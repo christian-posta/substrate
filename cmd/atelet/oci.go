@@ -269,6 +269,19 @@ func untar(ctx context.Context, tarData io.Reader, rootPath string) error {
 				return fmt.Errorf("while creating hardlink src=%q target=%q: %w", source, target, err)
 			}
 
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			// Many real container images (anything FROM a chainguard/wolfi
+			// or alpine base) include /dev/null, /dev/zero, /dev/random etc.
+			// as character-device tar entries in their base layer. We can't
+			// create those without CAP_MKNOD, and gVisor's sandbox mounts
+			// its own /dev anyway, so skipping is safe. Block devices and
+			// FIFOs are likewise unused by gVisor's setup.
+			slog.DebugContext(ctx, "Skipping device/FIFO tar entry",
+				slog.String("typeflag", string([]byte{hdr.Typeflag})),
+				slog.String("name", hdr.Name),
+			)
+			continue
+
 		default:
 			tfStr := string([]byte{hdr.Typeflag})
 			slog.ErrorContext(ctx, "Unhandled tar entry typeflag", slog.String("typeflag", tfStr), slog.Any("hdr", hdr))
