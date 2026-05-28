@@ -324,25 +324,40 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Check state of all containers to mimic containerd.
 	//
 	// Without this, `runsc delete` occasionally throws an error.
+	//
+	// Post-checkpoint, the sentry has exited (Resume:false is the default for
+	// runsc checkpoint), so cmdState and cmdDelete will hit a race between the
+	// sentry exit and the runsc-state files updating to "stopped". When the
+	// race lands wrong, runsc tries to connect to the dead sentry's control
+	// server and fails with "connection refused" → exit 128. We tolerate that
+	// here: the checkpoint already wrote a valid image to object storage, and
+	// atelet is responsible for tearing down the OCI bundles and resetting the
+	// actor directory (see contract above). cmdState/cmdDelete failures here
+	// are post-success cleanup hiccups, not actual checkpoint failures.
 	if err := rcmd.cmdState(ctx, "pause"); err != nil {
-		return nil, fmt.Errorf("while checking state of pause container: %w", err)
+		slog.WarnContext(ctx, "post-checkpoint runsc state failed (sandbox already gone); continuing",
+			slog.String("container", "pause"), slog.String("error", err.Error()))
 	}
 	for _, ctr := range req.GetSpec().GetContainers() {
 		if err := rcmd.cmdState(ctx, ctr.GetName()); err != nil {
-			return nil, fmt.Errorf("while deleting %q application container: %w", ctr.GetName(), err)
+			slog.WarnContext(ctx, "post-checkpoint runsc state failed (sandbox already gone); continuing",
+				slog.String("container", ctr.GetName()), slog.String("error", err.Error()))
 		}
 	}
 
-	// Delete all application containers
+	// Delete all application containers. Same race as above — tolerate the
+	// "sandbox already gone" failure.
 	for _, ctr := range req.GetSpec().GetContainers() {
 		if err := rcmd.cmdDelete(ctx, ctr.GetName()); err != nil {
-			return nil, fmt.Errorf("while deleting %q application container: %w", ctr.GetName(), err)
+			slog.WarnContext(ctx, "post-checkpoint runsc delete failed (sandbox already gone); continuing",
+				slog.String("container", ctr.GetName()), slog.String("error", err.Error()))
 		}
 	}
 
-	// Delete pause container
+	// Delete pause container. Same race.
 	if err := rcmd.cmdDelete(ctx, "pause"); err != nil {
-		return nil, fmt.Errorf("while deleting pause container: %w", err)
+		slog.WarnContext(ctx, "post-checkpoint runsc delete failed (sandbox already gone); continuing",
+			slog.String("container", "pause"), slog.String("error", err.Error()))
 	}
 
 	// Yoink eth0 back to the pod netns.

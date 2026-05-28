@@ -38,16 +38,20 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 
 	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
 
+	debugLogDir := ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)
+	if err := os.MkdirAll(debugLogDir, 0o700); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", debugLogDir, err)
+	}
+
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
-		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
-		// "-debug-to-user-log",
-		// "-log-packets",
-		// "-strace",
+		"-debug",
+		"-debug-log", debugLogDir+"/",
+		"-debug-log-format", "json",
+		"-panic-log", debugLogDir+"/panic.log",
 		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
 		"create",
 		"-bundle", ateompath.OCIBundlePath(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName),
@@ -71,16 +75,20 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 
 	slog.InfoContext(ctx, "About to run runsc start", slog.String("container", containerName))
 
+	debugLogDir := ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)
+	if err := os.MkdirAll(debugLogDir, 0o700); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", debugLogDir, err)
+	}
+
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
-		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
-		// "-debug-to-user-log",
-		// "-log-packets",
-		// "-strace",
+		"-debug",
+		"-debug-log", debugLogDir+"/",
+		"-debug-log-format", "json",
+		"-panic-log", debugLogDir+"/panic.log",
 		"-allow-connected-on-save",
 		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
 		"start",
@@ -103,16 +111,20 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 
 	slog.InfoContext(ctx, "About to run runsc checkpoint", slog.String("container", containerName))
 
+	debugLogDir := ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)
+	if err := os.MkdirAll(debugLogDir, 0o700); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", debugLogDir, err)
+	}
+
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
-		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
-		// "-debug-to-user-log",
-		// "-log-packets",
-		// "-strace",
+		"-debug",
+		"-debug-log", debugLogDir+"/",
+		"-debug-log-format", "json",
+		"-panic-log", debugLogDir+"/panic.log",
 		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
 		"checkpoint",
 		"-image-path", checkpointPath,
@@ -135,16 +147,20 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 
 	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
 
+	debugLogDir := ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)
+	if err := os.MkdirAll(debugLogDir, 0o700); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", debugLogDir, err)
+	}
+
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
-		// "-debug",
-		// "-debug-log", ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)+"/",
-		// "-debug-to-user-log",
-		// "-log-packets",
-		// "-strace",
+		"-debug",
+		"-debug-log", debugLogDir+"/",
+		"-debug-log-format", "json",
+		"-panic-log", debugLogDir+"/panic.log",
 		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
 		"restore",
 		"-bundle", ateompath.OCIBundlePath(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName),
@@ -167,15 +183,20 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 	reapLock.RLock()
 	defer reapLock.RUnlock()
 
-	// token := rand.Text()
-	// logFile := "/tmp/runsc.delete." + token + ".log"
+	debugLogDir := ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)
+	if err := os.MkdirAll(debugLogDir, 0o700); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", debugLogDir, err)
+	}
 
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
-		// "-debug",
+		"-debug",
+		"-debug-log", debugLogDir+"/",
+		"-debug-log-format", "json",
+		"-panic-log", debugLogDir+"/panic.log",
 		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
 		"delete",
 		"-force",
@@ -196,11 +217,20 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 	reapLock.RLock()
 	defer reapLock.RUnlock()
 
+	debugLogDir := ateompath.RunscDebugLogDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID, containerName)
+	if err := os.MkdirAll(debugLogDir, 0o700); err != nil {
+		return fmt.Errorf("MkdirAll(%q): %w", debugLogDir, err)
+	}
+
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
 		"-log-format", "json",
 		"--alsologtostderr",
+		"-debug",
+		"-debug-log", debugLogDir+"/",
+		"-debug-log-format", "json",
+		"-panic-log", debugLogDir+"/panic.log",
 		"-root", ateompath.RunSCStateDir(r.actorTemplateNamespace, r.actorTemplateName, r.actorID),
 		"state",
 		containerName,
