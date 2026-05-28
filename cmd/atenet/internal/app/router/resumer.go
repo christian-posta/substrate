@@ -44,7 +44,12 @@ func (r *ActorResumer) ResumeActor(ctx context.Context, actorID string) (*ateapi
 		// We detach the context from the first caller using a fixed background timeout.
 		// This guarantees that if Caller 1 disconnects or times out, the underlying
 		// resume operation continues running for Caller 2 and Caller 3 without failing.
-		bgCtx, bgCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		//
+		// kagent local fork: bumped 15s → 60s because the kagent ADK image's
+		// runsc restore (OCI bundle unpack of the Python + google-adk image plus
+		// sentry state attach) consistently lands around 14–18s on kind/macOS.
+		// 15s was just under the edge; subsequent calls almost always cross it.
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer bgCancel()
 
 		backoff := wait.Backoff{

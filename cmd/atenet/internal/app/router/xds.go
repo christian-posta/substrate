@@ -304,13 +304,17 @@ func (x *XdsServer) buildHcm(statPrefix string) *anypb.Any {
 					ClusterName: ClusterName,
 				},
 			},
-			Timeout: durationpb.New(5 * time.Second),
+			// kagent local fork: bumped 5s → 60s. The 5s default was tight enough
+			// that the kagent ADK image's 14–18s restore time forced the user-
+			// facing 500. Coordinated with resumer.go's bgCtx (60s).
+			Timeout: durationpb.New(60 * time.Second),
 		},
 		MutationRules: &mutationrulesv3.HeaderMutationRules{
 			AllowAllRouting: &wrapperspb.BoolValue{Value: true},
 		},
-		// Explicitly configure the message timeout to avoid the 200ms default
-		MessageTimeout: durationpb.New(5 * time.Second),
+		// Explicitly configure the message timeout to avoid the 200ms default.
+		// kagent local fork: bumped 5s → 60s. See Timeout note above.
+		MessageTimeout: durationpb.New(60 * time.Second),
 		ProcessingMode: &extprocv3filter.ProcessingMode{
 			RequestHeaderMode:   extprocv3filter.ProcessingMode_SEND,
 			ResponseHeaderMode:  extprocv3filter.ProcessingMode_SKIP,

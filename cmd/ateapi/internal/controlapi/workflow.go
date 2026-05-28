@@ -135,9 +135,13 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, id string, boot bool) (
 	}
 	state := &ResumeState{}
 
-	// Acquire lock and get the timeout context for the workflow
-	// Lock TTL is 7 seconds, with 2 seconds padding for workflow timeout
-	ctx, releaseLock, err := w.acquireActorLock(ctx, id, 30*time.Second, 2*time.Second)
+	// kagent fork: Acquire lock TTL bumped 30s → 120s. The kagent ADK and
+	// openclaw images take 14–30s to restore on kind/macOS (OCI rootfs unpack
+	// + sentry attach), occasionally crossing the 28s workflow budget
+	// (ttl - padding). 120s gives plenty of headroom and matches the
+	// kagent-side harness Client CallTimeout. See SUBSTRATE.md §22 and the
+	// atenet 60s bgCtx companion patch.
+	ctx, releaseLock, err := w.acquireActorLock(ctx, id, 120*time.Second, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -164,9 +168,10 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, id string) (*ateapipb.
 	}
 	state := &SuspendState{}
 
-	// Acquire lock and get the timeout context for the workflow
-	// Lock TTL is 7 seconds, with 2 seconds padding for workflow timeout
-	ctx, releaseLock, err := w.acquireActorLock(ctx, id, 30*time.Second, 2*time.Second)
+	// kagent fork: Suspend lock TTL bumped 30s → 120s to match the bumped
+	// Resume TTL above. Suspend can also be slow when the sentry's
+	// SIGKILL-and-cleanup pass takes time (especially for rich workloads).
+	ctx, releaseLock, err := w.acquireActorLock(ctx, id, 120*time.Second, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
