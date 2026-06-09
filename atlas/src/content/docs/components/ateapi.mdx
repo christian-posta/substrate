@@ -4,7 +4,7 @@ description: The control plane API server. Source of truth for actor and worker 
 ---
 
 `ateapi` is a stateless gRPC server backed by Redis. It is **the** source of
-truth for actor and worker state — every other component either calls it
+truth for actor and worker state - every other component either calls it
 (atenet) or is called by it (atelet).
 
 ## What it owns
@@ -61,8 +61,8 @@ A second service on the same server, defined at
 Workloads call these from inside their gVisor sandbox to mint **session-scoped
 credentials** that survive worker migration:
 
-- `MintJWT(MintJWTRequest)` — JWT with subject `apps/{appid}/users/{userid}/sessions/{sessionid}`.
-- `MintCert(MintCertRequest)` — X.509 cert with a SPIFFE URI scoped to the same app/user/session.
+- `MintJWT(MintJWTRequest)` - JWT with subject `apps/{appid}/users/{userid}/sessions/{sessionid}`.
+- `MintCert(MintCertRequest)` - X.509 cert with a SPIFFE URI scoped to the same app/user/session.
 
 The workload authenticates either with its K8s service-account bearer token
 (the pod identity) or with an mTLS client cert; ateapi attests the session
@@ -117,7 +117,7 @@ the actual K8s state:
 
 :::caution[Known race]
 If a pod dies **and** a concurrent `SuspendActor` is in flight, the actor can
-get released twice. Best-effort cleanup only — tracked upstream.
+get released twice. Best-effort cleanup only - tracked upstream.
 :::
 
 ## The Redis keyspace
@@ -132,11 +132,11 @@ get released twice. Best-effort cleanup only — tracked upstream.
 
 ## Entry point
 
-<code class="fileref">cmd/ateapi/main.go:70-161</code> — gRPC server setup,
+<code class="fileref">cmd/ateapi/main.go:70-161</code> - gRPC server setup,
 Redis connection, K8s informer wiring, TLS config.
 
 ## Related
 
-- [Resume actor flow](/flows/resume-actor/) — sees the workflow engine in action.
-- [System topology](/topology/) — how ateapi connects to everything else.
-- [Storage](/components/storage/) — Redis and GCS details (Cut 3).
+- [Resume actor flow](/flows/resume-actor/) - sees the workflow engine in action.
+- [System topology](/topology/) - how ateapi connects to everything else.
+- [Storage](/components/storage/) - Redis and GCS details (Cut 3).

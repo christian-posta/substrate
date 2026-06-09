@@ -1,6 +1,6 @@
 ---
 title: ActorTemplate
-description: The CRD that declares what an actor of a given kind looks like — image, entrypoint, target worker pool, and where to put snapshots.
+description: The CRD that declares what an actor of a given kind looks like - image, entrypoint, target worker pool, and where to put snapshots.
 ---
 
 `ActorTemplate` is the second of Substrate's two CRDs. It declares the
@@ -40,14 +40,14 @@ status:
 `container[].name`, `spec.pauseImage`, `spec.snapshotsConfig`,
 `spec.workerPoolRef`, and `spec.runsc` are all `+required`. Both
 `container.image` and `pauseImage` carry an `XValidation` rule that the
-value must contain `@` (digest-pinning) — changing an image invalidates
+value must contain `@` (digest-pinning) - changing an image invalidates
 existing snapshots.
 
 <code class="fileref">pkg/api/v1alpha1/actortemplate_types.go</code>
 
 ## A real example: `hello-substrate`
 
-Here's a live `ActorTemplate` from the `kagent` namespace — created by
+Here's a live `ActorTemplate` from the `kagent` namespace - created by
 kagent's `SandboxAgent` controller when you declare a tiny "hello world"
 declarative agent. It's the minimum-viable end-to-end shape:
 
@@ -112,7 +112,7 @@ status:
 A few things worth pointing out:
 
 - **Owner reference up to a `SandboxAgent`.** A user didn't write this
-  YAML by hand — they declared a `kagent.dev/v1alpha2 SandboxAgent` named
+  YAML by hand - they declared a `kagent.dev/v1alpha2 SandboxAgent` named
   `hello-substrate`, and kagent's controller projected it down into this
   `ActorTemplate` (plus a `Secret` holding the agent's config). Delete
   the SandboxAgent and the ActorTemplate is garbage-collected.
@@ -121,14 +121,14 @@ A few things worth pointing out:
   actor created from this template will land on a worker from that pool.
 - **`containers[0]` is the agent binary.** `localhost:5001/...golang-adk`
   is kagent's Go ADK runtime, pulled from the in-cluster registry. The
-  digest pin is what makes the golden snapshot below valid — bump the
+  digest pin is what makes the golden snapshot below valid - bump the
   image and you invalidate the snapshot.
 - **`env` is mostly secret refs.** `config.json` and `agent-card.json`
   come from a `Secret` that kagent also manages. `OPENAI_API_KEY` comes
   from a shared `kagent-openai` Secret. None of this is baked into the
   image; the container reads it at startup.
 - **`snapshotsConfig.location` is per-template.** All actors of this
-  template — and the golden snapshot itself — live under
+  template - and the golden snapshot itself - live under
   `gs://ate-snapshots/kagent/hello-substrate/`.
 - **`status.goldenSnapshot` is set.** That's the artifact the 5-phase
   bootstrap below produced. New actors of this template start from it
@@ -149,7 +149,7 @@ stateDiagram-v2
 ```
 
 `PhaseFailed` is declared in the CRD type but the reconciler never assigns
-it — errors return up and trigger a requeue. The 20s "wait" is not a
+it - errors return up and trigger a requeue. The 20s "wait" is not a
 blocking sleep: the reconciler stamps `Status.TakeGoldenSnapshotAt` and
 uses `RequeueAfter` to come back later.
 
@@ -185,8 +185,8 @@ pre-initialized state, not from cold boot.
 
 ## Related
 
-- [Actor](/concepts/actor/) — the per-instance entity.
-- [WorkerPool](/concepts/workerpool/) — what the template binds to.
-- [Snapshot](/concepts/snapshot/) — golden vs. last.
-- [Golden snapshot bootstrap](/flows/golden-snapshot/) — the reconciler's flow.
-- [atecontroller](/components/atecontroller/) — the reconciler.
+- [Actor](/concepts/actor/) - the per-instance entity.
+- [WorkerPool](/concepts/workerpool/) - what the template binds to.
+- [Snapshot](/concepts/snapshot/) - golden vs. last.
+- [Golden snapshot bootstrap](/flows/golden-snapshot/) - the reconciler's flow.
+- [atecontroller](/components/atecontroller/) - the reconciler.

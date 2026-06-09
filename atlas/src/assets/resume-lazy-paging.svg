@@ -65,7 +65,7 @@
   </g>
   <text x="220" y="166" text-anchor="middle" class="label-sm">download + decompress</text>
   <text x="560" y="166" text-anchor="middle" class="label-sm">load ENTIRE pages.img into memory</text>
-  <text x="560" y="182" text-anchor="middle" class="label-tiny">(could be GBs — every page mapped before run)</text>
+  <text x="560" y="182" text-anchor="middle" class="label-tiny">(could be GBs - every page mapped before run)</text>
   <text x="840" y="166" text-anchor="middle" class="label-tiny">sentry up</text>
   <text x="980" y="166" text-anchor="middle" class="label-sm">handle HTTP request</text>
 
@@ -82,7 +82,7 @@
   </g>
   <text x="880" y="230" text-anchor="middle" class="bad">first byte: slow ⏰</text>
 
-  <!-- ============================== GAP — savings bracket ============================== -->
+  <!-- ============================== GAP - savings bracket ============================== -->
   <!-- bracket spans from substrate first-byte x=380 to naive first-byte x=880, sitting in
        the gap between regions. -->
   <path d="M 380 330 L 380 345 L 880 345 L 880 330" class="bracket"/>
@@ -96,9 +96,9 @@
 
   <!-- bars -->
   <g filter="url(#sketch)">
-    <!-- download + decompress (same width as naive — same network/disk cost) -->
+    <!-- download + decompress (same width as naive - same network/disk cost) -->
     <rect x="120" y="450" width="200" height="40" rx="6" class="bar-load"/>
-    <!-- sentry up — wider now so the label fits -->
+    <!-- sentry up - wider now so the label fits -->
     <rect x="320" y="450" width="60"  height="40" rx="6" class="bar-fast"/>
     <!-- handle request begins right after -->
     <rect x="380" y="450" width="200" height="40" rx="6" class="bar-serve"/>
@@ -140,7 +140,7 @@
   <line x1="880" y1="350" x2="880" y2="640" class="vline-bad"/>
   <text x="880" y="680" text-anchor="middle" class="label-tiny" fill="#b91c1c">(naive would still be loading pages.img here)</text>
 
-  <!-- runsc flag legend — stacked so each flag gets its own line and never overflows. -->
+  <!-- runsc flag legend - stacked so each flag gets its own line and never overflows. -->
   <g filter="url(#sketch)">
     <rect x="40" y="690" width="1160" height="44" rx="10" fill="#ffffff" stroke="#374151" stroke-width="1.6"/>
   </g>

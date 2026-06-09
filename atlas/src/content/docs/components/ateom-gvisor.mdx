@@ -31,7 +31,7 @@ flowchart LR
 
 All three are thin wrappers over `runsc` shell-outs.
 
-### RunWorkload — boot from scratch
+### RunWorkload - boot from scratch
 
 ```bash
 runsc -root <state-dir> create \
@@ -41,11 +41,11 @@ runsc -root <state-dir> create \
 runsc -root <state-dir> start <containerName>
 ```
 
-Used when there's no snapshot to restore from — the cold cold path.
+Used when there's no snapshot to restore from - the cold cold path.
 
 <code class="fileref">cmd/ateom-gvisor/runsc.go:37-72</code>
 
-### CheckpointWorkload — freeze to disk
+### CheckpointWorkload - freeze to disk
 
 ```bash
 runsc -root <state-dir> checkpoint \
@@ -55,15 +55,15 @@ runsc -root <state-dir> checkpoint \
 
 Produces three files on the worker pod's local volume:
 
-- `checkpoint.img` — sentry state, registers, FD table
-- `pages.img` — RAM page contents
-- `pages_meta.img` — page metadata
+- `checkpoint.img` - sentry state, registers, FD table
+- `pages.img` - RAM page contents
+- `pages_meta.img` - page metadata
 
 atelet picks these up and uploads them to GCS/S3.
 
 <code class="fileref">cmd/ateom-gvisor/runsc.go:102-130</code>
 
-### RestoreWorkload — thaw from disk
+### RestoreWorkload - thaw from disk
 
 ```bash
 runsc -root <state-dir> restore \
@@ -78,9 +78,9 @@ The flags are doing real work:
 
 | Flag | Effect |
 |---|---|
-| `-background` | Enable lazy demand-paging from the image files — `runsc` returns as soon as the sentry is up |
+| `-background` | Enable lazy demand-paging from the image files - `runsc` returns as soon as the sentry is up |
 | `-direct` | Skip certain security restrictions on snapshot data (needed because snapshot files don't go through the usual filesystem checks) |
-| `-detach` | Don't block on the workload — return immediately |
+| `-detach` | Don't block on the workload - return immediately |
 
 The combination is what makes resume fast: control returns to atelet in
 milliseconds, and pages stream in lazily as the workload touches them.
@@ -103,21 +103,21 @@ Each pod's ateom listens at:
 
 The directory is host-bind-mounted into the pod, so atelet (on the host)
 sees the same socket the pod's ateom is binding. The pod UID in the path
-is the addressing scheme — atelet uses it to know which pod's ateom it's
+is the addressing scheme - atelet uses it to know which pod's ateom it's
 talking to.
 
 ## Footprint
 
 ateom-gvisor itself is small: a gRPC server, an exec helper, and a few
 filesystem path helpers. The gVisor runtime (`runsc`) is downloaded
-separately by atelet and bind-mounted in — that's the big binary.
+separately by atelet and bind-mounted in - that's the big binary.
 
-<code class="fileref">internal/ateompath/ateompath.go</code> — path helpers used
+<code class="fileref">internal/ateompath/ateompath.go</code> - path helpers used
 by both atelet and ateom-gvisor.
 
 ## Related
 
-- [atelet](/components/atelet/) — ateom-gvisor's only client.
-- [Suspend actor flow](/flows/suspend-actor/) · [Resume actor flow](/flows/resume-actor/) —
+- [atelet](/components/atelet/) - ateom-gvisor's only client.
+- [Suspend actor flow](/flows/suspend-actor/) · [Resume actor flow](/flows/resume-actor/) -
   where the runsc calls happen.
-- [Snapshot](/concepts/snapshot/) — what these files mean.
+- [Snapshot](/concepts/snapshot/) - what these files mean.

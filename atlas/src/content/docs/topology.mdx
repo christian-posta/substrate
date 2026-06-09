@@ -11,7 +11,7 @@ assignment to pre-warmed worker pods happens in `ateapi` in milliseconds, not in
 ## In three pictures
 
 The whole-picture hero on the [Overview](/) is the elevator pitch. This page
-zooms in on the three regions that matter most — what's *in* each plane,
+zooms in on the three regions that matter most - what's *in* each plane,
 and how a request actually flows.
 
 ### 1 · Control plane
@@ -116,7 +116,7 @@ case), see [Resume actor](/flows/resume-actor/).
 | atenet router (L7 proxy) | 8080 / 8443 | HTTP / HTTPS |
 | atenet ExtProc | 50051 | gRPC (ext_proc) |
 | atenet xDS | 18000 | gRPC (xDS control plane) |
-| ateom-gvisor | Unix socket | gRPC — `/var/lib/ateom-gvisor/ateoms/{podUID}/ateom.sock` |
+| ateom-gvisor | Unix socket | gRPC - `/var/lib/ateom-gvisor/ateoms/{podUID}/ateom.sock` |
 
 ## How traffic *actually* gets to an actor
 

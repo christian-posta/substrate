@@ -1,12 +1,12 @@
 ---
 title: Storage
-description: The two persistent stores Substrate uses — Redis for actor and worker state, GCS/S3 for checkpoint snapshots.
+description: The two persistent stores Substrate uses - Redis for actor and worker state, GCS/S3 for checkpoint snapshots.
 ---
 
 Substrate has **two** persistent stores. They serve completely different
 needs and have completely different access patterns.
 
-## Redis / Valkey — hot path
+## Redis / Valkey - hot path
 
 The source of truth for actor and worker state. Every routing decision
 reads from here.
@@ -40,14 +40,14 @@ declarative state (CRDs) and Redis for high-frequency operational state.
 
 `lock:actor:<id>` is set with a 30-second TTL whenever a workflow starts on
 an actor. The workflow itself times out at 28 seconds (TTL minus 2s of
-padding). Two concurrent operations on the same actor cannot both succeed —
+padding). Two concurrent operations on the same actor cannot both succeed -
 the second returns `Aborted`.
 
 <code class="fileref">cmd/ateapi/internal/controlapi/workflow.go:189-212</code>
 
-## GCS / S3 — cold path
+## GCS / S3 - cold path
 
-The store for **snapshot images** — the RAM + sentry-state blobs that let
+The store for **snapshot images** - the RAM + sentry-state blobs that let
 suspended actors come back to life.
 
 ```mermaid
@@ -96,7 +96,7 @@ CPU cost is paid once on suspend, hidden behind storage I/O on restore.
 
 `ATE_STORAGE_BACKEND` selects the backend at atelet startup. Both
 implement the same internal interface (`cmd/atelet/internal/ategcs`). The choice is
-environmental — GCS in GCP, S3 in AWS — not a runtime decision per
+environmental - GCS in GCP, S3 in AWS - not a runtime decision per
 snapshot.
 
 ## Who reads each store
@@ -114,6 +114,6 @@ touches object storage.** Everything else goes through them.
 
 ## Related
 
-- [ateapi internals](/components/ateapi/) — Redis is its private database.
-- [atelet](/components/atelet/) — the GCS/S3 client.
-- [Snapshot](/concepts/snapshot/) — what the three image files actually are.
+- [ateapi internals](/components/ateapi/) - Redis is its private database.
+- [atelet](/components/atelet/) - the GCS/S3 client.
+- [Snapshot](/concepts/snapshot/) - what the three image files actually are.

@@ -1,6 +1,6 @@
 ---
 title: Request path
-description: How an inbound HTTP request gets from a client to the right actor on the right worker. No per-pod sidecar — a single L7 proxy fleet + ExtProc + ateapi lookup.
+description: How an inbound HTTP request gets from a client to the right actor on the right worker. No per-pod sidecar - a single L7 proxy fleet + ExtProc + ateapi lookup.
 ---
 
 The [resume actor flow](/flows/resume-actor/) covers the **cold** path
@@ -8,7 +8,7 @@ end-to-end. This page focuses on the **routing mechanics**: how atenet
 discovers the worker IP for a given actor, what the L7 proxy is configured to
 do, and what happens when the actor is already running (the warm path).
 
-## Warm path — already running actor
+## Warm path - already running actor
 
 ```mermaid
 sequenceDiagram
@@ -33,7 +33,7 @@ sequenceDiagram
   E-->>C: response
 ```
 
-In the warm case `ResumeActor` is a quick Redis read — no atelet, no GCS, no
+In the warm case `ResumeActor` is a quick Redis read - no atelet, no GCS, no
 runsc. The actor is already on a worker; we just need to learn which one.
 
 ## Why there's no per-pod sidecar
@@ -45,7 +45,7 @@ Every request goes through it. This is deliberate:
   state changes. With a centralized proxy, the xDS snapshot lives in one
   place.
 - The cost of one extra hop is dwarfed by the cost of a cold actor restore.
-- Worker pods are stateless — Substrate is free to repack actors onto any
+- Worker pods are stateless - Substrate is free to repack actors onto any
   worker, and the router just learns the new IP from ateapi on the next
   request.
 
@@ -79,7 +79,7 @@ choreography.
 Hammering ExtProc with 50 simultaneous requests for the same cold actor
 would otherwise produce 50 `ResumeActor` calls. ExtProc wraps the call in a
 [`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight)
-group keyed by actor ID — the first call goes through, the rest piggyback on
+group keyed by actor ID - the first call goes through, the rest piggyback on
 its result.
 
 <code class="fileref">cmd/atenet/internal/app/router/resumer.go:29-93</code>
@@ -98,13 +98,13 @@ The proxy is bootstrapped pointing at the atenet router's **xDS server on
 | Cluster `dynamic_forward_proxy_cluster` | Forwards to whatever :authority the proxy now holds |
 
 The snapshot is refreshed every 5 seconds by a controller loop that
-re-reads `atStore.readyTemplates(...)` and rebuilds the snapshot — it's a
+re-reads `atStore.readyTemplates(...)` and rebuilds the snapshot - it's a
 **periodic poll**, not an informer-driven watch.
 
 <code class="fileref">cmd/atenet/internal/app/router/xds.go:42-249</code> ·
 <code class="fileref">cmd/atenet/internal/app/router/controller.go:73-110</code>
 
-## DNS — why we resolve to the router, not the worker
+## DNS - why we resolve to the router, not the worker
 
 Worker IPs can change at any moment (actors move between workers). If DNS
 returned a worker IP directly, clients would cache it and break the first
@@ -112,7 +112,7 @@ time the actor migrated.
 
 Instead CoreDNS returns the **router's ClusterIP** for any name matching
 `*.actors.resources.substrate.ate.dev`. The router (via ExtProc) does the
-per-request lookup that yields the current worker IP — and rewrites
+per-request lookup that yields the current worker IP - and rewrites
 `:authority` so the proxy's `dynamic_forward_proxy_cluster` hits it.
 
 <code class="fileref">internal/dns/dns.go:71-88</code> ·
@@ -130,6 +130,6 @@ per-request lookup that yields the current worker IP — and rewrites
 
 ## Related
 
-- [Resume actor](/flows/resume-actor/) — the cold path in full.
-- [atenet](/components/atenet/) — router + DNS internals (Cut 3).
-- [System topology](/topology/) — where the router sits in the cluster.
+- [Resume actor](/flows/resume-actor/) - the cold path in full.
+- [atenet](/components/atenet/) - router + DNS internals (Cut 3).
+- [System topology](/topology/) - where the router sits in the cluster.

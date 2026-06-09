@@ -1,6 +1,6 @@
 ---
 title: atenet
-description: The networking component. One binary, two Cobra subcommands — a centralized L7 proxy router (with xDS + ExtProc) and a CoreDNS controller.
+description: The networking component. One binary, two Cobra subcommands - a centralized L7 proxy router (with xDS + ExtProc) and a CoreDNS controller.
 ---
 
 `atenet` is one binary that exposes two Cobra subcommands: `atenet router`
@@ -72,7 +72,7 @@ headers off to ExtProc; ExtProc:
 2. Calls `ateapi.ResumeActor(actorId)` (dedup'd via singleflight).
 3. Receives the Actor object back with `ateom_pod_ip`.
 4. Returns a `HeaderMutation` telling the proxy to overwrite `:authority`
-   with `<pod_ip>:80`. (The `:80` is currently hardcoded — see the
+   with `<pod_ip>:80`. (The `:80` is currently hardcoded - see the
    `TODO(bowei)` in `extproc.go` about supporting other ports.)
 
 After that, the proxy's dynamic forward proxy carries the request to the
@@ -84,7 +84,7 @@ worker.
 ### Proxy runner
 
 atenet **manages a K8s Deployment of L7 proxy pods** as part of its own
-reconciliation — it's not a sidecar pattern, the proxy pods are a separate
+reconciliation - it's not a sidecar pattern, the proxy pods are a separate
 fleet that this process keeps healthy. Bootstrap config points the proxies
 at the xDS server above.
 
@@ -92,7 +92,7 @@ at the xDS server above.
 
 ## The DNS subsystem
 
-Independent from the router — it's a separate Cobra subcommand
+Independent from the router - it's a separate Cobra subcommand
 (`atenet dns`) typically run as its own Deployment. The DNS controller:
 
 1. Watches the K8s API for relevant objects.
@@ -124,7 +124,7 @@ architectural one.
 
 ## Related
 
-- [Request path flow](/flows/request-path/) — the warm-path mechanics.
-- [Resume actor flow](/flows/resume-actor/) — the cold-path mechanics
+- [Request path flow](/flows/request-path/) - the warm-path mechanics.
+- [Resume actor flow](/flows/resume-actor/) - the cold-path mechanics
   through atenet.
-- [ateapi](/components/ateapi/) — atenet's only gRPC dependency.
+- [ateapi](/components/ateapi/) - atenet's only gRPC dependency.

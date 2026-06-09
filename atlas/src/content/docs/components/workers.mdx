@@ -5,7 +5,7 @@ description: The pre-warmed gVisor sandbox pods that actually run actor workload
 
 A **worker** in Substrate is a Kubernetes Pod that's *ready to host an actor*.
 It's pre-warmed: `ateom-gvisor` is already running and runsc is staged on
-the node — so when ateapi assigns the worker, ateom-gvisor can create the
+the node - so when ateapi assigns the worker, ateom-gvisor can create the
 gVisor sandbox (with its own pause process) and `runsc restore` an actor
 into it without waiting on image pulls or sandbox boot.
 
@@ -16,7 +16,7 @@ flowchart LR
   subgraph POD["Worker pod (only ateom-gvisor container at idle)"]
     direction TB
     OM[ateom-gvisor<br/>gRPC on Unix socket]
-    GVISOR[["gVisor sandbox<br/>(runsc-managed, created on assignment —<br/>pause process lives inside)"]]
+    GVISOR[["gVisor sandbox<br/>(runsc-managed, created on assignment -<br/>pause process lives inside)"]]
     OM -- exec runsc create/restore --> GVISOR
     GVISOR -.->|hosts| WL[["Actor workload<br/>(after restore)"]]
   end
@@ -107,7 +107,7 @@ calls.
 ## Why gVisor (and not, say, Kata Containers)?
 
 `runsc` (gVisor's runtime) is one of the very few sandboxes that supports
-**checkpoint and restore** — the entire point of Substrate. CRIU-based
+**checkpoint and restore** - the entire point of Substrate. CRIU-based
 restore for normal containers exists but is fragile; `runsc checkpoint` and
 `runsc restore -background` are first-class operations.
 
@@ -124,7 +124,7 @@ boundary.
 
 ## Related
 
-- [Worker lifecycle](/flows/worker-lifecycle/) — full state machine.
-- [WorkerPool](/concepts/workerpool/) — the CRD that makes workers exist.
-- [ateom-gvisor](/components/ateom-gvisor/) — what runs inside.
-- [atelet](/components/atelet/) — who drives them externally.
+- [Worker lifecycle](/flows/worker-lifecycle/) - full state machine.
+- [WorkerPool](/concepts/workerpool/) - the CRD that makes workers exist.
+- [ateom-gvisor](/components/ateom-gvisor/) - what runs inside.
+- [atelet](/components/atelet/) - who drives them externally.

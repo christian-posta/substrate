@@ -54,7 +54,7 @@ Some "no-op" transitions are idempotent rather than rejected. Suspending
 an already-suspended actor short-circuits inside the workflow and returns
 the actor unchanged (`workflow_suspend.go` `MarkSuspendingStep.IsComplete`
 returns early for SUSPENDED/SUSPENDING actors). `DeleteActor` currently
-does **not** check status — it removes the Redis record regardless. The
+does **not** check status - it removes the Redis record regardless. The
 real serialization guarantee is the per-actor lock below, not status-
 based precondition errors.
 
@@ -87,7 +87,7 @@ flowchart LR
 Every transition runs inside a workflow that holds `lock:actor:<id>` in
 Redis with a 30-second TTL. The workflow itself times out at 28 seconds
 (TTL minus 2s of padding before the lock expires). Two concurrent calls for
-the same actor cannot both succeed — the second gets `Aborted`.
+the same actor cannot both succeed - the second gets `Aborted`.
 
 This is what prevents nasty races like "resume + suspend at the same time"
 or "delete while a worker is still assigned."
@@ -98,7 +98,7 @@ or "delete while a worker is still assigned."
 
 One path: **the worker pod dies**. The WorkerPoolSyncer's pod-delete
 handler runs `releaseActorOnDeadWorker`, which finds the assigned actor
-and forces it back to `SUSPENDED` — even mid-`RUNNING`. The actor's
+and forces it back to `SUSPENDED` - even mid-`RUNNING`. The actor's
 `LastSnapshot` is whatever it was before (or empty for never-run actors).
 
 This is a recovery path, not a normal transition, and it's known to race
@@ -111,13 +111,13 @@ with concurrent `SuspendActor` calls.
 
 Just one place: Redis. The key is `actor:<actor-id>` and the value is the
 JSON-serialized Actor proto. Every other component (atelet, atecontroller,
-atenet) reads it via ateapi RPCs — they never touch Redis directly.
+atenet) reads it via ateapi RPCs - they never touch Redis directly.
 
 ## Related
 
 - [Create actor](/flows/create-actor/) · [Resume actor](/flows/resume-actor/) ·
   [Suspend actor](/flows/suspend-actor/)
-- [Worker lifecycle](/flows/worker-lifecycle/) — the dual state machine
+- [Worker lifecycle](/flows/worker-lifecycle/) - the dual state machine
   on the worker side.
-- [ateapi internals](/components/ateapi/) — the workflow engine that drives
+- [ateapi internals](/components/ateapi/) - the workflow engine that drives
   every transition.

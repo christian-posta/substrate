@@ -4,7 +4,7 @@ description: The unit of work in Substrate. A logical instance of an agent or st
 ---
 
 An **actor** is the unit of work in Substrate. Think "an instance of an
-agent" — it has its own RAM state, its own filesystem, its own identity —
+agent" - it has its own RAM state, its own filesystem, its own identity -
 but it's *not pinned to a pod*. The same actor can suspend on worker A,
 resume on worker B, and pick up exactly where it left off.
 
@@ -32,7 +32,7 @@ stateDiagram-v2
 The proto defines five status values:
 `STATUS_UNSPECIFIED`, `STATUS_RESUMING`, `STATUS_RUNNING`, `STATUS_SUSPENDING`,
 `STATUS_SUSPENDED` (`pkg/proto/ateapipb/ateapi.proto`). `RESUMING` and
-`SUSPENDING` are transient — they're set when the workflow begins and
+`SUSPENDING` are transient - they're set when the workflow begins and
 cleared when it finalizes.
 
 See [Actor lifecycle](/flows/actor-lifecycle/) for the full machine.
@@ -48,7 +48,7 @@ externally-facing handle that clients use to talk to an actor over HTTP
 
 **Decoupled.** An actor is a logical entity in Redis; a worker pod is a
 physical hosting slot. The mapping changes every time the actor
-suspends/resumes — the same actor will likely live in a different worker
+suspends/resumes - the same actor will likely live in a different worker
 pod across resumes.
 
 This is the whole point of Substrate: 30 actors per pod, not 1.
@@ -63,4 +63,4 @@ with their own state and snapshot.
 
 - [ActorTemplate](/concepts/actortemplate/) · [Worker](/concepts/worker/) ·
   [Snapshot](/concepts/snapshot/) · [Session](/concepts/session/)
-- [Actor lifecycle](/flows/actor-lifecycle/) — full state machine.
+- [Actor lifecycle](/flows/actor-lifecycle/) - full state machine.

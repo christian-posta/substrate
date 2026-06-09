@@ -66,7 +66,7 @@ spec:
   snapshotsConfig: { location: gs://my-bucket/actors }
 ```
 
-This one is more interesting — it runs the **5-phase golden snapshot
+This one is more interesting - it runs the **5-phase golden snapshot
 bootstrap** described in [Golden snapshot](/flows/golden-snapshot/):
 
 ```mermaid
@@ -79,7 +79,7 @@ stateDiagram-v2
 ```
 
 `PhaseFailed` is declared in the CRD type but the reconciler never assigns
-it — errors just return and trigger a requeue. The 20s wait between resume
+it - errors just return and trigger a requeue. The 20s wait between resume
 and suspend is not a blocking sleep; the reconciler stamps
 `Status.TakeGoldenSnapshotAt` and uses `RequeueAfter` to come back later.
 
@@ -90,7 +90,7 @@ new actors of this template can restore from in milliseconds.
 
 ## Why is this a separate process from ateapi?
 
-It uses the Kubernetes informer cache and has reconcile-loop semantics —
+It uses the Kubernetes informer cache and has reconcile-loop semantics -
 the standard operator pattern. ateapi is stateless gRPC, optimized for QPS.
 Different concerns, different scaling profiles. (Note: the manager is
 constructed with `ctrl.Options{Scheme: scheme}`, so leader election is
@@ -99,12 +99,12 @@ reconcile concurrently.)
 
 ## Entry point
 
-<code class="fileref">cmd/atecontroller/main.go:49-107</code> — controller-runtime
+<code class="fileref">cmd/atecontroller/main.go:49-107</code> - controller-runtime
 manager setup, scheme registration, both reconcilers wired up.
 
 ## Related
 
 - [WorkerPool](/concepts/workerpool/) · [ActorTemplate](/concepts/actortemplate/)
-- [Golden snapshot bootstrap](/flows/golden-snapshot/) — the ActorTemplate
+- [Golden snapshot bootstrap](/flows/golden-snapshot/) - the ActorTemplate
   reconciler's interesting flow.
-- [ateapi](/components/ateapi/) — atecontroller's only gRPC client.
+- [ateapi](/components/ateapi/) - atecontroller's only gRPC client.

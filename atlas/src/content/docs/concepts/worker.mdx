@@ -4,7 +4,7 @@ description: A pre-warmed gVisor sandbox pod ready to host an actor. Members of 
 ---
 
 A **worker** is a Pod that's pre-warmed to host actors. It's not the actor
-itself — it's the *hosting slot*. Worker pods come from a `WorkerPool`
+itself - it's the *hosting slot*. Worker pods come from a `WorkerPool`
 Deployment and are pooled, fungible, and reassigned across many actors over
 their lifetime.
 
@@ -15,14 +15,14 @@ flowchart LR
   subgraph POD["Worker pod (a.k.a. one worker)"]
     direction TB
     OM[ateom-gvisor container]
-    SANDBOX[("gVisor sandbox<br/>(created on assignment —<br/>pause process lives inside)")]
+    SANDBOX[("gVisor sandbox<br/>(created on assignment -<br/>pause process lives inside)")]
   end
 ```
 
 Two pieces:
 1. `ateom-gvisor` running as the pod's only container, ready to receive
    Run/Checkpoint/Restore RPCs.
-2. A gVisor sandbox that ateom-gvisor will create on assignment — its
+2. A gVisor sandbox that ateom-gvisor will create on assignment - its
    pause process lives **inside** that sandbox, not as a peer pod-level
    container.
 
@@ -64,6 +64,6 @@ forced back to `SUSPENDED` first.
 
 ## Related
 
-- [Worker lifecycle](/flows/worker-lifecycle/) — Idle ↔ Assigned state machine.
-- [WorkerPool](/concepts/workerpool/) — where workers come from.
-- [Workers component](/components/workers/) — the worker pod itself, in more depth.
+- [Worker lifecycle](/flows/worker-lifecycle/) - Idle ↔ Assigned state machine.
+- [WorkerPool](/concepts/workerpool/) - where workers come from.
+- [Workers component](/components/workers/) - the worker pod itself, in more depth.

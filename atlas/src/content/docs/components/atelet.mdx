@@ -5,7 +5,7 @@ description: The node-level DaemonSet. Receives gRPC calls from ateapi, drives a
 
 `atelet` is the node-side workhorse. One pod per worker node (it's a
 DaemonSet), exposing a gRPC server that ateapi calls into for every Run /
-Checkpoint / Restore. atelet doesn't make decisions — it executes.
+Checkpoint / Restore. atelet doesn't make decisions - it executes.
 
 ## What it does
 
@@ -58,7 +58,7 @@ Each worker pod has a host-bind-mounted Unix socket at:
 ```
 
 atelet dials this socket (`DialAteomPod`) and gets a gRPC client to that
-specific pod's ateom. No TCP, no service discovery — the pod UID in the
+specific pod's ateom. No TCP, no service discovery - the pod UID in the
 filesystem path is the addressing scheme.
 
 <code class="fileref">cmd/atelet/main.go:592</code>
@@ -111,7 +111,7 @@ node, is much cheaper.
 
 ## Related
 
-- [Resume actor flow](/flows/resume-actor/) · [Suspend actor flow](/flows/suspend-actor/) —
+- [Resume actor flow](/flows/resume-actor/) · [Suspend actor flow](/flows/suspend-actor/) -
   atelet's two main jobs.
-- [ateom-gvisor](/components/ateom-gvisor/) — what atelet drives.
-- [Storage](/components/storage/) — GCS/S3 layout details.
+- [ateom-gvisor](/components/ateom-gvisor/) - what atelet drives.
+- [Storage](/components/storage/) - GCS/S3 layout details.
