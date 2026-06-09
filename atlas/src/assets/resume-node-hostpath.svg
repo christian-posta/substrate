@@ -59,43 +59,56 @@
   <!-- Each pillar visually connects a pod to the hostPath. -->
   <g filter="url(#sketch)">
     <!-- atelet → hostPath pillar -->
-    <rect x="180" y="360" width="160" height="170" rx="6" class="mount"/>
+    <rect x="180" y="380" width="160" height="150" rx="6" class="mount"/>
     <!-- worker → hostPath pillar -->
-    <rect x="800" y="360" width="160" height="170" rx="6" class="mount"/>
+    <rect x="800" y="380" width="160" height="150" rx="6" class="mount"/>
   </g>
-  <text x="260" y="448" text-anchor="middle" class="label-tiny" fill="#92400e">bind-mount</text>
-  <text x="260" y="464" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ateom-gvisor</text>
-  <text x="880" y="448" text-anchor="middle" class="label-tiny" fill="#92400e">bind-mount</text>
-  <text x="880" y="464" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ateom-gvisor</text>
+  <text x="260" y="455" text-anchor="middle" class="label-tiny" fill="#92400e">bind-mount</text>
+  <text x="260" y="471" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ateom-gvisor</text>
+  <text x="880" y="455" text-anchor="middle" class="label-tiny" fill="#92400e">bind-mount</text>
+  <text x="880" y="471" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ateom-gvisor</text>
 
   <!-- ============================== atelet pod ============================== -->
   <g filter="url(#sketch)">
-    <rect x="80" y="150" width="360" height="220" rx="14" class="box-cp"/>
+    <rect x="80" y="150" width="360" height="240" rx="14" class="box-cp"/>
   </g>
   <text x="260" y="190" text-anchor="middle" class="label-big">atelet pod</text>
   <text x="260" y="212" text-anchor="middle" class="label-sm">DaemonSet — one per node</text>
   <text x="260" y="232" text-anchor="middle" class="label-tiny">listens on :8085 (per-pod IP)</text>
   <text x="260" y="248" text-anchor="middle" class="label-tiny">handler: AteomHerder.Restore()</text>
-  <text x="260" y="280" text-anchor="middle" class="label-sm">1. fetch runsc binary</text>
-  <text x="260" y="300" text-anchor="middle" class="label-sm">2. parallel GCS downloads</text>
-  <text x="260" y="320" text-anchor="middle" class="label-sm">3. zstd-decompress into hostPath</text>
-  <text x="260" y="340" text-anchor="middle" class="label-sm">4. dial ateom unix socket</text>
+  <text x="260" y="282" text-anchor="middle" class="label-sm">1. fetch runsc binary</text>
+  <text x="260" y="302" text-anchor="middle" class="label-sm">2. parallel GCS downloads</text>
+  <text x="260" y="322" text-anchor="middle" class="label-sm">3. zstd-decompress into hostPath</text>
+  <text x="260" y="342" text-anchor="middle" class="label-sm">4. dial ateom unix socket</text>
+  <text x="260" y="370" text-anchor="middle" class="label-tiny" fill="#6b7280">(unsandboxed, has host privileges)</text>
 
   <!-- ============================== worker pod ============================== -->
   <g filter="url(#sketch)">
-    <rect x="700" y="150" width="360" height="220" rx="14" class="box-pod"/>
+    <rect x="700" y="150" width="360" height="240" rx="14" class="box-pod"/>
   </g>
-  <text x="880" y="186" text-anchor="middle" class="label-big">worker pod</text>
-  <text x="880" y="208" text-anchor="middle" class="label-tiny">pre-warmed, idle · scheduled into a WorkerPool</text>
+  <text x="880" y="178" text-anchor="middle" class="label-big">worker pod</text>
+  <text x="880" y="196" text-anchor="middle" class="label-tiny">pre-warmed · hosts ≤1 actor at a time</text>
 
-  <!-- ateom-gvisor inner box -->
+  <!-- ateom-gvisor inner box: the PID 1 process in the pod. Unsandboxed. -->
   <g filter="url(#sketch)">
-    <rect x="735" y="232" width="290" height="120" rx="10" class="box-gvis"/>
+    <rect x="730" y="208" width="300" height="58" rx="10" class="box-gvis"/>
   </g>
-  <text x="880" y="262" text-anchor="middle" class="label-med">ateom-gvisor</text>
-  <text x="880" y="284" text-anchor="middle" class="label-tiny">RestoreWorkload RPC handler</text>
-  <text x="880" y="304" text-anchor="middle" class="label-tiny">exec runsc restore</text>
-  <text x="880" y="322" text-anchor="middle" class="label-tiny">-background -direct -detach</text>
+  <text x="880" y="230" text-anchor="middle" class="label-med">ateom-gvisor</text>
+  <text x="880" y="250" text-anchor="middle" class="label-tiny">PID 1 · gRPC server · NOT inside gVisor</text>
+
+  <!-- exec runsc arrow + label between the two sub-boxes -->
+  <path d="M 880 266 L 880 286" class="conn" stroke="#5b21b6"/>
+  <text x="895" y="282" class="annot" fill="#5b21b6">exec runsc</text>
+
+  <!-- gVisor sandbox sub-box: what runsc actually creates. Contains the actor workload. -->
+  <g filter="url(#sketch)">
+    <rect x="730" y="290" width="300" height="90" rx="10" fill="#ede9fe" stroke="#5b21b6" stroke-width="1.8"/>
+  </g>
+  <text x="880" y="312" text-anchor="middle" class="label-med" fill="#5b21b6">gVisor sandbox</text>
+  <text x="880" y="328" text-anchor="middle" class="label-tiny" fill="#5b21b6">runsc-managed · one per actor</text>
+  <line x1="760" y1="336" x2="1000" y2="336" stroke="#c4b5fd" stroke-width="1.2"/>
+  <text x="880" y="354" text-anchor="middle" class="label-sm" font-weight="700">actor workload</text>
+  <text x="880" y="372" text-anchor="middle" class="label-tiny">from the actor's OCI image (+ pause container)</text>
 
   <!-- ============================== GCS (off-node) ============================== -->
   <g filter="url(#sketch)">
@@ -157,14 +170,15 @@
   <!-- atelet → unix socket box (the dial).  Comes down the right side of the atelet pod,
        passes through atelet's bind-mount pillar (which is what's literally true),
        and lands on the socket box. -->
-  <path d="M 360 370 Q 380 500 460 600" class="conn-blue"/>
-  <text x="395" y="500" class="step">12</text>
-  <text x="395" y="518" class="annot">dial socket</text>
+  <path d="M 360 390 Q 380 500 460 600" class="conn-blue"/>
+  <text x="395" y="510" class="step">12</text>
+  <text x="395" y="528" class="annot">dial socket</text>
 
   <!-- unix socket → ateom-gvisor (the actual RPC). Comes up the left side of the worker
-       pod via worker's bind-mount pillar. -->
-  <path d="M 690 600 Q 710 480 770 360" class="conn"/>
-  <text x="710" y="500" class="step">13</text>
-  <text x="710" y="518" class="annot">RestoreWorkload RPC</text>
+       pod via worker's bind-mount pillar, lands on ateom-gvisor (NOT the sandbox —
+       the RPC is handled by the ateom-gvisor process, which then execs runsc). -->
+  <path d="M 690 600 Q 715 430 735 260" class="conn"/>
+  <text x="710" y="510" class="step">13</text>
+  <text x="710" y="528" class="annot">RestoreWorkload RPC</text>
 
 </svg>

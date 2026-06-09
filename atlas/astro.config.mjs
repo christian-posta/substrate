@@ -1,6 +1,35 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
-import rehypeMermaid from 'rehype-mermaid';
+
+// Transforms ```mermaid code blocks into <pre class="mermaid"> for client-side rendering.
+// Avoids rehype-mermaid's playwright/mermaid-isomorphic dependency which breaks in CI.
+function rehypeMermaidPre() {
+  return function(tree) {
+    function walk(node) {
+      if (!node.children) return;
+      for (let i = 0; i < node.children.length; i++) {
+        const child = node.children[i];
+        if (
+          child.type === 'element' &&
+          child.tagName === 'pre' &&
+          child.children?.[0]?.tagName === 'code' &&
+          (child.children[0].properties?.className ?? []).includes('language-mermaid')
+        ) {
+          const text = child.children[0].children?.[0]?.value ?? '';
+          node.children[i] = {
+            type: 'element',
+            tagName: 'pre',
+            properties: { className: ['mermaid'] },
+            children: [{ type: 'text', value: text }],
+          };
+        } else {
+          walk(child);
+        }
+      }
+    }
+    walk(tree);
+  };
+}
 
 export default defineConfig({
   markdown: {
@@ -8,9 +37,7 @@ export default defineConfig({
       type: 'shiki',
       excludeLangs: ['mermaid'],
     },
-    rehypePlugins: [
-      [rehypeMermaid, { strategy: 'pre-mermaid' }],
-    ],
+    rehypePlugins: [rehypeMermaidPre],
   },
   integrations: [
     starlight({
