@@ -3,6 +3,9 @@ title: Resume actor (end-to-end)
 description: The most interesting flow in Substrate — a request arrives for a suspended actor, and the system wakes it on a pre-warmed gVisor worker in milliseconds.
 ---
 
+import nodeHostpath from '../../../assets/resume-node-hostpath.svg?raw';
+import lazyPaging from '../../../assets/resume-lazy-paging.svg?raw';
+
 This is **the** flow to understand if you want to understand Substrate. It
 touches DNS, the L7 proxy, ExtProc, ateapi's workflow engine, the Redis store,
 atelet, GCS, ateom-gvisor, and `runsc restore`. Six components and two data
@@ -26,7 +29,7 @@ sequenceDiagram
   participant X as ExtProc<br/>(atenet router)
   participant A as ateapi
   participant R as Redis
-  participant L as atelet<br/>(target node)
+  participant L as atelet DaemonSet<br/>(on assigned worker's node)
   participant G as GCS / S3
   participant O as ateom-gvisor<br/>(worker pod)
   participant W as Worker workload
@@ -47,6 +50,7 @@ sequenceDiagram
     A->>R: AssignWorker: pick random idle worker
     A->>R: UPDATE worker (actor_id=X), UPDATE actor (RESUMING + ateom pod ref)
 
+    Note over A,L: Dial atelet on the *node* hosting<br/>the assigned worker pod (atelet pod IP : 8085)
     A->>L: Restore(snapshotURI, ateom pod, runsc cfg)
     L->>G: Download checkpoint.img + pages.img + pages_meta.img (zstd, parallel)
     G-->>L: bytes
@@ -106,8 +110,11 @@ timeout) and steps through:
 1. **LoadActorForResume** — fetch actor + ActorTemplate.
 2. **AssignWorker** — random shuffle over idle workers in the target
    WorkerPool; update Redis: worker becomes assigned, actor goes `RESUMING`.
-3. **CallAteletRestore** — pick which restore strategy to use, then call
-   atelet on the chosen pod's IP.
+3. **CallAteletRestore** — pick which restore strategy to use, then
+   resolve the atelet DaemonSet pod that runs on the *same node* as the
+   assigned worker (informer indexed by node name) and dial that atelet's
+   pod IP on `:8085`. atelet is a per-node DaemonSet, not a per-pod
+   sidecar — one atelet serves every worker pod scheduled to its node.
 4. **FinalizeRunning** — set actor to `RUNNING`.
 
 <code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go:35-293</code>
@@ -123,9 +130,40 @@ else                                          → atelet.Run (boot from scratch)
 ### 10–14. atelet does the heavy lifting
 
 atelet's `Restore` handler downloads the three snapshot files from GCS in
-parallel, zstd-decompresses them onto the worker pod's local volume at
-`/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/restore-state/`, then calls
-ateom-gvisor over the Unix socket to begin the restore.
+parallel and zstd-decompresses them under
+`/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/restore-state/`. That
+directory is a **node `hostPath`** (`/var/lib/ateom-gvisor`) bind-mounted
+into both the atelet DaemonSet pod and every worker pod on the node, so
+ateom-gvisor (running inside the worker pod) sees the same files atelet
+just wrote. atelet then opens the ateom unix socket at
+`/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock` (also in the shared
+hostPath) and calls `RestoreWorkload` to kick off the restore.
+
+<figure style="margin: 1.5rem 0;">
+  <div class="atlas-hero-svg" set:html={nodeHostpath} />
+  <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
+    Two pods on one node, talking through the node's own filesystem. The shared
+    <code>hostPath</code> is how atelet "delivers" the snapshot files <em>and</em>
+    where it finds the unix socket to ateom-gvisor — there's no network hop
+    between them.
+  </figcaption>
+</figure>
+
+The pieces worth noticing in that picture:
+
+- **atelet is per-node, not per-pod.** One DaemonSet pod handles every
+  worker pod scheduled to that node. It does not run as a sidecar.
+- **The three snapshot files are downloaded in parallel** via an
+  `errgroup` and streamed through `zstd` on the way to disk
+  (`ategcs.FetchLocalFileFromGCSWithZstd`).
+- **The unix socket path is conventional, not negotiated.** atelet
+  composes it from the worker pod's UID
+  (`/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`) and dials it
+  directly. ateom-gvisor inside the worker pod is listening on the same
+  path because it sees the same mount.
+- **OCI bundle goes there too.** Before calling `RestoreWorkload`, atelet
+  writes a fresh `config.json` + rootfs bundle into the hostPath so
+  ateom-gvisor has everything `runsc restore` needs in one place.
 
 <code class="fileref">cmd/atelet/main.go:414-474</code>
 
@@ -136,6 +174,28 @@ paging**: `runsc` returns control as soon as the sentry is up; actual memory
 pages stream in lazily as the workload touches them. `-direct` skips some
 gVisor security restrictions for snapshot data. `-detach` returns
 immediately.
+
+<figure style="margin: 1.5rem 0;">
+  <div class="atlas-hero-svg" set:html={lazyPaging} />
+  <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
+    Without <code>-background</code>, restore would have to map every page of
+    <code>pages.img</code> before the workload can run a single instruction.
+    With it, the sentry is "up" the moment the metadata is loaded; the first
+    HTTP request page-faults its own working set in.
+  </figcaption>
+</figure>
+
+A few things to note about this trick:
+
+- **The first request pays a small page-in tax**, but only for the pages it
+  actually touches — usually a tiny fraction of resident memory.
+- **Subsequent requests are warm.** Once a page is in, it stays in until
+  the actor suspends again, so steady-state latency is whatever the
+  workload's normal latency is.
+- **`-detach` is what makes the RPC return.** Without it,
+  `RestoreWorkload` would block until the sandboxed process exited.
+  Combined with `-background`, atelet gets its `ok` back in milliseconds
+  and ateapi can finalize the actor to `RUNNING`.
 
 <code class="fileref">cmd/ateom-gvisor/runsc.go:134-158</code>
 

@@ -23,6 +23,68 @@ status:
 
 <code class="fileref">pkg/api/v1alpha1/workerpool_types.go</code>
 
+## A real example: `kagent-default`
+
+Here's the live `WorkerPool` from the `kagent` namespace — installed by
+the kagent Helm chart and used by every `SandboxAgent` running on
+substrate today, including the [`hello-substrate`
+ActorTemplate](/concepts/actortemplate/#a-real-example-hello-substrate):
+
+```yaml
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: kagent-default
+  namespace: kagent
+  labels:
+    app.kubernetes.io/instance: kagent
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: kagent
+    app.kubernetes.io/part-of: kagent
+spec:
+  ateomImage: localhost:5001/ateom-gvisor:latest
+  replicas: 2
+status:
+  replicas: 2
+```
+
+The whole spec is two fields. atecontroller's `WorkerPool` reconciler
+turned that into a Deployment named `kagent-default-deployment` (the
+`-deployment` suffix is hard-coded by the reconciler):
+
+```text
+$ kubectl get deploy -n kagent kagent-default-deployment
+NAME                        READY   UP-TO-DATE   AVAILABLE   AGE
+kagent-default-deployment   2/2     2            2           11h
+
+$ kubectl get pods -n kagent -l ate.dev/worker-pool=kagent-default
+NAME                                         READY   STATUS    RESTARTS   AGE
+kagent-default-deployment-7f464cd64c-m2fps   1/1     Running   0          11h
+kagent-default-deployment-7f464cd64c-r6lhv   1/1     Running   0          11h
+```
+
+A few things worth pointing out:
+
+- **`ateomImage` is the gVisor-hosting pod image, not the agent image.**
+  Every pod in this Deployment runs `ateom-gvisor`, which is the
+  per-node manager that boots runsc sandboxes for actors. Actor
+  containers (e.g. the `golang-adk` image from `hello-substrate`) live
+  *inside* runsc, not in this pod's container spec. See
+  [ateom-gvisor](/components/ateom-gvisor/).
+- **`replicas: 2` is the whole capacity knob.** This cluster can host
+  exactly two actors concurrently per template-pool binding. Bump it
+  and atecontroller scales the Deployment; new pods register themselves
+  with `WorkerPoolSyncer` and Redis without restarting anything.
+- **The pods are `privileged` and mount `/var/lib/ateom-gvisor` from
+  the host.** That's how ateom-gvisor manages runsc state across the
+  pod boundary — actors that survive a pod restart do so via files on
+  the host path, not in the pod's ephemeral storage.
+- **The Deployment selector is `ate.dev/worker-pool=kagent-default`.**
+  ateapi uses this label to find pool members when reconciling
+  Redis-side worker records.
+- **Owner-referenced by the WorkerPool.** Delete the `WorkerPool` CRD
+  and the Deployment (and all its pods) go away.
+
 ## What atecontroller does with it
 
 ```mermaid
