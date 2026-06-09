@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" role="img" aria-labelledby="title desc" font-family="'Comic Sans MS', 'Patrick Hand', 'Caveat', cursive, system-ui, sans-serif">
+  <title id="title">How a golden snapshot gets created</title>
+  <desc id="desc">atecontroller drives the ActorTemplate through four phases: it creates a throwaway 'golden' actor, resumes it (cold-boot on a real worker pod), waits 20 seconds while the workload actually runs, then suspends it so runsc checkpoints the sandbox and atelet uploads the snapshot files to GCS. Future actors of this template restore from that GCS snapshot.</desc>
+
+  <defs>
+    <filter id="sketch" x="-2%" y="-2%" width="104%" height="104%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="2" seed="13" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="0.8"/>
+    </filter>
+    <filter id="sketch-region" x="-2%" y="-2%" width="104%" height="104%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.014" numOctaves="2" seed="31" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.0"/>
+    </filter>
+
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f2937"/>
+    </marker>
+    <marker id="arrow-grn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+
+    <style>
+      .box-crd    { fill: #fef3c7; stroke: #92400e; stroke-width: 2.4; }
+      .box-cp     { fill: #dbeafe; stroke: #1e3a8a; stroke-width: 2.4; }
+      .box-pod    { fill: #dcfce7; stroke: #166534; stroke-width: 3.2; }
+      .box-st     { fill: #fee2e2; stroke: #991b1b; stroke-width: 2.4; }
+      .box-sand   { fill: #ede9fe; stroke: #5b21b6; stroke-width: 1.8; }
+      .box-note   { fill: #fef9c3; stroke: #a16207; stroke-width: 2.4; }
+      .box-tmpl   { fill: #fef3c7; stroke: #92400e; stroke-width: 2.4; }
+
+      .label-big   { font-size: 22px; font-weight: 700; fill: #111827; }
+      .label-med   { font-size: 16px; font-weight: 700; fill: #1f2937; }
+      .label-sm    { font-size: 13px; fill: #374151; }
+      .label-tiny  { font-size: 11px; fill: #6b7280; }
+      .step-num    { font-size: 28px; font-weight: 700; fill: #b91c1c; }
+      .region-tag  { font-size: 13px; font-weight: 700; fill: #4b5563; letter-spacing: 0.08em; }
+      .annot       { font-size: 13px; fill: #374151; font-style: italic; }
+      .punch       { font-size: 15px; font-weight: 700; fill: #b91c1c; }
+
+      .conn        { fill: none; stroke: #1f2937; stroke-width: 2.4; marker-end: url(#arrow); }
+      .conn-grn    { fill: none; stroke: #15803d; stroke-width: 2.4; marker-end: url(#arrow-grn); stroke-dasharray: 6 4; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="700" fill="#fdfcf7"/>
+
+  <!-- Title -->
+  <text x="600" y="38" text-anchor="middle" class="label-big">How a golden snapshot gets made</text>
+  <text x="600" y="60" text-anchor="middle" class="annot">It's not built. It's <tspan font-weight="700">run</tspan>: a throwaway actor really boots on a real worker, then its memory is captured.</text>
+
+  <!-- Phase strip — 4 cards across the top -->
+  <!-- Phase 1: Initial -->
+  <g filter="url(#sketch)">
+    <rect x="40" y="100" width="220" height="180" rx="12" class="box-crd"/>
+  </g>
+  <text x="60" y="125" class="step-num">①</text>
+  <text x="150" y="148" text-anchor="middle" class="label-med">ActorTemplate</text>
+  <text x="150" y="166" text-anchor="middle" class="label-med">applied</text>
+  <text x="150" y="194" text-anchor="middle" class="label-sm">image, env, entrypoint,</text>
+  <text x="150" y="210" text-anchor="middle" class="label-sm">target WorkerPool —</text>
+  <text x="150" y="226" text-anchor="middle" class="label-sm">just a Kubernetes</text>
+  <text x="150" y="242" text-anchor="middle" class="label-sm">manifest at this point</text>
+  <text x="150" y="266" text-anchor="middle" class="label-tiny" fill="#6b7280">Status.Phase = Initial</text>
+
+  <!-- Phase 2: throwaway golden actor created + resumed -->
+  <g filter="url(#sketch)">
+    <rect x="290" y="100" width="240" height="180" rx="12" class="box-cp"/>
+  </g>
+  <text x="310" y="125" class="step-num">②</text>
+  <text x="410" y="148" text-anchor="middle" class="label-med">atecontroller creates a</text>
+  <text x="410" y="166" text-anchor="middle" class="label-med">throwaway "golden" actor</text>
+  <text x="410" y="194" text-anchor="middle" class="label-sm">No special API — the</text>
+  <text x="410" y="210" text-anchor="middle" class="label-sm">reconciler calls the same</text>
+  <text x="410" y="226" text-anchor="middle" class="label-sm">CreateActor + ResumeActor</text>
+  <text x="410" y="242" text-anchor="middle" class="label-sm">RPCs a client would call.</text>
+  <text x="410" y="266" text-anchor="middle" class="label-tiny" fill="#6b7280">Phase = ResumeGoldenActor</text>
+
+  <!-- Phase 3: REAL worker pod runs the workload — the big highlighted box -->
+  <g filter="url(#sketch)">
+    <rect x="560" y="100" width="380" height="320" rx="14" class="box-pod"/>
+  </g>
+  <text x="580" y="125" class="step-num">③</text>
+  <text x="750" y="150" text-anchor="middle" class="label-big">REAL worker pod</text>
+  <text x="750" y="172" text-anchor="middle" class="annot">from the WorkerPool — same code path as any actor</text>
+
+  <!-- Sandbox sub-box: shows the workload running -->
+  <g filter="url(#sketch)">
+    <rect x="590" y="188" width="320" height="140" rx="10" class="box-sand"/>
+  </g>
+  <text x="750" y="212" text-anchor="middle" class="label-med" fill="#5b21b6">gVisor sandbox</text>
+  <text x="750" y="230" text-anchor="middle" class="label-tiny" fill="#5b21b6">runsc create + runsc start</text>
+  <line x1="610" y1="238" x2="890" y2="238" stroke="#c4b5fd" stroke-width="1.2"/>
+  <text x="750" y="258" text-anchor="middle" class="label-sm" font-weight="700">actor workload — boots from scratch</text>
+  <text x="750" y="276" text-anchor="middle" class="label-sm">from the actor's OCI image</text>
+  <text x="750" y="298" text-anchor="middle" class="punch">runs for ≈ 20 seconds</text>
+  <text x="750" y="316" text-anchor="middle" class="punch">consuming real CPU + real RAM</text>
+
+  <!-- Suspend / checkpoint line at the bottom of the worker box -->
+  <text x="750" y="352" text-anchor="middle" class="label-sm" font-weight="700">then: SuspendActor →</text>
+  <text x="750" y="370" text-anchor="middle" class="label-sm">ateom-gvisor exec's <tspan font-weight="700">runsc checkpoint</tspan></text>
+  <text x="750" y="388" text-anchor="middle" class="label-sm">sandbox memory + state freeze to disk</text>
+  <text x="750" y="408" text-anchor="middle" class="label-tiny" fill="#6b7280">Phase = WaitGoldenActor → Ready</text>
+
+  <!-- Phase 4: GCS bucket gets the snapshot -->
+  <g filter="url(#sketch)">
+    <rect x="970" y="100" width="190" height="200" rx="12" class="box-st"/>
+  </g>
+  <text x="990" y="125" class="step-num">④</text>
+  <text x="1065" y="148" text-anchor="middle" class="label-med">GCS bucket</text>
+  <text x="1065" y="166" text-anchor="middle" class="label-tiny">snapshot of the run</text>
+  <line x1="990" y1="178" x2="1140" y2="178" stroke="#fca5a5" stroke-width="1.2"/>
+  <text x="1065" y="200" text-anchor="middle" class="label-sm">checkpoint.img.zstd</text>
+  <text x="1065" y="218" text-anchor="middle" class="label-sm">pages.img.zstd</text>
+  <text x="1065" y="236" text-anchor="middle" class="label-sm">pages_meta.img.zstd</text>
+  <text x="1065" y="268" text-anchor="middle" class="label-tiny" fill="#6b7280">uploaded by atelet</text>
+  <text x="1065" y="284" text-anchor="middle" class="label-tiny" fill="#6b7280">from the worker node</text>
+
+  <!-- Phase 5: snapshot URI stamped back onto the ActorTemplate.Status -->
+  <g filter="url(#sketch)">
+    <rect x="970" y="330" width="190" height="120" rx="12" class="box-tmpl"/>
+  </g>
+  <text x="990" y="355" class="step-num">⑤</text>
+  <text x="1065" y="380" text-anchor="middle" class="label-med">ActorTemplate</text>
+  <text x="1065" y="398" text-anchor="middle" class="label-med">.Status</text>
+  <text x="1065" y="418" text-anchor="middle" class="label-sm">.GoldenSnapshot = URI</text>
+  <text x="1065" y="434" text-anchor="middle" class="label-sm">.Phase = Ready</text>
+
+  <!-- Connector arrows between phase cards -->
+  <path d="M 260 190 L 290 190" class="conn"/>
+  <path d="M 530 190 L 560 190" class="conn"/>
+  <path d="M 940 190 L 970 190" class="conn"/>
+  <text x="952" y="180" class="label-tiny" fill="#6b7280" text-anchor="middle">upload</text>
+
+  <!-- GCS → ActorTemplate.Status (the URI gets stamped back) -->
+  <path d="M 1065 300 L 1065 330" class="conn"/>
+  <text x="1078" y="320" class="label-tiny" fill="#6b7280">stamp URI</text>
+
+  <!-- ====================== Bottom callout ====================== -->
+  <g filter="url(#sketch-region)" opacity="0.55">
+    <rect x="40" y="490" width="1120" height="180" rx="14" fill="#dcfce7" stroke="#166534" stroke-width="1.6" stroke-dasharray="8 7"/>
+  </g>
+  <text x="60" y="516" class="region-tag">AFTER READY — what every later actor of this template gets to skip</text>
+
+  <text x="600" y="552" text-anchor="middle" class="label-med">No more Phase ①–④. The GCS snapshot is the new starting line.</text>
+
+  <!-- Mini flow showing later actor path -->
+  <g filter="url(#sketch)">
+    <rect x="100" y="580" width="200" height="60" rx="10" class="box-cp"/>
+    <rect x="350" y="580" width="240" height="60" rx="10" class="box-st"/>
+    <rect x="640" y="580" width="240" height="60" rx="10" class="box-pod"/>
+    <rect x="930" y="580" width="170" height="60" rx="10" class="box-sand"/>
+  </g>
+  <text x="200" y="608" text-anchor="middle" class="label-sm">client calls</text>
+  <text x="200" y="626" text-anchor="middle" class="label-sm">CreateActor + ResumeActor</text>
+
+  <text x="470" y="608" text-anchor="middle" class="label-sm">ateapi picks restore strategy:</text>
+  <text x="470" y="626" text-anchor="middle" class="label-sm">GoldenSnapshot → pull from GCS</text>
+
+  <text x="760" y="608" text-anchor="middle" class="label-sm">runsc restore -background</text>
+  <text x="760" y="626" text-anchor="middle" class="label-sm">on a fresh worker pod</text>
+
+  <text x="1015" y="608" text-anchor="middle" class="label-sm" font-weight="700">live in milliseconds</text>
+  <text x="1015" y="626" text-anchor="middle" class="label-tiny" fill="#5b21b6">no cold boot, no 20s wait</text>
+
+  <!-- arrows between bottom flow boxes -->
+  <path d="M 300 610 L 350 610" class="conn-grn"/>
+  <path d="M 590 610 L 640 610" class="conn-grn"/>
+  <path d="M 880 610 L 930 610" class="conn-grn"/>
+
+</svg>
