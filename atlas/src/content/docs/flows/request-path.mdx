@@ -1,12 +1,12 @@
 ---
 title: Request path
-description: How an inbound HTTP request gets from a client to the right actor on the right worker. No per-pod sidecar — a single Envoy fleet + ExtProc + ateapi lookup.
+description: How an inbound HTTP request gets from a client to the right actor on the right worker. No per-pod sidecar — a single L7 proxy fleet + ExtProc + ateapi lookup.
 ---
 
 The [resume actor flow](/flows/resume-actor/) covers the **cold** path
 end-to-end. This page focuses on the **routing mechanics**: how atenet
-discovers the worker IP for a given actor, what Envoy is configured to do, and
-what happens when the actor is already running (the warm path).
+discovers the worker IP for a given actor, what the L7 proxy is configured to
+do, and what happens when the actor is already running (the warm path).
 
 ## Warm path — already running actor
 
@@ -15,7 +15,7 @@ sequenceDiagram
   autonumber
   participant C as Client
   participant DNS as CoreDNS
-  participant E as Envoy
+  participant E as L7 proxy
   participant X as ExtProc
   participant A as ateapi
   participant W as Worker
@@ -38,7 +38,7 @@ runsc. The actor is already on a worker; we just need to learn which one.
 
 ## Why there's no per-pod sidecar
 
-There is **one Envoy Deployment** for the whole cluster (atenet router).
+There is **one L7-proxy Deployment** for the whole cluster (atenet router).
 Every request goes through it. This is deliberate:
 
 - A sidecar per worker pod would mean configuring N proxies any time routing
@@ -62,7 +62,7 @@ flowchart LR
   API --> RED[(Redis)]
   RED --> API
   API --> EXT
-  EXT -->|HeaderMutation:<br/>:authority=ip:80| ENV[Envoy]
+  EXT -->|HeaderMutation:<br/>:authority=ip:80| ENV[L7 proxy]
   ENV --> WK[Worker]
 ```
 
@@ -84,9 +84,9 @@ its result.
 
 <code class="fileref">cmd/atenet/internal/app/router/resumer.go:29-93</code>
 
-## Envoy configuration via xDS
+## L7 proxy configuration via xDS
 
-Envoy is bootstrapped pointing at the atenet router's **xDS server on
+The proxy is bootstrapped pointing at the atenet router's **xDS server on
 `:18000`**. The xDS snapshot has:
 
 | Element | Purpose |
@@ -95,7 +95,7 @@ Envoy is bootstrapped pointing at the atenet router's **xDS server on
 | `ingress_https_listener` (:8443) | HTTPS ingress |
 | Route `substrate_routes` | Sends everything through ext_proc |
 | Cluster `ate-cluster` | Static cluster pointing at ExtProc (:50051) |
-| Cluster `dynamic_forward_proxy_cluster` | Forwards to whatever :authority Envoy now holds |
+| Cluster `dynamic_forward_proxy_cluster` | Forwards to whatever :authority the proxy now holds |
 
 The snapshot is refreshed every 5 seconds by a controller loop that
 re-reads `atStore.readyTemplates(...)` and rebuilds the snapshot — it's a
@@ -113,7 +113,7 @@ time the actor migrated.
 Instead CoreDNS returns the **router's ClusterIP** for any name matching
 `*.actors.resources.substrate.ate.dev`. The router (via ExtProc) does the
 per-request lookup that yields the current worker IP — and rewrites
-`:authority` so Envoy's `dynamic_forward_proxy_cluster` hits it.
+`:authority` so the proxy's `dynamic_forward_proxy_cluster` hits it.
 
 <code class="fileref">internal/dns/dns.go:71-88</code> ·
 <code class="fileref">internal/dns/corefile.go:42-59</code>

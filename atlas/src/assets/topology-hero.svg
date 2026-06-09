@@ -1,152 +1,204 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 520" role="img" aria-labelledby="title desc" font-family="'Comic Sans MS', 'Patrick Hand', 'Caveat', cursive, system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 820" role="img" aria-labelledby="title desc" font-family="'Comic Sans MS', 'Patrick Hand', 'Caveat', cursive, system-ui, sans-serif">
   <title id="title">Substrate topology — whiteboard view</title>
-  <desc id="desc">Client connects to atenet, which routes via ateapi to a worker pod; atelet ships snapshots to GCS/S3.</desc>
+  <desc id="desc">Client connects to atenet, which consults ateapi (control plane) to find the right worker pod. atelet uploads and downloads snapshots between the worker pod and GCS/S3.</desc>
 
-  <!-- Hand-drawn sketch filter: subtle wobble on all strokes -->
   <defs>
     <filter id="sketch" x="-2%" y="-2%" width="104%" height="104%">
-      <feTurbulence type="fractalNoise" baseFrequency="0.02" numOctaves="2" seed="3" result="noise"/>
-      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.6"/>
+      <feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="2" seed="5" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="0.8"/>
     </filter>
-    <filter id="sketch2" x="-2%" y="-2%" width="104%" height="104%">
-      <feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="2" seed="11" result="noise"/>
-      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.4"/>
+    <filter id="sketch-region" x="-2%" y="-2%" width="104%" height="104%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.014" numOctaves="2" seed="13" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.0"/>
     </filter>
 
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#3b3b3b"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f2937"/>
     </marker>
 
     <style>
-      .box  { fill: #fffbe6; stroke: #2c2c2c; stroke-width: 2.2; }
-      .box-cp { fill: #e7f1ff; stroke: #1e3a8a; stroke-width: 2.2; }
-      .box-dp { fill: #e9f7e7; stroke: #166534; stroke-width: 2.2; }
-      .box-st { fill: #fde2e2; stroke: #991b1b; stroke-width: 2.2; }
-      .box-cl { fill: #f3e8ff; stroke: #581c87; stroke-width: 2.2; }
-      .label-big   { font-size: 19px; font-weight: 700; fill: #1f2937; }
-      .label-sm    { font-size: 13px; fill: #374151; }
-      .label-tiny  { font-size: 11px; fill: #6b7280; }
-      .group-label { font-size: 13px; font-weight: 700; fill: #6b7280; letter-spacing: 0.04em; }
-      .conn        { fill: none; stroke: #3b3b3b; stroke-width: 2.2; marker-end: url(#arrow); }
-      .conn-bi     { fill: none; stroke: #3b3b3b; stroke-width: 2.2; marker-end: url(#arrow); marker-start: url(#arrow); }
-      .conn-dot    { stroke-dasharray: 5 4; }
-      .annot       { font-size: 12px; fill: #4b5563; font-style: italic; }
+      .box-cl   { fill: #f3e8ff; stroke: #4c1d95; stroke-width: 2.4; }
+      .box-gw   { fill: #fffbe6; stroke: #92400e; stroke-width: 2.4; }
+      .box-cp   { fill: #dbeafe; stroke: #1e3a8a; stroke-width: 2.4; }
+      .box-dp   { fill: #dcfce7; stroke: #166534; stroke-width: 2.4; }
+      .box-st   { fill: #fee2e2; stroke: #991b1b; stroke-width: 2.4; }
+      .box-sub  { fill: #ffffff; stroke: #166534; stroke-width: 1.6; }
+
+      .label-big   { font-size: 23px; font-weight: 700; fill: #111827; }
+      .label-med   { font-size: 17px; font-weight: 700; fill: #1f2937; }
+      .label-sm    { font-size: 14px; fill: #374151; }
+      .label-tiny  { font-size: 12px; fill: #6b7280; }
+      .region-tag  { font-size: 13px; font-weight: 700; fill: #4b5563; letter-spacing: 0.08em; }
+
+      .conn     { fill: none; stroke: #1f2937; stroke-width: 2.4; marker-end: url(#arrow); }
+      .conn-bi  { fill: none; stroke: #1f2937; stroke-width: 2.4; marker-end: url(#arrow); marker-start: url(#arrow); }
+      .conn-dot { stroke-dasharray: 6 5; }
+      .annot    { font-size: 14px; fill: #374151; font-style: italic; }
+
+      /* Clickable boxes — show pointer + slight brightening on hover. */
+      a, a * { cursor: pointer; }
+      a:focus { outline: none; }
+      a:hover rect { stroke-width: 3.6; filter: brightness(1.04); }
+      a:hover text { fill: #000; }
     </style>
   </defs>
 
   <!-- Background -->
-  <rect width="920" height="520" fill="#fdfcf7"/>
+  <rect width="1240" height="820" fill="#fdfcf7"/>
 
-  <!-- ==== GROUP REGIONS ==== -->
-  <!-- Control plane region -->
-  <g filter="url(#sketch2)" opacity="0.55">
-    <rect x="320" y="40"  width="350" height="170" rx="14" fill="#dbeafe" stroke="#1e3a8a" stroke-width="1.5" stroke-dasharray="6 6"/>
+  <!-- ============================== REGIONS ============================== -->
+  <!-- Control plane region (right, top) -->
+  <g filter="url(#sketch-region)" opacity="0.55">
+    <rect x="490" y="60" width="720" height="240" rx="18" fill="#dbeafe" stroke="#1e3a8a" stroke-width="1.6" stroke-dasharray="8 7"/>
   </g>
-  <text x="335" y="60" class="group-label">CONTROL PLANE</text>
+  <text x="510" y="86" class="region-tag">CONTROL PLANE</text>
 
-  <!-- Data plane region -->
-  <g filter="url(#sketch2)" opacity="0.55">
-    <rect x="320" y="290" width="350" height="200" rx="14" fill="#dcfce7" stroke="#166534" stroke-width="1.5" stroke-dasharray="6 6"/>
+  <!-- Data plane region (right, middle) -->
+  <g filter="url(#sketch-region)" opacity="0.55">
+    <rect x="490" y="370" width="720" height="220" rx="18" fill="#dcfce7" stroke="#166534" stroke-width="1.6" stroke-dasharray="8 7"/>
   </g>
-  <text x="335" y="310" class="group-label">DATA PLANE  (per worker node)</text>
+  <text x="510" y="396" class="region-tag">DATA PLANE  ·  per worker node</text>
 
-  <!-- ==== BOXES ==== -->
+  <!-- Storage region (right, bottom) -->
+  <g filter="url(#sketch-region)" opacity="0.55">
+    <rect x="490" y="650" width="720" height="140" rx="18" fill="#fee2e2" stroke="#991b1b" stroke-width="1.6" stroke-dasharray="8 7"/>
+  </g>
+  <text x="510" y="676" class="region-tag">SNAPSHOT STORAGE</text>
+
+  <!-- ============================== BOXES =============================== -->
 
   <!-- Client -->
   <g filter="url(#sketch)">
-    <rect x="30" y="225" width="130" height="70" rx="10" class="box-cl"/>
+    <rect x="40" y="400" width="170" height="110" rx="14" class="box-cl"/>
   </g>
-  <text x="95" y="260" text-anchor="middle" class="label-big">Client</text>
-  <text x="95" y="278" text-anchor="middle" class="label-sm">HTTP / DNS</text>
+  <text x="125" y="444" text-anchor="middle" class="label-big">Client</text>
+  <text x="125" y="470" text-anchor="middle" class="label-sm">HTTP request</text>
+  <text x="125" y="492" text-anchor="middle" class="label-tiny">actorId.actors…ate.dev</text>
 
-  <!-- atenet -->
-  <g filter="url(#sketch)">
-    <rect x="195" y="215" width="100" height="90" rx="10" class="box"/>
-  </g>
-  <text x="245" y="248" text-anchor="middle" class="label-big">atenet</text>
-  <text x="245" y="268" text-anchor="middle" class="label-sm">Envoy + DNS</text>
-  <text x="245" y="286" text-anchor="middle" class="label-tiny">ExtProc, xDS</text>
+  <!-- atenet (gateway) -->
+  <a href="/components/atenet/">
+    <g filter="url(#sketch)">
+      <rect x="260" y="400" width="170" height="110" rx="14" class="box-gw"/>
+    </g>
+    <text x="345" y="440" text-anchor="middle" class="label-big">atenet</text>
+    <text x="345" y="464" text-anchor="middle" class="label-sm">L7 proxy + DNS</text>
+    <text x="345" y="486" text-anchor="middle" class="label-tiny">ExtProc · xDS</text>
+  </a>
 
   <!-- ateapi -->
-  <g filter="url(#sketch)">
-    <rect x="350" y="80" width="135" height="80" rx="10" class="box-cp"/>
-  </g>
-  <text x="417" y="112" text-anchor="middle" class="label-big">ateapi</text>
-  <text x="417" y="132" text-anchor="middle" class="label-sm">gRPC + workflows</text>
+  <a href="/components/ateapi/">
+    <g filter="url(#sketch)">
+      <rect x="520" y="110" width="180" height="120" rx="14" class="box-cp"/>
+    </g>
+    <text x="610" y="152" text-anchor="middle" class="label-big">ateapi</text>
+    <text x="610" y="180" text-anchor="middle" class="label-sm">gRPC + workflows</text>
+    <text x="610" y="202" text-anchor="middle" class="label-tiny">source of truth</text>
+  </a>
 
-  <!-- atecontroller -->
-  <g filter="url(#sketch)">
-    <rect x="510" y="80" width="140" height="80" rx="10" class="box-cp"/>
-  </g>
-  <text x="580" y="112" text-anchor="middle" class="label-big">atecontroller</text>
-  <text x="580" y="132" text-anchor="middle" class="label-sm">CRD reconciler</text>
+  <!-- Redis (attached right of ateapi) -->
+  <a href="/components/storage/">
+    <g filter="url(#sketch)">
+      <rect x="730" y="110" width="120" height="120" rx="14" class="box-cp"/>
+    </g>
+    <text x="790" y="152" text-anchor="middle" class="label-med">Redis</text>
+    <text x="790" y="178" text-anchor="middle" class="label-tiny">actors</text>
+    <text x="790" y="196" text-anchor="middle" class="label-tiny">workers</text>
+    <text x="790" y="214" text-anchor="middle" class="label-tiny">locks</text>
+  </a>
 
-  <!-- Redis -->
-  <g filter="url(#sketch)">
-    <rect x="350" y="170" width="135" height="38" rx="10" class="box-cp"/>
-  </g>
-  <text x="417" y="195" text-anchor="middle" class="label-sm" font-weight="700">Redis / Valkey</text>
+  <!-- atecontroller (right of Redis) -->
+  <a href="/components/atecontroller/">
+    <g filter="url(#sketch)">
+      <rect x="880" y="110" width="220" height="120" rx="14" class="box-cp"/>
+    </g>
+    <text x="990" y="152" text-anchor="middle" class="label-big">atecontroller</text>
+    <text x="990" y="180" text-anchor="middle" class="label-sm">CRD reconciler</text>
+    <text x="990" y="202" text-anchor="middle" class="label-tiny">WorkerPool · ActorTemplate</text>
+  </a>
 
   <!-- atelet -->
-  <g filter="url(#sketch)">
-    <rect x="350" y="330" width="135" height="60" rx="10" class="box-dp"/>
-  </g>
-  <text x="417" y="358" text-anchor="middle" class="label-big">atelet</text>
-  <text x="417" y="376" text-anchor="middle" class="label-sm">DaemonSet</text>
+  <a href="/components/atelet/">
+    <g filter="url(#sketch)">
+      <rect x="520" y="420" width="180" height="120" rx="14" class="box-dp"/>
+    </g>
+    <text x="610" y="464" text-anchor="middle" class="label-big">atelet</text>
+    <text x="610" y="490" text-anchor="middle" class="label-sm">DaemonSet</text>
+    <text x="610" y="512" text-anchor="middle" class="label-tiny">drives ateom · ships snapshots</text>
+  </a>
 
-  <!-- Worker pod (with ateom-gvisor inside) -->
-  <g filter="url(#sketch)">
-    <rect x="350" y="400" width="300" height="76" rx="10" class="box-dp"/>
-  </g>
-  <text x="500" y="428" text-anchor="middle" class="label-big">Worker pod  (gVisor)</text>
-  <text x="500" y="448" text-anchor="middle" class="label-sm">ateom-gvisor  ·  runsc  ·  workload</text>
-  <text x="500" y="466" text-anchor="middle" class="label-tiny">checkpoint / restore over Unix socket</text>
+  <!-- Worker pod (outer shell linked to /components/workers/) -->
+  <a href="/components/workers/">
+    <g filter="url(#sketch)">
+      <rect x="730" y="410" width="380" height="160" rx="14" class="box-dp"/>
+    </g>
+    <text x="920" y="442" text-anchor="middle" class="label-big">Worker pod  ·  gVisor</text>
+    <text x="920" y="552" text-anchor="middle" class="label-tiny" fill="#6b7280">one actor per pod · pool of N pods</text>
+  </a>
 
-  <!-- Worker pod sibling (just visually suggest a pool) -->
-  <g filter="url(#sketch)" opacity="0.45">
-    <rect x="362" y="384" width="280" height="12" rx="4" class="box-dp"/>
-  </g>
-  <g filter="url(#sketch)" opacity="0.7">
-    <rect x="356" y="372" width="292" height="14" rx="6" class="box-dp"/>
-  </g>
+  <!-- Worker pod sub-boxes — each linked to its own component page -->
+  <a href="/components/ateom-gvisor/">
+    <g filter="url(#sketch)">
+      <rect x="750" y="460" width="140" height="56" rx="8" class="box-sub"/>
+    </g>
+    <text x="820" y="484" text-anchor="middle" class="label-sm" font-weight="700">ateom-gvisor</text>
+    <text x="820" y="503" text-anchor="middle" class="label-tiny">Unix socket gRPC</text>
+  </a>
+  <a href="/components/ateom-gvisor/">
+    <g filter="url(#sketch)">
+      <rect x="900" y="460" width="90" height="56" rx="8" class="box-sub"/>
+    </g>
+    <text x="945" y="484" text-anchor="middle" class="label-sm" font-weight="700">runsc</text>
+    <text x="945" y="503" text-anchor="middle" class="label-tiny">gVisor</text>
+  </a>
+  <a href="/components/workers/">
+    <g filter="url(#sketch)">
+      <rect x="1000" y="460" width="95" height="56" rx="8" class="box-sub"/>
+    </g>
+    <text x="1047" y="484" text-anchor="middle" class="label-sm" font-weight="700">workload</text>
+    <text x="1047" y="503" text-anchor="middle" class="label-tiny">your code</text>
+  </a>
 
-  <!-- Storage -->
-  <g filter="url(#sketch)">
-    <rect x="745" y="385" width="140" height="80" rx="14" class="box-st"/>
-  </g>
-  <text x="815" y="420" text-anchor="middle" class="label-big">GCS / S3</text>
-  <text x="815" y="440" text-anchor="middle" class="label-sm">checkpoint snapshots</text>
-  <text x="815" y="456" text-anchor="middle" class="label-tiny">(zstd-compressed)</text>
+  <!-- GCS / S3 -->
+  <a href="/components/storage/">
+    <g filter="url(#sketch)">
+      <rect x="520" y="690" width="180" height="80" rx="14" class="box-st"/>
+    </g>
+    <text x="610" y="722" text-anchor="middle" class="label-big">GCS / S3</text>
+    <text x="610" y="745" text-anchor="middle" class="label-sm">checkpoint snapshots</text>
+    <text x="610" y="762" text-anchor="middle" class="label-tiny">zstd-compressed</text>
+  </a>
 
-  <!-- ==== CONNECTIONS ==== -->
+  <!-- ============================== ARROWS ============================== -->
 
-  <!-- Client ↔ atenet -->
-  <path d="M 160 260 L 192 260" class="conn"/>
-  <text x="178" y="252" text-anchor="middle" class="annot">HTTP</text>
+  <!-- 1. Client → atenet -->
+  <path d="M 210 455 L 256 455" class="conn"/>
+  <text x="233" y="445" text-anchor="middle" class="annot">HTTP</text>
 
-  <!-- atenet → ateapi  (ResumeActor per request) -->
-  <path d="M 296 240 C 320 210, 335 165, 350 130" class="conn"/>
-  <text x="320" y="180" class="annot">ResumeActor</text>
+  <!-- 2. atenet → ateapi (ResumeActor) -->
+  <path d="M 430 425 C 470 320, 490 240, 520 218" class="conn"/>
+  <text x="438" y="320" class="annot">ResumeActor</text>
+  <text x="438" y="338" class="annot">(per request)</text>
 
-  <!-- atenet → worker (HTTP forward) -->
-  <path d="M 296 280 C 320 320, 335 380, 350 432" class="conn"/>
-  <text x="298" y="345" class="annot">HTTP →</text>
+  <!-- 3. atenet → worker pod (HTTP after :authority rewrite).
+       L-shape: down from atenet bottom, across BELOW atelet, up into worker pod.
+       Keeps the horizontal segment in the clear gap between DP and Storage regions. -->
+  <path d="M 345 510 L 345 618 L 718 618 L 730 568" class="conn"/>
+  <text x="476" y="606" text-anchor="middle" class="annot">HTTP after :authority rewrite</text>
 
-  <!-- ateapi ↔ Redis -->
-  <path d="M 417 160 L 417 170" class="conn-bi"/>
+  <!-- 4. ateapi ↔ Redis -->
+  <path d="M 700 170 L 730 170" class="conn-bi"/>
 
-  <!-- ateapi → atelet (Checkpoint / Restore / Run) -->
-  <path d="M 417 208 L 417 330" class="conn"/>
-  <text x="425" y="270" class="annot">Checkpoint / Restore</text>
+  <!-- 5. ateapi → atelet -->
+  <path d="M 610 230 L 610 416" class="conn"/>
+  <text x="622" y="340" class="annot">Run · Checkpoint · Restore</text>
 
-  <!-- atelet → worker pod (Unix socket to ateom) -->
-  <path d="M 417 390 L 417 400" class="conn"/>
+  <!-- 6. atelet → worker pod (drives ateom) -->
+  <path d="M 700 480 L 730 480" class="conn"/>
 
-  <!-- atelet ↔ GCS -->
-  <path d="M 485 360 C 600 360, 700 400, 745 412" class="conn-bi"/>
-  <text x="600" y="350" class="annot">upload / download (zstd)</text>
+  <!-- 7. atelet ↔ GCS/S3 -->
+  <path d="M 610 540 L 610 690" class="conn-bi"/>
+  <text x="622" y="618" class="annot">upload /</text>
+  <text x="622" y="636" class="annot">download</text>
+  <text x="622" y="654" class="annot">(zstd)</text>
 
-  <!-- atecontroller → K8s API (implied) -->
-  <path d="M 580 160 L 580 200" class="conn conn-dot"/>
-  <text x="588" y="186" class="annot">reconciles CRDs (K8s API)</text>
 </svg>

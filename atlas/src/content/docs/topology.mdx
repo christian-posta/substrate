@@ -71,7 +71,7 @@ is the only thing that talks to runsc.
 flowchart LR
   Client([External client])
   DNS["atenet DNS<br/>(CoreDNS Corefile mgr)"]
-  ROUTER["atenet router<br/>Envoy :8080/:8443<br/>ExtProc :50051"]
+  ROUTER["atenet router<br/>L7 proxy :8080/:8443<br/>ExtProc :50051"]
   ATEAPI["ateapi"]
   WORKLOAD[["Worker workload"]]
 
@@ -99,7 +99,7 @@ case), see [Resume actor](/flows/resume-actor/).
 |---|---|---|
 | **ateapi** | Deployment | Source of truth for actor & worker state. Serves `Control` and `SessionIdentity` gRPC services. Owns the suspend/resume workflows. |
 | **atecontroller** | Deployment | Watches the K8s API. Reconciles `WorkerPool` (→ Deployments of worker pods) and `ActorTemplate` (→ golden snapshot bootstrap). |
-| **atenet** | Deployments (one binary, two subcommands) | `atenet router` runs Envoy + ExtProc and does the per-request dance to find the right worker. `atenet dns` programs CoreDNS so `<actorId>.actors.resources.substrate.ate.dev` resolves. Each subcommand is typically deployed as its own Deployment. |
+| **atenet** | Deployments (one binary, two subcommands) | `atenet router` runs an L7 proxy + ExtProc and does the per-request dance to find the right worker. `atenet dns` programs CoreDNS so `<actorId>.actors.resources.substrate.ate.dev` resolves. Each subcommand is typically deployed as its own Deployment. |
 | **atelet** | DaemonSet | Lives on each worker node. Receives gRPC calls from ateapi. Pulls images, manages OCI bundles, talks to ateom over a Unix socket, ships snapshots to GCS/S3. |
 | **ateom-gvisor** | In-pod helper | Lives inside every worker pod. Tiny gRPC server on a Unix socket. Shells out to `runsc checkpoint` / `runsc restore`. |
 | **Worker pods** | Deployment-spawned (from `WorkerPool`) | Pre-warmed gVisor sandboxes. Each can host one actor at a time; the gVisor sandbox (with its pause process) is created on assignment, not at pod start. |
@@ -113,16 +113,16 @@ case), see [Resume actor](/flows/resume-actor/).
 |---|---|---|
 | ateapi | 443 | gRPC (TLS) |
 | atelet | 8085 | gRPC |
-| atenet router (Envoy) | 8080 / 8443 | HTTP / HTTPS |
-| atenet ExtProc | 50051 | gRPC (Envoy ext_proc) |
-| atenet xDS | 18000 | gRPC (Envoy control) |
+| atenet router (L7 proxy) | 8080 / 8443 | HTTP / HTTPS |
+| atenet ExtProc | 50051 | gRPC (ext_proc) |
+| atenet xDS | 18000 | gRPC (xDS control plane) |
 | ateom-gvisor | Unix socket | gRPC — `/var/lib/ateom-gvisor/ateoms/{podUID}/ateom.sock` |
 
 ## How traffic *actually* gets to an actor
 
-The short version: there is **no per-pod sidecar**. atenet's centralized Envoy
-is the single dataplane proxy, and ExtProc consults ateapi on each request to
-discover (and if needed, resume) the actor's worker.
+The short version: there is **no per-pod sidecar**. atenet's centralized
+L7 proxy is the single dataplane proxy, and ExtProc consults ateapi on each
+request to discover (and if needed, resume) the actor's worker.
 
 See the [request path flow](/flows/resume-actor/) for the full sequence.
 
