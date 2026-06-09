@@ -5,7 +5,7 @@ description: How atecontroller turns an ActorTemplate CRD into a reusable "golde
 
 import goldenLifecycle from '../../../assets/golden-snapshot-lifecycle.svg?raw';
 
-An `ActorTemplate` says *"this is what an actor of this kind looks like"* —
+An `ActorTemplate` says *"this is what an actor of this kind looks like"* -
 image, entrypoint, env vars, worker pool. By itself that's just a manifest.
 
 The interesting part is how Substrate produces the **golden snapshot** that
@@ -15,7 +15,7 @@ build the snapshot statically from the image. Instead:
 :::caution[The snapshot is recorded, not built]
 `atecontroller` reacts to the new template by creating a **throwaway "golden"
 actor**, calling `ResumeActor` on it, and letting the workload **actually
-boot on a real worker pod** — same gVisor sandbox, same `runsc create`,
+boot on a real worker pod** - same gVisor sandbox, same `runsc create`,
 same pulled OCI image, real CPU and RAM. After **20 seconds** of actual
 runtime it issues `SuspendActor`, which makes ateom-gvisor exec
 `runsc checkpoint` against the running sandbox. atelet uploads the
@@ -24,14 +24,14 @@ URI gets stamped back onto `ActorTemplate.Status.GoldenSnapshot`.
 
 So the "golden" image is a **live memory snapshot of a freshly-booted
 workload**, not a precomputed artifact. New actors get the side effects of
-all that initialization work — heap state, JIT caches, opened FDs, parsed
-config — without paying for it again.
+all that initialization work - heap state, JIT caches, opened FDs, parsed
+config - without paying for it again.
 :::
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={goldenLifecycle} />
   <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
-    The bootstrap really does occupy a worker pod for ≈ 20 seconds — that pod is the
+    The bootstrap really does occupy a worker pod for ≈ 20 seconds - that pod is the
     one a regular actor would have gotten. After Ready, every later actor of this
     template skips ①–④ entirely and restores from the GCS snapshot.
   </figcaption>
@@ -49,7 +49,7 @@ stateDiagram-v2
 ```
 
 `PhaseFailed` is declared in the CRD type but the reconciler never assigns
-it — errors return up and trigger a normal requeue.
+it - errors return up and trigger a normal requeue.
 
 <code class="fileref">internal/controllers/actortemplate_controller.go:70-155</code>
 
@@ -76,7 +76,7 @@ sequenceDiagram
 
   rect rgb(245,245,235)
     Note over CT: Phase: WaitGoldenActor
-    CT->>CT: stamp Status.TakeGoldenSnapshotAt = now + 20s<br/>return ctrl.Result{RequeueAfter: 20s}<br/>(controller-runtime requeues — not a blocking sleep)
+    CT->>CT: stamp Status.TakeGoldenSnapshotAt = now + 20s<br/>return ctrl.Result{RequeueAfter: 20s}<br/>(controller-runtime requeues - not a blocking sleep)
   end
 
   rect rgb(235,235,245)
@@ -100,7 +100,7 @@ Once `ActorTemplate.Status.GoldenSnapshot` is set:
 - The result: new actors of this template come up in **lazy-page-restore
   time**, not cold-boot time.
 
-## The 20-second wait — why?
+## The 20-second wait - why?
 
 The reconciler **waits 20 seconds between resume and suspend** to give the
 workload time to initialize. It's not a blocking sleep: the reconciler
@@ -111,7 +111,7 @@ later. This is intentionally crude: the controller has no protocol for
 window.
 
 If your workload needs longer (e.g. downloading a model), the resulting
-golden snapshot will be of a partially-initialized process — and that's
+golden snapshot will be of a partially-initialized process - and that's
 what every actor of this template will restore from. You'd typically build
 the heavy initialization into your container image instead.
 
@@ -119,7 +119,7 @@ the heavy initialization into your container image instead.
 
 ## What about the workload running during the wait?
 
-Yes — the golden actor is occupying a real worker pod, eating real
+Yes - the golden actor is occupying a real worker pod, eating real
 resources, for the whole 20-second window (see the callout at the top of
 the page). The reconcile goroutine is *not* blocked during the wait; the
 work-queue holds the item until `RequeueAfter` elapses, so atecontroller
@@ -139,7 +139,7 @@ spec changes.
 
 ## Failure paths
 
-The reconciler does **not** transition to `PhaseFailed` on errors — it
+The reconciler does **not** transition to `PhaseFailed` on errors - it
 simply returns the error up to controller-runtime, which requeues with
 backoff. The phase stays at whatever it was (Initial / ResumeGoldenActor /
 WaitGoldenActor), and the next reconcile retries the same step.
@@ -151,12 +151,12 @@ WaitGoldenActor), and the next reconcile retries the same step.
   `WaitGoldenActor`, requeued.
 
 The golden actor record may be left dangling on a worker if a reconcile
-errored mid-flow — cleanup is the operator's responsibility for now.
+errored mid-flow - cleanup is the operator's responsibility for now.
 
 ## Related
 
-- [Resume actor](/flows/resume-actor/) — sees the GoldenSnapshot strategy
+- [Resume actor](/flows/resume-actor/) - sees the GoldenSnapshot strategy
   branch in action.
-- [Actor lifecycle](/flows/actor-lifecycle/) — full state machine.
-- [atecontroller](/components/atecontroller/) — reconciler internals (Cut 3).
-- [ActorTemplate](/concepts/actortemplate/) — the CRD itself (Cut 3).
+- [Actor lifecycle](/flows/actor-lifecycle/) - full state machine.
+- [atecontroller](/components/atecontroller/) - reconciler internals (Cut 3).
+- [ActorTemplate](/concepts/actortemplate/) - the CRD itself (Cut 3).

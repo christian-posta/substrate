@@ -54,7 +54,7 @@ export default defineConfig({
           content: `
             import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
             // Diagrams are authored for a light canvas. We keep mermaid pinned to
-            // its 'default' (light) theme regardless of site theme — the page CSS
+            // its 'default' (light) theme regardless of site theme - the page CSS
             // gives the diagram its own light card background. This trades a tiny
             // bit of "the diagram feels separate from the page" for vastly better
             // legibility (default mermaid dark theme has terrible contrast on a

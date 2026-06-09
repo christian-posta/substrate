@@ -1,6 +1,6 @@
 ---
 title: Resume actor (end-to-end)
-description: The most interesting flow in Substrate — a request arrives for a suspended actor, and the system wakes it on a pre-warmed gVisor worker in milliseconds.
+description: The most interesting flow in Substrate - a request arrives for a suspended actor, and the system wakes it on a pre-warmed gVisor worker in milliseconds.
 ---
 
 import nodeHostpath from '../../../assets/resume-node-hostpath.svg?raw';
@@ -76,7 +76,7 @@ sequenceDiagram
 
 The client resolves `actorId.actors.resources.substrate.ate.dev`. The atenet **DNS controller**
 programs CoreDNS so this name pattern always returns the **ClusterIP of the
-atenet router service** — not the worker IP. This is deliberate: the worker IP
+atenet router service** - not the worker IP. This is deliberate: the worker IP
 isn't known until ExtProc consults ateapi, and it may change between requests
 if the actor moves between workers.
 
@@ -107,15 +107,15 @@ on its result.
 ateapi acquires `lock:actor:<actorId>` in Redis (30s TTL, 28s workflow
 timeout) and steps through:
 
-1. **LoadActorForResume** — fetch actor + ActorTemplate.
-2. **AssignWorker** — random shuffle over idle workers in the target
+1. **LoadActorForResume** - fetch actor + ActorTemplate.
+2. **AssignWorker** - random shuffle over idle workers in the target
    WorkerPool; update Redis: worker becomes assigned, actor goes `RESUMING`.
-3. **CallAteletRestore** — pick which restore strategy to use, then
+3. **CallAteletRestore** - pick which restore strategy to use, then
    resolve the atelet DaemonSet pod that runs on the *same node* as the
    assigned worker (informer indexed by node name) and dial that atelet's
    pod IP on `:8085`. atelet is a per-node DaemonSet, not a per-pod
-   sidecar — one atelet serves every worker pod scheduled to its node.
-4. **FinalizeRunning** — set actor to `RUNNING`.
+   sidecar - one atelet serves every worker pod scheduled to its node.
+4. **FinalizeRunning** - set actor to `RUNNING`.
 
 <code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go:35-293</code>
 
@@ -130,12 +130,12 @@ else                                          → atelet.Run (boot from scratch)
 ### 10–14. atelet does the heavy lifting
 
 :::note[What ateom-gvisor actually is]
-A worker pod runs **exactly one container** — and that container is
+A worker pod runs **exactly one container** - and that container is
 **ateom-gvisor**, the small gRPC server in `cmd/ateom-gvisor/`. ateom-gvisor
 is **not** itself sandboxed; it runs as PID 1 in the worker pod with normal
 container privileges. Its job is to receive RPCs from atelet and `exec`
 `runsc` (the gVisor runtime), which spawns a **separate gVisor sandbox**.
-The actor's workload — pulled from the **actor's OCI image** — runs *inside
+The actor's workload - pulled from the **actor's OCI image** - runs *inside
 that sandbox*, not alongside ateom-gvisor. The pod hosts at most one such
 sandbox at a time. See [ateom-gvisor](/components/ateom-gvisor/) for the
 RPC surface.
@@ -145,16 +145,16 @@ RPC surface.
 atelet's `Restore` handler downloads the three snapshot files from GCS in
 parallel and zstd-decompresses them onto the **node's own filesystem**,
 under `/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/restore-state/`. The
-files are owned by the host — they're not written into either pod's
+files are owned by the host - they're not written into either pod's
 container filesystem.
 
 How does the worker pod then *see* those bytes? Through a **`hostPath`
-bind mount**. Both pods on the node — the atelet DaemonSet pod and every
-worker pod — mount the same node directory `/var/lib/ateom-gvisor` into
+bind mount**. Both pods on the node - the atelet DaemonSet pod and every
+worker pod - mount the same node directory `/var/lib/ateom-gvisor` into
 their own filesystem at the same path. A `hostPath` volume is a slice of
 the host's filesystem grafted into the pod's mount namespace, so when
 atelet writes a file there, ateom-gvisor (inside the worker pod) reads
-exactly the same bytes — no copy, no network, same inode.
+exactly the same bytes - no copy, no network, same inode.
 
 This is also why the gRPC channel from atelet to ateom-gvisor can be a
 **unix socket**: the socket file `/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`
@@ -169,7 +169,7 @@ the restore.
     Two pods on one node, talking through the node's own filesystem. The shared
     <code>hostPath</code> is how atelet "delivers" the snapshot files <em>and</em>
     where it finds the unix socket to ateom-gvisor. Note the purple
-    <strong>gVisor sandbox</strong> inside the worker pod — that's a separate
+    <strong>gVisor sandbox</strong> inside the worker pod - that's a separate
     runsc-managed sandbox that ateom-gvisor spawns; the actor's OCI image runs
     in there, not in ateom-gvisor itself.
   </figcaption>
@@ -181,7 +181,7 @@ The pieces worth noticing in that picture:
   worker pod scheduled to that node. It does not run as a sidecar.
 - **ateom-gvisor and the actor live at different layers.** ateom-gvisor is
   the *pod's* container (PID 1, unsandboxed). The actor runs in a
-  *runsc-managed gVisor sandbox* that ateom-gvisor spawns — a sibling
+  *runsc-managed gVisor sandbox* that ateom-gvisor spawns - a sibling
   process tree, not a child of the ateom-gvisor binary. When you read
   "exec runsc restore" in the code, that's the moment the sandbox comes
   into existence.
@@ -207,7 +207,7 @@ paging**.
 :::note[What "demand paging" means]
 A normal "eager" restore would have to copy the *entire* `pages.img` file
 into the sandbox's RAM before the workload could execute a single
-instruction — for a multi-GB snapshot that's seconds of wall clock spent
+instruction - for a multi-GB snapshot that's seconds of wall clock spent
 just shuffling bytes.
 
 **Demand paging** flips that: `runsc` brings the sentry up immediately
@@ -219,7 +219,7 @@ continues. Pages that the workload never touches are never loaded at
 all.
 
 This is the same trick the Linux kernel uses for `mmap`'d files and for
-loading executables — it's just being applied to the RAM image of a
+loading executables - it's just being applied to the RAM image of a
 checkpointed process.
 :::
 
@@ -241,7 +241,7 @@ memory pages stream in lazily, on fault, as the workload touches them.
 A few things to note about this trick:
 
 - **The first request pays a small page-in tax**, but only for the pages it
-  actually touches — usually a tiny fraction of resident memory.
+  actually touches - usually a tiny fraction of resident memory.
 - **Subsequent requests are warm.** Once a page is in, it stays in until
   the actor suspends again, so steady-state latency is whatever the
   workload's normal latency is.
@@ -253,7 +253,7 @@ A few things to note about this trick:
 <code class="fileref">cmd/ateom-gvisor/runsc.go:134-158</code>
 
 This is the trick that makes resume *fast*: we don't wait for the entire
-snapshot to be paged in before serving the request — only what the workload
+snapshot to be paged in before serving the request - only what the workload
 actually needs to handle this request.
 
 ### 17–18. ExtProc rewrites :authority
@@ -310,10 +310,10 @@ stateDiagram-v2
 - **Lazy-paging restore.** The workload is "back" the instant `runsc restore
   -background` returns; pages come in on demand.
 - **Per-actor distributed lock.** Two concurrent `Resume` calls for the same
-  actor don't race — the second one waits or gets `Aborted`.
+  actor don't race - the second one waits or gets `Aborted`.
 
 ## Related
 
-- [Suspend actor](/flows/suspend-actor/) — the reverse flow (Cut 2).
-- [Actor lifecycle](/flows/actor-lifecycle/) — full state machine (Cut 2).
-- [ateapi internals](/components/ateapi/) — the workflow engine in detail.
+- [Suspend actor](/flows/suspend-actor/) - the reverse flow (Cut 2).
+- [Actor lifecycle](/flows/actor-lifecycle/) - full state machine (Cut 2).
+- [ateapi internals](/components/ateapi/) - the workflow engine in detail.

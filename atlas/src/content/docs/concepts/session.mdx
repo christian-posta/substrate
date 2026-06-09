@@ -5,7 +5,7 @@ description: A workload-facing concept layered on top of actors. A session ident
 
 A **session** is a workload-facing concept. From the workload's perspective,
 a "session" is a stable identity (an app, a user, a session ID) that **needs
-to persist across worker pod changes** — because the actor it lives in might
+to persist across worker pod changes** - because the actor it lives in might
 migrate at any moment.
 
 ## Why this needs a special concept
@@ -13,8 +13,8 @@ migrate at any moment.
 A long-running actor will move between worker pods many times (every
 suspend/resume cycle is potentially a new pod). The pod's own
 ServiceAccount-issued credentials change with each pod. But the workload's
-identity to *external services* — the LLM API key, the user's OAuth token,
-the application's identifier — must not.
+identity to *external services* - the LLM API key, the user's OAuth token,
+the application's identifier - must not.
 
 Sessions solve this: ateapi mints **session-scoped credentials** that the
 workload uses to talk to external services. JWTs carry a stable subject of
@@ -61,5 +61,5 @@ outlive many actors (rare but possible).
 
 ## Related
 
-- [Actor](/concepts/actor/) — the substrate-internal lifecycle.
-- [ateapi internals](/components/ateapi/) — the SessionIdentity service.
+- [Actor](/concepts/actor/) - the substrate-internal lifecycle.
+- [ateapi internals](/components/ateapi/) - the SessionIdentity service.

@@ -48,7 +48,7 @@
   <text x="600" y="38" text-anchor="middle" class="label-big">How a golden snapshot gets made</text>
   <text x="600" y="60" text-anchor="middle" class="annot">It's not built. It's <tspan font-weight="700">run</tspan>: a throwaway actor really boots on a real worker, then its memory is captured.</text>
 
-  <!-- Phase strip — 4 cards across the top -->
+  <!-- Phase strip - 4 cards across the top -->
   <!-- Phase 1: Initial -->
   <g filter="url(#sketch)">
     <rect x="40" y="100" width="220" height="180" rx="12" class="box-crd"/>
@@ -57,7 +57,7 @@
   <text x="150" y="148" text-anchor="middle" class="label-med">ActorTemplate</text>
   <text x="150" y="166" text-anchor="middle" class="label-med">applied</text>
   <text x="150" y="194" text-anchor="middle" class="label-sm">image, env, entrypoint,</text>
-  <text x="150" y="210" text-anchor="middle" class="label-sm">target WorkerPool —</text>
+  <text x="150" y="210" text-anchor="middle" class="label-sm">target WorkerPool -</text>
   <text x="150" y="226" text-anchor="middle" class="label-sm">just a Kubernetes</text>
   <text x="150" y="242" text-anchor="middle" class="label-sm">manifest at this point</text>
   <text x="150" y="266" text-anchor="middle" class="label-tiny" fill="#6b7280">Status.Phase = Initial</text>
@@ -69,19 +69,19 @@
   <text x="310" y="125" class="step-num">②</text>
   <text x="410" y="148" text-anchor="middle" class="label-med">atecontroller creates a</text>
   <text x="410" y="166" text-anchor="middle" class="label-med">throwaway "golden" actor</text>
-  <text x="410" y="194" text-anchor="middle" class="label-sm">No special API — the</text>
+  <text x="410" y="194" text-anchor="middle" class="label-sm">No special API - the</text>
   <text x="410" y="210" text-anchor="middle" class="label-sm">reconciler calls the same</text>
   <text x="410" y="226" text-anchor="middle" class="label-sm">CreateActor + ResumeActor</text>
   <text x="410" y="242" text-anchor="middle" class="label-sm">RPCs a client would call.</text>
   <text x="410" y="266" text-anchor="middle" class="label-tiny" fill="#6b7280">Phase = ResumeGoldenActor</text>
 
-  <!-- Phase 3: REAL worker pod runs the workload — the big highlighted box -->
+  <!-- Phase 3: REAL worker pod runs the workload - the big highlighted box -->
   <g filter="url(#sketch)">
     <rect x="560" y="100" width="380" height="320" rx="14" class="box-pod"/>
   </g>
   <text x="580" y="125" class="step-num">③</text>
   <text x="750" y="150" text-anchor="middle" class="label-big">REAL worker pod</text>
-  <text x="750" y="172" text-anchor="middle" class="annot">from the WorkerPool — same code path as any actor</text>
+  <text x="750" y="172" text-anchor="middle" class="annot">from the WorkerPool - same code path as any actor</text>
 
   <!-- Sandbox sub-box: shows the workload running -->
   <g filter="url(#sketch)">
@@ -90,7 +90,7 @@
   <text x="750" y="212" text-anchor="middle" class="label-med" fill="#5b21b6">gVisor sandbox</text>
   <text x="750" y="230" text-anchor="middle" class="label-tiny" fill="#5b21b6">runsc create + runsc start</text>
   <line x1="610" y1="238" x2="890" y2="238" stroke="#c4b5fd" stroke-width="1.2"/>
-  <text x="750" y="258" text-anchor="middle" class="label-sm" font-weight="700">actor workload — boots from scratch</text>
+  <text x="750" y="258" text-anchor="middle" class="label-sm" font-weight="700">actor workload - boots from scratch</text>
   <text x="750" y="276" text-anchor="middle" class="label-sm">from the actor's OCI image</text>
   <text x="750" y="298" text-anchor="middle" class="punch">runs for ≈ 20 seconds</text>
   <text x="750" y="316" text-anchor="middle" class="punch">consuming real CPU + real RAM</text>
@@ -139,7 +139,7 @@
   <g filter="url(#sketch-region)" opacity="0.55">
     <rect x="40" y="490" width="1120" height="180" rx="14" fill="#dcfce7" stroke="#166534" stroke-width="1.6" stroke-dasharray="8 7"/>
   </g>
-  <text x="60" y="516" class="region-tag">AFTER READY — what every later actor of this template gets to skip</text>
+  <text x="60" y="516" class="region-tag">AFTER READY - what every later actor of this template gets to skip</text>
 
   <text x="600" y="552" text-anchor="middle" class="label-med">No more Phase ①–④. The GCS snapshot is the new starting line.</text>
 

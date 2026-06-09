@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 820" role="img" aria-labelledby="title desc" font-family="'Comic Sans MS', 'Patrick Hand', 'Caveat', cursive, system-ui, sans-serif">
-  <title id="title">Substrate topology — whiteboard view</title>
+  <title id="title">Substrate topology - whiteboard view</title>
   <desc id="desc">Client connects to atenet, which consults ateapi (control plane) to find the right worker pod. atelet uploads and downloads snapshots between the worker pod and GCS/S3.</desc>
 
   <defs>
@@ -35,7 +35,7 @@
       .conn-dot { stroke-dasharray: 6 5; }
       .annot    { font-size: 14px; fill: #374151; font-style: italic; }
 
-      /* Clickable boxes — show pointer + slight brightening on hover. */
+      /* Clickable boxes - show pointer + slight brightening on hover. */
       a, a * { cursor: pointer; }
       a:focus { outline: none; }
       a:hover rect { stroke-width: 3.6; filter: brightness(1.04); }
@@ -135,7 +135,7 @@
     <text x="920" y="552" text-anchor="middle" class="label-tiny" fill="#6b7280">one actor per pod · pool of N pods</text>
   </a>
 
-  <!-- Worker pod sub-boxes — each linked to its own component page -->
+  <!-- Worker pod sub-boxes - each linked to its own component page -->
   <a href="/components/ateom-gvisor/">
     <g filter="url(#sketch)">
       <rect x="750" y="460" width="140" height="56" rx="8" class="box-sub"/>

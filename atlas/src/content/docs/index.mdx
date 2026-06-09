@@ -1,9 +1,9 @@
 ---
 title: Learn Agent Substrate
-description: A visual atlas of how agent-substrate works — control plane, data plane, lifecycle, request path, and snapshot/restore.
+description: A visual atlas of how agent-substrate works - control plane, data plane, lifecycle, request path, and snapshot/restore.
 template: splash
 hero:
-  tagline: How agent-substrate works — visualized end to end.
+  tagline: How agent-substrate works - visualized end to end.
   actions:
     - text: Start with the topology
       link: /topology/
@@ -13,6 +13,10 @@ hero:
       link: /flows/resume-actor/
       icon: right-arrow
       variant: secondary
+    - text: View on GitHub
+      link: https://github.com/agent-substrate/substrate
+      icon: github
+      variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
@@ -21,7 +25,7 @@ import topologyHero from '../../assets/topology-hero.svg?raw';
 ## What is Substrate?
 
 **Agent Substrate** is a Kubernetes-native runtime for highly-multiplexed actor
-workloads — AI agents, sandboxed environments, stateful services. It decouples
+workloads - AI agents, sandboxed environments, stateful services. It decouples
 actor lifecycle from Pods, so a small pool of pre-warmed gVisor workers can host
 **30× more actors than there are pods**, by suspending idle actors to object
 storage and restoring them on demand.
@@ -44,7 +48,7 @@ The bird's-eye view:
     [Open →](/topology/)
   </Card>
   <Card title="Resume actor" icon="rocket">
-    The most interesting flow — touches every component. Cold start from
+    The most interesting flow - touches every component. Cold start from
     snapshot, end to end.
     [Open →](/flows/resume-actor/)
   </Card>
@@ -53,9 +57,13 @@ The bird's-eye view:
     [Open →](/components/ateapi/)
   </Card>
   <Card title="Concepts glossary" icon="document">
-    Quick definitions for the domain terms — actor, worker, session,
+    Quick definitions for the domain terms - actor, worker, session,
     snapshot, WorkerPool, ActorTemplate.
     [Open Actor →](/concepts/actor/)
+  </Card>
+  <Card title="Source on GitHub" icon="github">
+    Browse the full source, open issues, or read the architecture docs and API guide.
+    [agent-substrate/substrate →](https://github.com/agent-substrate/substrate)
   </Card>
 </CardGrid>
 
@@ -64,9 +72,9 @@ The bird's-eye view:
 - **Mermaid diagrams** are the lingua franca: sequence diagrams for flows, state
   diagrams for lifecycles, flowcharts for topology.
 - **Boxes are clickable** in the hero topology above and in every Mermaid
-  diagram on the deeper pages — try clicking `ateapi` above to drill into its
+  diagram on the deeper pages - try clicking `ateapi` above to drill into its
   internals.
-- **Code references** look like <code class="fileref">cmd/ateapi/main.go:97</code> —
+- **Code references** look like <code class="fileref">cmd/ateapi/main.go:97</code> -
   open those in your editor to confirm any claim made here.
 
 :::note[Authoritative sources]

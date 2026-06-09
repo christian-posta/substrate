@@ -5,7 +5,7 @@ description: A frozen point-in-time image of an actor's RAM and sentry state. Th
 
 A **snapshot** is what makes Substrate actors portable. It's an on-disk
 representation of an actor's full in-process state at the moment it was
-suspended — captured by `runsc checkpoint`, restored by
+suspended - captured by `runsc checkpoint`, restored by
 `runsc restore -background`.
 
 ## The three files
@@ -28,7 +28,7 @@ There is no fixed `actors/` or `snapshots/` segment.
 | `pages_meta.img.zstd` | Small (KB) | Up front + during lazy paging. Uploaded only if produced. |
 
 The trick that makes resume fast is that `pages.img` is **not** read fully
-on restore — `runsc restore -background` returns control as soon as the
+on restore - `runsc restore -background` returns control as soon as the
 sentry is up, and individual RAM pages stream in only when the workload
 touches them.
 
@@ -69,11 +69,11 @@ file names when reading or writing.
 
 ## Why zstd, not gzip?
 
-Better ratio at comparable speed, and decompression is fast — important
+Better ratio at comparable speed, and decompression is fast - important
 because decompress happens on the critical path of resume.
 
 ## Related
 
 - [Suspend actor](/flows/suspend-actor/) · [Resume actor](/flows/resume-actor/)
 - [Golden snapshot bootstrap](/flows/golden-snapshot/)
-- [Storage](/components/storage/) — the GCS/S3 layer.
+- [Storage](/components/storage/) - the GCS/S3 layer.

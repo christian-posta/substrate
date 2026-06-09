@@ -25,7 +25,7 @@ status:
 
 ## A real example: `kagent-default`
 
-Here's the live `WorkerPool` from the `kagent` namespace — installed by
+Here's the live `WorkerPool` from the `kagent` namespace - installed by
 the kagent Helm chart and used by every `SandboxAgent` running on
 substrate today, including the [`hello-substrate`
 ActorTemplate](/concepts/actortemplate/#a-real-example-hello-substrate):
@@ -77,7 +77,7 @@ A few things worth pointing out:
   with `WorkerPoolSyncer` and Redis without restarting anything.
 - **The pods are `privileged` and mount `/var/lib/ateom-gvisor` from
   the host.** That's how ateom-gvisor manages runsc state across the
-  pod boundary — actors that survive a pod restart do so via files on
+  pod boundary - actors that survive a pod restart do so via files on
   the host path, not in the pod's ephemeral storage.
 - **The Deployment selector is `ate.dev/worker-pool=kagent-default`.**
   ateapi uses this label to find pool members when reconciling
@@ -106,7 +106,7 @@ flowchart LR
 3. Updates `status.replicas` with what K8s reports.
 
 That's the whole reconciler. **It doesn't insert worker records into
-Redis** — that happens later via ateapi's `WorkerPoolSyncer`, which
+Redis** - that happens later via ateapi's `WorkerPoolSyncer`, which
 watches the pods directly.
 
 <code class="fileref">internal/controllers/workerpool_controller.go:52-176</code>
@@ -126,12 +126,12 @@ Edit `spec.replicas`, apply, done. atecontroller updates the Deployment,
 new pods come up, the syncer registers them. No actor downtime.
 
 Scaling down: terminated pods that were hosting actors trigger the
-"worker died" recovery path — actors are reset to `SUSPENDED` from their
+"worker died" recovery path - actors are reset to `SUSPENDED` from their
 `LastSnapshot`.
 
 ## Related
 
-- [Worker](/concepts/worker/) — what a pool member actually is.
-- [Workers component](/components/workers/) — pod-level detail.
-- [Worker lifecycle](/flows/worker-lifecycle/) — the state machine.
-- [atecontroller](/components/atecontroller/) — the reconciler.
+- [Worker](/concepts/worker/) - what a pool member actually is.
+- [Workers component](/components/workers/) - pod-level detail.
+- [Worker lifecycle](/flows/worker-lifecycle/) - the state machine.
+- [atecontroller](/components/atecontroller/) - the reconciler.

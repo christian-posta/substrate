@@ -3,7 +3,7 @@ title: Worker lifecycle
 description: The state machine on the worker side. Workers are pre-warmed pods that flip between Idle and Assigned. Plus what happens when a pod dies.
 ---
 
-A **worker** in Substrate is a pre-warmed gVisor sandbox pod — a member of a
+A **worker** in Substrate is a pre-warmed gVisor sandbox pod - a member of a
 `WorkerPool` Deployment, sitting around with `ateom-gvisor` running and a
 pause container, waiting for an actor to be restored into it.
 
@@ -100,7 +100,7 @@ This is a recovery path, not a planned transition.
 :::caution[Known race]
 If a worker pod dies **and** a concurrent `SuspendActor` is in flight, the
 release-on-death and the suspend workflow can both touch the actor. Today
-this is best-effort — the worse outcome is a benign double-write, not data
+this is best-effort - the worse outcome is a benign double-write, not data
 loss.
 :::
 
@@ -137,7 +137,7 @@ workers. This is the unit at which:
 
 ## Related
 
-- [Actor lifecycle](/flows/actor-lifecycle/) — the dual state machine on
+- [Actor lifecycle](/flows/actor-lifecycle/) - the dual state machine on
   the actor side.
 - [Resume actor](/flows/resume-actor/) · [Suspend actor](/flows/suspend-actor/)
 - [WorkerPool](/concepts/workerpool/) · [Workers](/components/workers/) (Cut 3).
