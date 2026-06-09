@@ -1,0 +1,142 @@
+---
+title: System topology
+description: Every binary, every port, every connection. The static architecture map.
+---
+
+Substrate is a **control plane / data plane** split that runs on Kubernetes but
+deliberately **routes around the K8s scheduler** for the hot path. Actor
+assignment to pre-warmed worker pods happens in `ateapi` in milliseconds, not in
+`kube-scheduler` in seconds.
+
+## In three pictures
+
+The whole-picture hero on the [Overview](/) is the elevator pitch. This page
+zooms in on the three regions that matter most — what's *in* each plane,
+and how a request actually flows.
+
+### 1 · Control plane
+
+```mermaid
+flowchart LR
+  KAPI[(K8s API)]
+  ATECTRL["atecontroller<br/>(Deployment)<br/>CRD reconciler"]
+  ATEAPI["ateapi<br/>(Deployment)<br/>gRPC :443"]
+  REDIS[("Redis / Valkey<br/>actors · workers · locks")]
+
+  ATECTRL -- "reconciles<br/>ActorTemplate · WorkerPool" --> KAPI
+  ATEAPI -- "watches worker pods" --> KAPI
+  ATEAPI <--> REDIS
+
+  click ATEAPI "/components/ateapi/" "ateapi"
+  click ATECTRL "/components/atecontroller/" "atecontroller"
+  click REDIS "/components/storage/" "Storage"
+```
+
+Stateless workloads, declarative inputs. `atecontroller` owns the CRDs;
+`ateapi` is the operational brain backed by Redis.
+
+### 2 · Data plane (one worker node)
+
+```mermaid
+flowchart LR
+  ATELET["atelet<br/>(DaemonSet)<br/>gRPC :8085"]
+
+  subgraph WPOD["Worker pod"]
+    direction TB
+    ATEOM["ateom-gvisor<br/>gRPC over Unix socket"]
+    RUNSC[["runsc<br/>(gVisor runtime)"]]
+    WL[["Actor workload"]]
+    ATEOM -- exec --> RUNSC
+    RUNSC -- manages --> WL
+  end
+
+  GCS[("GCS / S3<br/>snapshots (zstd)")]
+
+  ATELET -- "Run · Checkpoint · Restore" --> ATEOM
+  ATELET <-- "upload / download" --> GCS
+
+  click ATELET "/components/atelet/" "atelet"
+  click ATEOM "/components/ateom-gvisor/" "ateom-gvisor"
+  click WPOD "/components/workers/" "Workers"
+  click GCS "/components/storage/" "Storage"
+```
+
+Every node runs one `atelet` DaemonSet pod and many worker pods. atelet is
+the single component on the node that touches object storage; ateom-gvisor
+is the only thing that talks to runsc.
+
+### 3 · Request flow
+
+```mermaid
+flowchart LR
+  Client([External client])
+  DNS["atenet DNS<br/>(CoreDNS Corefile mgr)"]
+  ROUTER["atenet router<br/>Envoy :8080/:8443<br/>ExtProc :50051"]
+  ATEAPI["ateapi"]
+  WORKLOAD[["Worker workload"]]
+
+  Client -- "1. resolve actorId.actors…ate.dev" --> DNS
+  DNS -- "2. router ClusterIP" --> Client
+  Client -- "3. HTTP request" --> ROUTER
+  ROUTER -- "4. ResumeActor (per request)" --> ATEAPI
+  ATEAPI -- "5. Actor{pod IP}" --> ROUTER
+  ROUTER -- "6. rewritten :authority → worker pod" --> WORKLOAD
+
+  click DNS "/components/atenet/" "atenet DNS"
+  click ROUTER "/components/atenet/" "atenet router"
+  click ATEAPI "/components/ateapi/" "ateapi"
+  click WORKLOAD "/components/workers/" "Workers"
+```
+
+The thing that lets Substrate scale: routing is **resolved at the request
+moment**, not pre-baked. No worker-IP DNS records, no sidecars, no
+scheduler involvement. For the full sequence (including the cold-restore
+case), see [Resume actor](/flows/resume-actor/).
+
+## What each component is for
+
+| Component | Kind | Role |
+|---|---|---|
+| **ateapi** | Deployment | Source of truth for actor & worker state. Serves `Control` and `SessionIdentity` gRPC services. Owns the suspend/resume workflows. |
+| **atecontroller** | Deployment | Watches the K8s API. Reconciles `WorkerPool` (→ Deployments of worker pods) and `ActorTemplate` (→ golden snapshot bootstrap). |
+| **atenet** | Deployments (one binary, two subcommands) | `atenet router` runs Envoy + ExtProc and does the per-request dance to find the right worker. `atenet dns` programs CoreDNS so `<actorId>.actors.resources.substrate.ate.dev` resolves. Each subcommand is typically deployed as its own Deployment. |
+| **atelet** | DaemonSet | Lives on each worker node. Receives gRPC calls from ateapi. Pulls images, manages OCI bundles, talks to ateom over a Unix socket, ships snapshots to GCS/S3. |
+| **ateom-gvisor** | In-pod helper | Lives inside every worker pod. Tiny gRPC server on a Unix socket. Shells out to `runsc checkpoint` / `runsc restore`. |
+| **Worker pods** | Deployment-spawned (from `WorkerPool`) | Pre-warmed gVisor sandboxes. Each can host one actor at a time; the gVisor sandbox (with its pause process) is created on assignment, not at pod start. |
+| **Redis / Valkey** | StatefulSet | Holds actor records, worker records, and the per-actor distributed locks that serialize workflows. |
+| **GCS / S3** | External | Holds the checkpoint images (RAM + sentry state + lazy-load pages), zstd-compressed. |
+| **podcertcontroller** | Deployment | Polyfill for the upstream K8s Pod Certificate signers feature. Not on the hot path. |
+
+## Ports at a glance
+
+| Service | Port | Protocol |
+|---|---|---|
+| ateapi | 443 | gRPC (TLS) |
+| atelet | 8085 | gRPC |
+| atenet router (Envoy) | 8080 / 8443 | HTTP / HTTPS |
+| atenet ExtProc | 50051 | gRPC (Envoy ext_proc) |
+| atenet xDS | 18000 | gRPC (Envoy control) |
+| ateom-gvisor | Unix socket | gRPC — `/var/lib/ateom-gvisor/ateoms/{podUID}/ateom.sock` |
+
+## How traffic *actually* gets to an actor
+
+The short version: there is **no per-pod sidecar**. atenet's centralized Envoy
+is the single dataplane proxy, and ExtProc consults ateapi on each request to
+discover (and if needed, resume) the actor's worker.
+
+See the [request path flow](/flows/resume-actor/) for the full sequence.
+
+## The hot path bypasses kube-scheduler
+
+The big architectural bet: when an actor needs to wake up, **ateapi picks a
+pre-warmed worker out of Redis and tells atelet to restore into it**. The
+Kubernetes scheduler is never on the critical path. That's how Substrate gets
+sub-second resume times against 30× more actors than pods.
+
+:::tip[Where in the code]
+- ateapi entry: <code class="fileref">cmd/ateapi/main.go:70-161</code>
+- atecontroller entry: <code class="fileref">cmd/atecontroller/main.go:49-107</code>
+- atenet router init: <code class="fileref">cmd/atenet/internal/app/router/router.go:164-218</code>
+- atelet entry: <code class="fileref">cmd/atelet/main.go</code>
+- ateom-gvisor entry: <code class="fileref">cmd/ateom-gvisor/main.go</code>
+:::

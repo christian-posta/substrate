@@ -1,0 +1,79 @@
+---
+title: Snapshot
+description: A frozen point-in-time image of an actor's RAM and sentry state. Three zstd-compressed files in GCS/S3 that runsc restore can lazy-page back into a sandbox.
+---
+
+A **snapshot** is what makes Substrate actors portable. It's an on-disk
+representation of an actor's full in-process state at the moment it was
+suspended — captured by `runsc checkpoint`, restored by
+`runsc restore -background`.
+
+## The three files
+
+```
+<ActorTemplate.spec.snapshotsConfig.location>/<actorId>/<RFC3339-ts>-<random>/
+├── checkpoint.img.zstd        # sentry state, registers, FD table
+├── pages.img.zstd             # RAM page contents       (optional)
+└── pages_meta.img.zstd        # page index              (optional)
+```
+
+The prefix comes entirely from `ActorTemplate.spec.snapshotsConfig.location`
+(e.g. `gs://my-bucket/some/prefix`); ateapi appends `/<actorId>/<ts>-<rand>`.
+There is no fixed `actors/` or `snapshots/` segment.
+
+| File | Size | When read |
+|---|---|---|
+| `checkpoint.img.zstd` | Small (KB-MB) | Up front during restore. Always present. |
+| `pages.img.zstd` | **Big** (often GB) | Lazily, page by page, as the workload touches memory. Uploaded only if produced by `runsc checkpoint`. |
+| `pages_meta.img.zstd` | Small (KB) | Up front + during lazy paging. Uploaded only if produced. |
+
+The trick that makes resume fast is that `pages.img` is **not** read fully
+on restore — `runsc restore -background` returns control as soon as the
+sentry is up, and individual RAM pages stream in only when the workload
+touches them.
+
+## Where snapshots are produced
+
+Only one place: ateom-gvisor running `runsc checkpoint` inside a worker
+pod, then atelet zstd-compressing and uploading the result. See the
+[suspend flow](/flows/suspend-actor/).
+
+## Where snapshots are consumed
+
+Only one place: atelet downloading and decompressing them onto a worker
+pod's local volume, then ateom-gvisor running `runsc restore` against
+them. See the [resume flow](/flows/resume-actor/).
+
+## Two flavors of snapshot
+
+| Kind | Stored where | When created |
+|---|---|---|
+| **LastSnapshot** | On the Actor record | Every time `SuspendActor` finishes |
+| **GoldenSnapshot** | On the ActorTemplate status | Once, by atecontroller's [bootstrap loop](/flows/golden-snapshot/) |
+
+The resume workflow's strategy selection prefers `LastSnapshot` if one
+exists; otherwise falls back to `GoldenSnapshot`; otherwise cold boots.
+
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go:213-265</code>
+
+## How they're addressed
+
+By URI prefix:
+
+```
+<snapshots-location>/<actorId>/<timestamp>-<random>/
+```
+
+The actor record stores just the URI prefix; atelet appends the three
+file names when reading or writing.
+
+## Why zstd, not gzip?
+
+Better ratio at comparable speed, and decompression is fast — important
+because decompress happens on the critical path of resume.
+
+## Related
+
+- [Suspend actor](/flows/suspend-actor/) · [Resume actor](/flows/resume-actor/)
+- [Golden snapshot bootstrap](/flows/golden-snapshot/)
+- [Storage](/components/storage/) — the GCS/S3 layer.

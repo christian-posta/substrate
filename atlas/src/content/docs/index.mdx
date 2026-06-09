@@ -1,0 +1,75 @@
+---
+title: Substrate Atlas
+description: A visual atlas of how agent-substrate works — control plane, data plane, lifecycle, request path, and snapshot/restore.
+template: splash
+hero:
+  tagline: How agent-substrate works — visualized end to end.
+  actions:
+    - text: Start with the topology
+      link: /topology/
+      icon: right-arrow
+      variant: primary
+    - text: Resume-actor walkthrough
+      link: /flows/resume-actor/
+      icon: right-arrow
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What is Substrate?
+
+**Agent Substrate** is a Kubernetes-native runtime for highly-multiplexed actor
+workloads — AI agents, sandboxed environments, stateful services. It decouples
+actor lifecycle from Pods, so a small pool of pre-warmed gVisor workers can host
+**30× more actors than there are pods**, by suspending idle actors to object
+storage and restoring them on demand.
+
+The bird's-eye view:
+
+<figure style="margin: 1.5rem 0;">
+  <img src="/topology-hero.svg" alt="Substrate topology — Client → atenet → worker pod, with ateapi/atecontroller in the control plane, atelet shipping snapshots to GCS/S3" class="atlas-hero-svg"/>
+  <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
+    The whole system on one whiteboard. For the wiring-diagram version with every port,
+    see <a href="/topology/">System topology</a>.
+  </figcaption>
+</figure>
+
+## Where to go next
+
+<CardGrid>
+  <Card title="System topology" icon="seti:graphql">
+    The static architecture: every binary, every port, every connection.
+    [Open →](/topology/)
+  </Card>
+  <Card title="Resume actor" icon="rocket">
+    The most interesting flow — touches every component. Cold start from
+    snapshot, end to end.
+    [Open →](/flows/resume-actor/)
+  </Card>
+  <Card title="ateapi internals" icon="seti:go">
+    Control plane API: RPCs, workflow engine, Redis keyspace.
+    [Open →](/components/ateapi/)
+  </Card>
+  <Card title="Concepts glossary" icon="document">
+    Quick definitions for the domain terms — actor, worker, session,
+    snapshot, WorkerPool, ActorTemplate.
+    [Open Actor →](/concepts/actor/)
+  </Card>
+</CardGrid>
+
+## How to read this atlas
+
+- **Mermaid diagrams** are the lingua franca: sequence diagrams for flows, state
+  diagrams for lifecycles, flowcharts for topology.
+- **Boxes are clickable** wherever a drill-down exists — try clicking `ateapi`
+  in the topology above.
+- **Code references** look like <code class="fileref">cmd/ateapi/main.go:97</code> —
+  open those in your editor to confirm any claim made here.
+
+:::note[Authoritative sources]
+The atlas is a visual layer over the prose in
+[`docs/architecture.md`](https://github.com/agent-substrate/substrate/blob/main/docs/architecture.md)
+and [`docs/api-guide.md`](https://github.com/agent-substrate/substrate/blob/main/docs/api-guide.md).
+When the two disagree, the code wins.
+:::
