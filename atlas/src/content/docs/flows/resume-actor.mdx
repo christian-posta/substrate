@@ -4,7 +4,7 @@ description: The most interesting flow in Substrate — a request arrives for a 
 ---
 
 This is **the** flow to understand if you want to understand Substrate. It
-touches DNS, Envoy, ExtProc, ateapi's workflow engine, the Redis store,
+touches DNS, the L7 proxy, ExtProc, ateapi's workflow engine, the Redis store,
 atelet, GCS, ateom-gvisor, and `runsc restore`. Six components and two data
 stores collaborate on a single HTTP request.
 
@@ -22,7 +22,7 @@ sequenceDiagram
   autonumber
   participant C as Client
   participant DNS as CoreDNS<br/>(atenet DNS)
-  participant E as Envoy<br/>(atenet router)
+  participant E as L7 proxy<br/>(atenet router)
   participant X as ExtProc<br/>(atenet router)
   participant A as ateapi
   participant R as Redis
@@ -79,9 +79,9 @@ if the actor moves between workers.
 <code class="fileref">internal/dns/dns.go:71-88</code> ·
 <code class="fileref">internal/dns/corefile.go:42-59</code>
 
-### 4–5. Envoy + ExtProc
+### 4–5. L7 proxy + ExtProc
 
-Envoy accepts the request on `:8080` and applies a single `ext_proc` filter
+The L7 proxy accepts the request on `:8080` and applies a single `ext_proc` filter
 that streams headers to **ExtProc on `:50051`**. ExtProc extracts the actor
 ID from the `:authority` header and decides where the request should go.
 
@@ -146,8 +146,8 @@ actually needs to handle this request.
 ### 17–18. ExtProc rewrites :authority
 
 When ResumeActor returns, the Actor object now carries `ateom_pod_ip`.
-ExtProc emits a header-mutation response telling Envoy to overwrite
-`:authority` with `<pod_ip>:80`. Envoy then forwards the request to the
+ExtProc emits a header-mutation response telling the proxy to overwrite
+`:authority` with `<pod_ip>:80`. The proxy then forwards the request to the
 worker.
 
 <code class="fileref">cmd/atenet/internal/app/router/extproc_out.go:36-44</code>
@@ -193,7 +193,7 @@ stateDiagram-v2
 
 - **No K8s scheduler on the hot path.** Worker pods are pre-warmed; ateapi
   picks one in microseconds via a Redis lookup.
-- **No per-pod sidecar.** A single Envoy fleet handles all routing.
+- **No per-pod sidecar.** A single L7-proxy fleet handles all routing.
 - **Lazy-paging restore.** The workload is "back" the instant `runsc restore
   -background` returns; pages come in on demand.
 - **Per-actor distributed lock.** Two concurrent `Resume` calls for the same

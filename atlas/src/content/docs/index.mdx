@@ -16,6 +16,7 @@ hero:
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
+import topologyHero from '../../assets/topology-hero.svg?raw';
 
 ## What is Substrate?
 
@@ -28,10 +29,10 @@ storage and restoring them on demand.
 The bird's-eye view:
 
 <figure style="margin: 1.5rem 0;">
-  <img src="/topology-hero.svg" alt="Substrate topology — Client → atenet → worker pod, with ateapi/atecontroller in the control plane, atelet shipping snapshots to GCS/S3" class="atlas-hero-svg"/>
+  <div class="atlas-hero-svg" set:html={topologyHero} />
   <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
-    The whole system on one whiteboard. For the wiring-diagram version with every port,
-    see <a href="/topology/">System topology</a>.
+    The whole system on one whiteboard. Click any box to drill in. For the wiring-diagram
+    version with every port, see <a href="/topology/">System topology</a>.
   </figcaption>
 </figure>
 
@@ -62,8 +63,9 @@ The bird's-eye view:
 
 - **Mermaid diagrams** are the lingua franca: sequence diagrams for flows, state
   diagrams for lifecycles, flowcharts for topology.
-- **Boxes are clickable** wherever a drill-down exists — try clicking `ateapi`
-  in the topology above.
+- **Boxes are clickable** in the hero topology above and in every Mermaid
+  diagram on the deeper pages — try clicking `ateapi` above to drill into its
+  internals.
 - **Code references** look like <code class="fileref">cmd/ateapi/main.go:97</code> —
   open those in your editor to confirm any claim made here.
 
