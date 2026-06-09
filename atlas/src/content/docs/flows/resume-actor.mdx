@@ -141,15 +141,27 @@ sandbox at a time. See [ateom-gvisor](/components/ateom-gvisor/) for the
 RPC surface.
 :::
 
+**Where the actor's state actually lands: on the node, not in the pod.**
 atelet's `Restore` handler downloads the three snapshot files from GCS in
-parallel and zstd-decompresses them under
-`/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/restore-state/`. That
-directory is a **node `hostPath`** (`/var/lib/ateom-gvisor`) bind-mounted
-into both the atelet DaemonSet pod and every worker pod on the node, so
-ateom-gvisor (running inside the worker pod) sees the same files atelet
-just wrote. atelet then opens the ateom unix socket at
-`/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock` (also in the shared
-hostPath) and calls `RestoreWorkload` to kick off the restore.
+parallel and zstd-decompresses them onto the **node's own filesystem**,
+under `/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/restore-state/`. The
+files are owned by the host — they're not written into either pod's
+container filesystem.
+
+How does the worker pod then *see* those bytes? Through a **`hostPath`
+bind mount**. Both pods on the node — the atelet DaemonSet pod and every
+worker pod — mount the same node directory `/var/lib/ateom-gvisor` into
+their own filesystem at the same path. A `hostPath` volume is a slice of
+the host's filesystem grafted into the pod's mount namespace, so when
+atelet writes a file there, ateom-gvisor (inside the worker pod) reads
+exactly the same bytes — no copy, no network, same inode.
+
+This is also why the gRPC channel from atelet to ateom-gvisor can be a
+**unix socket**: the socket file `/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`
+sits in the same shared hostPath, so both ends address it by the same
+path. atelet opens it and calls `RestoreWorkload`; ateom-gvisor, listening
+on the same path inside the worker pod, accepts the call and proceeds with
+the restore.
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={nodeHostpath} />
@@ -190,10 +202,31 @@ The pieces worth noticing in that picture:
 ### 15–16. ateom-gvisor runs `runsc restore -background -direct`
 
 This is where the magic happens. The `-background` flag enables **demand
-paging**: `runsc` returns control as soon as the sentry is up; actual memory
-pages stream in lazily as the workload touches them. `-direct` skips some
-gVisor security restrictions for snapshot data. `-detach` returns
-immediately.
+paging**.
+
+:::note[What "demand paging" means]
+A normal "eager" restore would have to copy the *entire* `pages.img` file
+into the sandbox's RAM before the workload could execute a single
+instruction — for a multi-GB snapshot that's seconds of wall clock spent
+just shuffling bytes.
+
+**Demand paging** flips that: `runsc` brings the sentry up immediately
+with `pages.img` mapped but **not yet resident in memory**. The very
+first time the workload reads or writes a given memory page, the CPU
+takes a *page fault*; `runsc` catches the fault, reads just that one
+page out of `pages.img`, hands it to the workload, and execution
+continues. Pages that the workload never touches are never loaded at
+all.
+
+This is the same trick the Linux kernel uses for `mmap`'d files and for
+loading executables — it's just being applied to the RAM image of a
+checkpointed process.
+:::
+
+So `-background` returns control as soon as the sentry is up; actual
+memory pages stream in lazily, on fault, as the workload touches them.
+`-direct` skips some gVisor security restrictions for snapshot data.
+`-detach` returns immediately.
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={lazyPaging} />

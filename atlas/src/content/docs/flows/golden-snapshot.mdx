@@ -3,15 +3,39 @@ title: Golden snapshot bootstrap
 description: How atecontroller turns an ActorTemplate CRD into a reusable "golden" checkpoint that new actors can boot from in milliseconds.
 ---
 
+import goldenLifecycle from '../../../assets/golden-snapshot-lifecycle.svg?raw';
+
 An `ActorTemplate` says *"this is what an actor of this kind looks like"* —
 image, entrypoint, env vars, worker pool. By itself that's just a manifest.
-The interesting part is that `atecontroller` immediately uses it to **create
-one throwaway actor, let it boot, then snapshot it** — producing a **golden
-snapshot** that all future actors of this template can restore from instead
-of cold-booting.
 
-This is what lets new actors come up in milliseconds: they're not booting,
-they're being restored from a pre-recorded RAM image.
+The interesting part is how Substrate produces the **golden snapshot** that
+later lets actors of this template come up in milliseconds. It does *not*
+build the snapshot statically from the image. Instead:
+
+:::caution[The snapshot is recorded, not built]
+`atecontroller` reacts to the new template by creating a **throwaway "golden"
+actor**, calling `ResumeActor` on it, and letting the workload **actually
+boot on a real worker pod** — same gVisor sandbox, same `runsc create`,
+same pulled OCI image, real CPU and RAM. After **20 seconds** of actual
+runtime it issues `SuspendActor`, which makes ateom-gvisor exec
+`runsc checkpoint` against the running sandbox. atelet uploads the
+resulting `checkpoint.img` / `pages.img` / `pages_meta.img` to GCS, and the
+URI gets stamped back onto `ActorTemplate.Status.GoldenSnapshot`.
+
+So the "golden" image is a **live memory snapshot of a freshly-booted
+workload**, not a precomputed artifact. New actors get the side effects of
+all that initialization work — heap state, JIT caches, opened FDs, parsed
+config — without paying for it again.
+:::
+
+<figure style="margin: 1.5rem 0;">
+  <div class="atlas-hero-svg" set:html={goldenLifecycle} />
+  <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
+    The bootstrap really does occupy a worker pod for ≈ 20 seconds — that pod is the
+    one a regular actor would have gotten. After Ready, every later actor of this
+    template skips ①–④ entirely and restores from the GCS snapshot.
+  </figcaption>
+</figure>
 
 ## Phase machine
 
@@ -95,12 +119,16 @@ the heavy initialization into your container image instead.
 
 ## What about the workload running during the wait?
 
-Yes, real CPU/memory is consumed during the 20-second wait. The golden
-actor is a normal actor on a normal worker pod — atecontroller is just
-using the user-facing `CreateActor`/`ResumeActor`/`SuspendActor` API,
-exactly as a client would. The reconcile goroutine is *not* blocked
-during the wait; the work-queue holds the item until `RequeueAfter`
-elapses.
+Yes — the golden actor is occupying a real worker pod, eating real
+resources, for the whole 20-second window (see the callout at the top of
+the page). The reconcile goroutine is *not* blocked during the wait; the
+work-queue holds the item until `RequeueAfter` elapses, so atecontroller
+is free to handle other reconciles in the meantime.
+
+If your `WorkerPool` is sized tightly, this matters: bootstrap consumes a
+slot. Operationally you'll want to either provision an extra worker for
+the bootstrap window, or accept that the first 20 seconds after applying
+a new template will see one fewer worker available for traffic.
 
 ## After Ready
 
