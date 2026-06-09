@@ -41,7 +41,7 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Substrate Atlas',
+      title: 'Learn Agent Substrate',
       description: 'A visual atlas of how agent-substrate works.',
       customCss: ['./src/styles/atlas.css'],
       social: {
