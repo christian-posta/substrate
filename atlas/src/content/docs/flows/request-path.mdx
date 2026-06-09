@@ -1,0 +1,135 @@
+---
+title: Request path
+description: How an inbound HTTP request gets from a client to the right actor on the right worker. No per-pod sidecar — a single Envoy fleet + ExtProc + ateapi lookup.
+---
+
+The [resume actor flow](/flows/resume-actor/) covers the **cold** path
+end-to-end. This page focuses on the **routing mechanics**: how atenet
+discovers the worker IP for a given actor, what Envoy is configured to do, and
+what happens when the actor is already running (the warm path).
+
+## Warm path — already running actor
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant DNS as CoreDNS
+  participant E as Envoy
+  participant X as ExtProc
+  participant A as ateapi
+  participant W as Worker
+
+  C->>DNS: actorId.actors.resources.substrate.ate.dev?
+  DNS-->>C: atenet-router ClusterIP
+  C->>E: HTTP, :authority=actorId.actors.resources.substrate.ate.dev
+  E->>X: ext_proc headers
+  X->>A: ResumeActor(actorId)
+  Note over A: status already RUNNING<br/>→ no-op, just return current state
+  A-->>X: Actor{ ateom_pod_ip }
+  X-->>E: :authority := pod_ip:80
+  E->>W: forwarded request
+  W-->>E: response
+  E-->>C: response
+```
+
+In the warm case `ResumeActor` is a quick Redis read — no atelet, no GCS, no
+runsc. The actor is already on a worker; we just need to learn which one.
+
+## Why there's no per-pod sidecar
+
+There is **one Envoy Deployment** for the whole cluster (atenet router).
+Every request goes through it. This is deliberate:
+
+- A sidecar per worker pod would mean configuring N proxies any time routing
+  state changes. With a centralized proxy, the xDS snapshot lives in one
+  place.
+- The cost of one extra hop is dwarfed by the cost of a cold actor restore.
+- Worker pods are stateless — Substrate is free to repack actors onto any
+  worker, and the router just learns the new IP from ateapi on the next
+  request.
+
+## How atenet learns the worker IP
+
+There is **no cache** in atenet. ExtProc calls `ResumeActor` on every
+request and gets back the current `ateom_pod_ip` from the Actor record in
+Redis.
+
+```mermaid
+flowchart LR
+  REQ[Request] --> EXT[ExtProc<br/>handleRequestHeaders]
+  EXT -->|ResumeActor| API[ateapi]
+  API --> RED[(Redis)]
+  RED --> API
+  API --> EXT
+  EXT -->|HeaderMutation:<br/>:authority=ip:80| ENV[Envoy]
+  ENV --> WK[Worker]
+```
+
+This costs one extra hop per request but guarantees the router never gets
+stale routing data. If an actor moved from worker A to worker B between two
+requests, the second request sees the new IP without any cache invalidation
+choreography.
+
+<code class="fileref">cmd/atenet/internal/app/router/extproc.go:125-175</code> ·
+<code class="fileref">cmd/atenet/internal/app/router/extproc_out.go:36-44</code>
+
+## The singleflight optimization
+
+Hammering ExtProc with 50 simultaneous requests for the same cold actor
+would otherwise produce 50 `ResumeActor` calls. ExtProc wraps the call in a
+[`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight)
+group keyed by actor ID — the first call goes through, the rest piggyback on
+its result.
+
+<code class="fileref">cmd/atenet/internal/app/router/resumer.go:29-93</code>
+
+## Envoy configuration via xDS
+
+Envoy is bootstrapped pointing at the atenet router's **xDS server on
+`:18000`**. The xDS snapshot has:
+
+| Element | Purpose |
+|---|---|
+| `ingress_http_listener` (:8080) | Plain HTTP ingress |
+| `ingress_https_listener` (:8443) | HTTPS ingress |
+| Route `substrate_routes` | Sends everything through ext_proc |
+| Cluster `ate-cluster` | Static cluster pointing at ExtProc (:50051) |
+| Cluster `dynamic_forward_proxy_cluster` | Forwards to whatever :authority Envoy now holds |
+
+The snapshot is refreshed every 5 seconds by a controller loop that
+re-reads `atStore.readyTemplates(...)` and rebuilds the snapshot — it's a
+**periodic poll**, not an informer-driven watch.
+
+<code class="fileref">cmd/atenet/internal/app/router/xds.go:42-249</code> ·
+<code class="fileref">cmd/atenet/internal/app/router/controller.go:73-110</code>
+
+## DNS — why we resolve to the router, not the worker
+
+Worker IPs can change at any moment (actors move between workers). If DNS
+returned a worker IP directly, clients would cache it and break the first
+time the actor migrated.
+
+Instead CoreDNS returns the **router's ClusterIP** for any name matching
+`*.actors.resources.substrate.ate.dev`. The router (via ExtProc) does the
+per-request lookup that yields the current worker IP — and rewrites
+`:authority` so Envoy's `dynamic_forward_proxy_cluster` hits it.
+
+<code class="fileref">internal/dns/dns.go:71-88</code> ·
+<code class="fileref">internal/dns/corefile.go:42-59</code>
+
+## Error mapping
+
+| ateapi response | HTTP status |
+|---|---|
+| `FailedPrecondition` (no free workers) | 503 Service Unavailable |
+| `NotFound` (no such actor) | 404 Not Found |
+| `Aborted` (concurrent op) | ExtProc's `ActorResumer` retries internally with backoff; if it still surfaces, `mapResumeError` falls into the `default` branch → **500 Internal Server Error** (not 503). |
+
+<code class="fileref">cmd/atenet/internal/app/router/errors.go:66-71</code>
+
+## Related
+
+- [Resume actor](/flows/resume-actor/) — the cold path in full.
+- [atenet](/components/atenet/) — router + DNS internals (Cut 3).
+- [System topology](/topology/) — where the router sits in the cluster.

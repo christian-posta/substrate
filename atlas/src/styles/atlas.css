@@ -1,0 +1,55 @@
+/* Atlas-specific styling tweaks on top of Starlight defaults */
+
+:root {
+  --sl-content-width: 60rem;
+  --atlas-canvas: #fdfcf7;       /* match the topology-hero SVG background */
+  --atlas-canvas-border: #e5e0d0;
+}
+
+/* Mermaid diagrams get their own warm light canvas, regardless of site theme.
+   The diagrams are authored for a light background — embedding them in a card
+   keeps them legible without forcing the whole site into light mode. */
+pre.mermaid {
+  background: var(--atlas-canvas);
+  border: 1px solid var(--atlas-canvas-border);
+  border-radius: 0.5rem;
+  padding: 1.25rem 1rem;
+  text-align: center;
+  overflow-x: auto;
+  color: #1f2937;                /* dark text inside the card */
+}
+
+pre.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Inline file:line refs — soft pill, kept low-contrast in dark mode so a
+   dense list of refs doesn't overwhelm the surrounding prose. */
+.fileref {
+  font-family: var(--sl-font-mono);
+  font-size: 0.85em;
+  background: var(--sl-color-gray-6);
+  padding: 0.1em 0.35em;
+  border-radius: 0.25em;
+  color: var(--sl-color-text-accent);
+}
+
+:root[data-theme='dark'] .fileref {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--sl-color-gray-2);
+}
+
+/* The hero topology SVG is a hand-drawn whiteboard — in dark mode it looks like
+   a glaring lightbox punched into the page. Wrap it in the same canvas style as
+   mermaid blocks so it visually integrates rather than fighting the theme. */
+.atlas-hero-svg {
+  background: var(--atlas-canvas);
+  border: 1px solid var(--atlas-canvas-border);
+  border-radius: 0.75rem;
+  padding: 0.5rem;
+  width: 100%;
+  max-width: 920px;
+  display: block;
+  margin: 0 auto;
+}
