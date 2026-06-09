@@ -129,6 +129,18 @@ else                                          → atelet.Run (boot from scratch)
 
 ### 10–14. atelet does the heavy lifting
 
+:::note[What ateom-gvisor actually is]
+A worker pod runs **exactly one container** — and that container is
+**ateom-gvisor**, the small gRPC server in `cmd/ateom-gvisor/`. ateom-gvisor
+is **not** itself sandboxed; it runs as PID 1 in the worker pod with normal
+container privileges. Its job is to receive RPCs from atelet and `exec`
+`runsc` (the gVisor runtime), which spawns a **separate gVisor sandbox**.
+The actor's workload — pulled from the **actor's OCI image** — runs *inside
+that sandbox*, not alongside ateom-gvisor. The pod hosts at most one such
+sandbox at a time. See [ateom-gvisor](/components/ateom-gvisor/) for the
+RPC surface.
+:::
+
 atelet's `Restore` handler downloads the three snapshot files from GCS in
 parallel and zstd-decompresses them under
 `/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/restore-state/`. That
@@ -144,8 +156,10 @@ hostPath) and calls `RestoreWorkload` to kick off the restore.
   <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
     Two pods on one node, talking through the node's own filesystem. The shared
     <code>hostPath</code> is how atelet "delivers" the snapshot files <em>and</em>
-    where it finds the unix socket to ateom-gvisor — there's no network hop
-    between them.
+    where it finds the unix socket to ateom-gvisor. Note the purple
+    <strong>gVisor sandbox</strong> inside the worker pod — that's a separate
+    runsc-managed sandbox that ateom-gvisor spawns; the actor's OCI image runs
+    in there, not in ateom-gvisor itself.
   </figcaption>
 </figure>
 
@@ -153,6 +167,12 @@ The pieces worth noticing in that picture:
 
 - **atelet is per-node, not per-pod.** One DaemonSet pod handles every
   worker pod scheduled to that node. It does not run as a sidecar.
+- **ateom-gvisor and the actor live at different layers.** ateom-gvisor is
+  the *pod's* container (PID 1, unsandboxed). The actor runs in a
+  *runsc-managed gVisor sandbox* that ateom-gvisor spawns — a sibling
+  process tree, not a child of the ateom-gvisor binary. When you read
+  "exec runsc restore" in the code, that's the moment the sandbox comes
+  into existence.
 - **The three snapshot files are downloaded in parallel** via an
   `errgroup` and streamed through `zstd` on the way to disk
   (`ategcs.FetchLocalFileFromGCSWithZstd`).
@@ -162,8 +182,8 @@ The pieces worth noticing in that picture:
   directly. ateom-gvisor inside the worker pod is listening on the same
   path because it sees the same mount.
 - **OCI bundle goes there too.** Before calling `RestoreWorkload`, atelet
-  writes a fresh `config.json` + rootfs bundle into the hostPath so
-  ateom-gvisor has everything `runsc restore` needs in one place.
+  writes a fresh `config.json` + rootfs (unpacked from the actor's image)
+  into the hostPath so `runsc restore` finds everything in one place.
 
 <code class="fileref">cmd/atelet/main.go:414-474</code>
 
