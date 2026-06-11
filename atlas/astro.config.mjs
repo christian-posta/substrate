@@ -41,6 +41,7 @@ export default defineConfig({
   },
   integrations: [
     starlight({
+      defaultColorScheme: 'light',
       title: 'Learn Agent Substrate',
       description: 'A visual atlas of how agent-substrate works.',
       customCss: ['./src/styles/atlas.css'],
