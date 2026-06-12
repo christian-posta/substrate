@@ -50,6 +50,14 @@ export default defineConfig({
       head: [
         {
           tag: 'script',
+          content: `window.HIVEMIND_ATTRIBUTION = { propertyKey: 'pk_efc68399cd3059b7e53bfde64e4df05e', apiBase: 'https://hivemind-web-dev-atx3yhqzbq-ue.a.run.app', source: 'learn.agentsubstrate.dev' };`,
+        },
+        {
+          tag: 'script',
+          attrs: { src: 'https://hivemind-web-dev-atx3yhqzbq-ue.a.run.app/hivemind-attribution.js' },
+        },
+        {
+          tag: 'script',
           content: `if (!localStorage.getItem('starlight-theme')) { document.documentElement.setAttribute('data-theme', 'light'); localStorage.setItem('starlight-theme', 'light'); }`,
         },
         {
