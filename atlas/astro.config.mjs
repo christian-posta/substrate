@@ -41,7 +41,6 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      defaultColorScheme: 'light',
       title: 'Learn Agent Substrate',
       description: 'A visual atlas of how agent-substrate works.',
       customCss: ['./src/styles/atlas.css'],
@@ -49,6 +48,10 @@ export default defineConfig({
         github: 'https://github.com/agent-substrate/substrate',
       },
       head: [
+        {
+          tag: 'script',
+          content: `if (!localStorage.getItem('starlight-theme')) { document.documentElement.setAttribute('data-theme', 'light'); localStorage.setItem('starlight-theme', 'light'); }`,
+        },
         {
           tag: 'script',
           attrs: { type: 'module' },
