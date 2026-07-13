@@ -73,7 +73,7 @@
   </g>
   <text x="125" y="444" text-anchor="middle" class="label-big">Client</text>
   <text x="125" y="470" text-anchor="middle" class="label-sm">HTTP request</text>
-  <text x="125" y="492" text-anchor="middle" class="label-tiny">actorId.actors…ate.dev</text>
+  <text x="125" y="492" text-anchor="middle" class="label-tiny">name.atespace.actors…ate.dev</text>
 
   <!-- atenet (gateway) -->
   <a href="/components/atenet/">

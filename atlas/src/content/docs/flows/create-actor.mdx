@@ -9,6 +9,11 @@ on the first `ResumeActor` call.
 
 ## Sequence
 
+`CreateActorRequest` carries an `Actor` body. Identity comes from
+`actor.metadata.{atespace, name}` - there is no bare `actor_id` field
+anymore. The referenced `ActorTemplate` and the target atespace must both
+already exist.
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -17,32 +22,39 @@ sequenceDiagram
   participant R as Redis
 
   participant K as K8s API
-  C->>A: CreateActor(actor_id, actor_template_namespace, actor_template_name)
+  C->>A: CreateActor(Actor{ metadata{atespace,name},<br/>actor_template_namespace, actor_template_name })
   A->>K: Lister: ActorTemplate exists?
   K-->>A: ok
-  A->>R: Conditional write to actor:{id}<br/>{ status: SUSPENDED, version: 1 }
+  A->>R: AtespaceExists(atespace)?
+  R-->>A: yes
+  A->>R: Conditional write to actor:{atespace}:{name}<br/>{ status: SUSPENDED }
   R-->>A: ok
-  A-->>C: Actor{ id, status=SUSPENDED }
+  A-->>C: Actor{ metadata{atespace,name,...}, status=SUSPENDED }
 ```
 
 ## What's actually written
 
-A new actor record in Redis at key `actor:<actor-id>` containing:
+A new actor record in Redis at key `actor:<atespace>:<name>` containing:
 
 | Field | Value at create time |
 |---|---|
-| `actor_id` | **caller-supplied** in `CreateActorRequest` |
-| `actor_template_ref` | from `actor_template_namespace` + `actor_template_name` in the request |
+| `metadata.atespace` / `metadata.name` | **caller-supplied** in `CreateActorRequest.actor.metadata` (identity) |
+| `actor_template_namespace` / `actor_template_name` | from the request's `Actor` body |
 | `status` | `STATUS_SUSPENDED` |
-| `version` | 1 |
+| `worker_selector` | copied from the request if set (per-actor placement) |
 | `ateom_pod_*` | empty |
-| `last_snapshot` | empty |
+| `latest_snapshot_info` | unset |
+
+The server assigns the rest of `ResourceMetadata` (`uid`, `version`,
+timestamps) on write. There is no `last_snapshot` string field - snapshot
+state now lives in `latest_snapshot_info` (a `SnapshotInfo`).
 
 No call to atelet or atecontroller. One K8s lister hit (to verify the
-referenced `ActorTemplate` exists - `FailedPrecondition` if not) and one
-conditional Redis write.
+referenced `ActorTemplate` exists - `FailedPrecondition` if not), one Redis
+`AtespaceExists` check (`FailedPrecondition` if the atespace does not exist),
+and one conditional Redis write.
 
-<code class="fileref">cmd/ateapi/internal/controlapi/create_actor.go:30-66</code>
+<code class="fileref">cmd/ateapi/internal/controlapi/create_actor.go</code>
 
 ## Why this is so simple
 
@@ -50,10 +62,11 @@ Actor creation is **cheap and lazy**. The expensive work - pulling images,
 allocating a worker, restoring memory - only happens when something actually
 needs the actor to be running. That's the [resume flow](/flows/resume-actor/).
 
-## What if an actor with that ID already exists?
+## What if an actor with that name already exists?
 
-`CreateActor` uses a conditional write - duplicate creates return
-`AlreadyExists` and don't overwrite the record.
+`CreateActor` uses a conditional write - a duplicate create for the same
+`(atespace, name)` returns `AlreadyExists` and does not overwrite the
+record.
 
 ## Related
 

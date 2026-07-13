@@ -86,6 +86,7 @@ export default defineConfig({
         { label: 'Start here', items: [
           { label: 'Overview', slug: '' },
           { label: 'System topology', slug: 'topology' },
+          { label: 'Security & identity', slug: 'security' },
         ]},
         { label: 'Flows', items: [
           { label: 'Create actor', slug: 'flows/create-actor' },
@@ -101,14 +102,17 @@ export default defineConfig({
           { label: 'atecontroller', slug: 'components/atecontroller' },
           { label: 'atelet', slug: 'components/atelet' },
           { label: 'ateom-gvisor', slug: 'components/ateom-gvisor' },
+          { label: 'ateom-microvm', slug: 'components/ateom-microvm' },
           { label: 'atenet', slug: 'components/atenet' },
           { label: 'Workers', slug: 'components/workers' },
           { label: 'Storage', slug: 'components/storage' },
         ]},
         { label: 'Concepts', items: [
           { label: 'Actor', slug: 'concepts/actor' },
+          { label: 'Atespace', slug: 'concepts/atespace' },
           { label: 'ActorTemplate', slug: 'concepts/actortemplate' },
           { label: 'WorkerPool', slug: 'concepts/workerpool' },
+          { label: 'SandboxConfig', slug: 'concepts/sandboxconfig' },
           { label: 'Worker', slug: 'concepts/worker' },
           { label: 'Snapshot', slug: 'concepts/snapshot' },
           { label: 'Session', slug: 'concepts/session' },

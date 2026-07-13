@@ -1,15 +1,28 @@
 ---
-title: Suspend actor
-description: Freeze a running actor to a checkpoint in object storage and release the worker. The inverse of resume.
+title: Suspend and pause an actor
+description: Freeze a running actor to a checkpoint and release its worker - either committing the snapshot to object storage (suspend) or keeping it on the node VM (pause). The inverse of resume.
 ---
 
-Suspend is the trick that lets Substrate run 30× more actors than there are
-worker pods. A running actor is checkpointed to object storage, its worker is
-released, and the actor record is updated to point at the snapshot. The next
-request triggers a [resume](/flows/resume-actor/) onto a different (or the
-same) worker.
+Freezing a running actor is the trick that lets Substrate run far more actors
+than there are worker pods. A running actor is checkpointed, its worker is
+released back to the pool, and the actor record is updated to point at the
+snapshot. The next request triggers a [resume](/flows/resume-actor/) onto a
+worker.
 
-## Sequence
+There are **two flavors** of this, driven by two RPCs on the `Control` service:
+
+| RPC | Where the snapshot lands | Effect on the next resume |
+|---|---|---|
+| **`SuspendActor`** | Uploaded to **object storage** (GCS/S3), node freed entirely | Can resume onto any eligible worker; downloads the snapshot |
+| **`PauseActor`** | Kept **local to the node VM**, node freed but the snapshot stays | Prefers to resume back onto that same node; no download |
+
+Both take a `SuspendActorRequest`/`PauseActorRequest` whose only field is an
+`actor` `ObjectRef{atespace, name}`, and both run as a four-step workflow under
+the per-actor lock. The workflows are near-identical - they differ only in the
+checkpoint type handed to atelet, the snapshot scope, and the `SnapshotInfo`
+variant written back.
+
+## Sequence (suspend)
 
 ```mermaid
 sequenceDiagram
@@ -21,212 +34,251 @@ sequenceDiagram
   participant O as ateom-gvisor<br/>(actor's worker pod)
   participant G as GCS / S3
 
-  C->>A: SuspendActor(actorId)
+  C->>A: SuspendActor(ObjectRef{atespace, name})
 
   rect rgb(245,235,235)
-    Note over A,R: Lock acquired:<br/>lock:actor:{actorId}<br/>(30s TTL, 28s workflow timeout)
+    Note over A,R: Lock acquired:<br/>lock:actor:{atespace}:{name}<br/>(30s TTL, 28s workflow timeout)
 
     A->>R: LoadActorForSuspend
     A->>R: MarkSuspending<br/>(status=SUSPENDING, allocate snapshot URI)
 
     Note over A,L: Dial atelet on the node hosting<br/>the actor's worker pod (atelet pod IP, port 8085)
-    A->>L: Checkpoint(actor, snapshotURI)
+    A->>L: Checkpoint(EXTERNAL, snapshotURI, scope=onCommit)
     L->>O: CheckpointWorkload (gRPC over Unix socket)
-    O->>O: exec runsc checkpoint<br/>writes checkpoint.img (plus pages.img,<br/>pages_meta.img if produced) on node hostPath
-    O-->>L: ok
-    L->>G: zstd-compress + upload, sequential<br/>(checkpoint.img always, pages files if present)
+    O->>O: runsc checkpoint → files on node hostPath,<br/>then tear down the actor veth pair
+    O-->>L: SnapshotFiles[]
+    L->>G: zstd-compress + upload in parallel (errgroup)<br/>+ manifest.json
     G-->>L: ok
     L-->>A: Checkpoint ok
 
-    A->>R: FinalizeSuspended<br/>(worker.actor_id="", actor.LastSnapshot=URI, status=SUSPENDED)
+    A->>R: FinalizeSuspended<br/>(clear worker Assignment,<br/>latest_snapshot_info=External{URI}, status=SUSPENDED)
   end
 
-  A-->>C: Actor{ status=SUSPENDED, LastSnapshot=URI }
+  A-->>C: Actor{ status=SUSPENDED, latest_snapshot_info=External }
 ```
+
+**Pause** follows the same shape, with a different tail: `PauseActor` →
+`MarkPausing` (status `PAUSING`) → `Checkpoint(LOCAL, snapshotPrefix,
+scope=onPause)` → atelet moves the checkpoint into the node's local-checkpoint
+directory instead of uploading → `FinalizePaused` sets status `PAUSED` and
+writes a `LocalSnapshotInfo` recording the node VM that holds the snapshot.
 
 ## What happens in each step
 
-### MarkSuspending - reserve the snapshot location
+### MarkSuspending / MarkPausing - reserve the snapshot location
 
-Before doing any work, ateapi flips the actor to `STATUS_SUSPENDING` and
-**generates a fresh snapshot URI** of the form:
+Before doing any work, ateapi flips the actor to `STATUS_SUSPENDING`
+(or `STATUS_PAUSING`) and reserves a snapshot location in
+`actor.in_progress_snapshot`, so that if anything crashes mid-checkpoint the
+stale data has a known location.
 
-```
-<ActorTemplate.spec.snapshotsConfig.location>/<actorId>/<RFC3339-timestamp>-<random>
-```
+- **Suspend** builds an external URI prefix of the form
+  `<snapshotsConfig.location>/<name>/<RFC3339-timestamp>-<random>`. The
+  bucket/prefix comes entirely from the template's `snapshotsConfig.location`
+  (trailing slash trimmed); ateapi appends `/<name>/<ts>-<rand>` (no fixed
+  `actors/` or `snapshots/` segment).
+- **Pause** reserves a plain, node-local prefix: `<name>-<RFC3339-timestamp>-<random>`
+  (no bucket - the snapshot never leaves the node).
 
-The bucket/prefix comes entirely from the template's `snapshotsConfig.location`;
-ateapi just appends `/<actorId>/<ts>-<rand>` (no fixed `actors/` or
-`snapshots/` segments).
+Both steps only act when the actor is `RUNNING`, and both short-circuit if the
+actor is already in the terminal state for their flow (`SUSPENDED` / `PAUSED`).
 
-This URI is written into `actor.InProgressSnapshot` so that if anything
-crashes mid-checkpoint, the stale data has a known location.
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code> ·
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_pause.go</code>
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go:73-93</code>
+### CallAteletSuspend / CallAteletPause - drive the checkpoint
 
-### CallAteletSuspend - drive the checkpoint
+ateapi resolves the **atelet DaemonSet pod running on the same node** as the
+actor's worker pod - dialing via `DialForWorker(actor.AteomPodNamespace,
+actor.AteomPodName)`, which looks up the atelet on that worker's node and dials
+its pod IP on `:8085`. atelet is per-node, not per-pod: one atelet serves every
+worker pod scheduled to its node.
 
-ateapi resolves the **atelet DaemonSet pod running on the same node** as
-the actor's worker pod (informer indexed by node name from
-`actor.AteomPodNamespace` / `AteomPodName`) and dials that atelet's pod IP
-on `:8085`. atelet is per-node, not per-pod - one atelet serves every
-worker pod scheduled to its node. atelet then:
+If the actor is in `SUSPENDING`/`PAUSING` but has no assigned worker
+(`ateom_pod_namespace`/`ateom_pod_name` empty), the step crashes the actor
+(`crashActor`) and fails - there's nothing to checkpoint.
 
-1. Calls `ateom-gvisor.CheckpointWorkload` over a Unix socket. The socket
-   sits in the shared `/var/lib/ateom-gvisor` hostPath, so atelet (on the
-   node) and ateom-gvisor (inside the worker pod) see it at the same
-   path. See [resume actor](/flows/resume-actor/) for the hostPath
-   diagram - checkpoint uses the same plumbing in reverse.
-2. ateom-gvisor execs `runsc checkpoint -image-path <local-path> <container>`,
-   writing `checkpoint.img` (and, depending on the workload,
-   `pages.img` / `pages_meta.img`) into
-   `/var/lib/ateom-gvisor/actors/{ns}:{name}:{id}/checkpoint-state/` on
-   the node. atelet reads them straight back through the same hostPath -
-   no copy across pod boundaries.
-3. atelet zstd-compresses each file and uploads them to GCS/S3
-   **sequentially**. `checkpoint.img` is always uploaded; `pages.img`
-   and `pages_meta.img` go through `uploadIfExists`, so they're silently
-   skipped if `runsc checkpoint` didn't produce them. The parallel
-   `errgroup` lives on the *restore* download path; the checkpoint
-   upload path is plain sequential calls.
+Otherwise atelet is sent a `CheckpointRequest`. The only differences between the
+two flows are:
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go:95-172</code> ·
-<code class="fileref">cmd/ateapi/internal/controlapi/dialer.go:47-99</code> ·
-<code class="fileref">cmd/atelet/main.go:351-412</code> ·
-<code class="fileref">cmd/ateom-gvisor/runsc.go:102-130</code>
-
-### FinalizeSuspended - release the worker
-
-Once the snapshot is durably in GCS, ateapi:
-
-1. **Clears the worker** (`actor_id=""`, `actor_namespace=""`,
-   `actor_template=""`) so it's eligible to host a new actor.
-2. **Updates the actor**: `LastSnapshot = InProgressSnapshot`,
-   clears `AteomPodNamespace`, `AteomPodName`, and `AteomPodIp`, and sets
-   `status = SUSPENDED`.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go:174-239</code>
-
-## What gets uploaded
-
-| File | Contents | Purpose at restore |
+| | Suspend | Pause |
 |---|---|---|
-| `checkpoint.img.zstd` | Sentry state, registers, FD table | Required up-front. Always uploaded. |
-| `pages.img.zstd` | RAM page data | Lazy-paged during `runsc restore -background`. Uploaded only if produced. |
-| `pages_meta.img.zstd` | Page metadata / index | Lazy-paged. Uploaded only if produced. |
+| `Type` | `CHECKPOINT_TYPE_EXTERNAL` | `CHECKPOINT_TYPE_LOCAL` |
+| Config | `ExternalConfig{ snapshot_uri_prefix }` | `LocalConfig{ snapshot_prefix }` |
+| `Scope` | `snapshotsConfig.onCommit` | `snapshotsConfig.onPause` |
 
-Lazy paging is what makes resume fast even on multi-GB checkpoints - only
-pages the workload actually touches get pulled in.
+The checkpoint request does **not** carry the sandbox config - atelet uses the
+version the actor is currently running (recorded on-node at Run/Restore) and
+pins it into the snapshot manifest. atelet then:
+
+1. Calls `ateom-gvisor.CheckpointWorkload` over a Unix socket in the shared
+   `/var/lib/ateom-gvisor` hostPath, so atelet (on the node) and ateom-gvisor
+   (inside the worker pod) see it at the same path. See
+   [resume actor](/flows/resume-actor/) for the hostPath diagram - checkpoint
+   uses the same plumbing in reverse.
+2. ateom-gvisor execs `runsc` to checkpoint into
+   `/var/lib/ateom-gvisor/actors/<atespace>:<name>/checkpoint-state/` on the
+   node - a full checkpoint of the `pause` container that roots the sandbox for
+   `Full` scope, or just an `fs-checkpoint` of the durable-dir volumes for
+   `Data` scope - then reports back **exactly the files runsc wrote** (a
+   `checkpoint.img` plus any pages images it emitted) rather than a hardcoded
+   list.
+3. **Suspend** zstd-compresses each reported file and uploads it to GCS/S3 **in
+   parallel** using an `errgroup`, then writes a `manifest.json` alongside them.
+   **Pause** instead moves the checkpoint into the node's
+   `.../local-checkpoint/` directory - no upload.
+
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code> ·
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_pause.go</code> ·
+<code class="fileref">cmd/ateapi/internal/controlapi/dialer.go</code> ·
+<code class="fileref">cmd/atelet/main.go</code> ·
+<code class="fileref">cmd/ateom-gvisor/main.go</code>
+
+### FinalizeSuspended / FinalizePaused - release the worker
+
+Once the snapshot is durably in place, ateapi:
+
+1. **Clears the worker's `Assignment`** (sets `worker.Assignment = nil`) so it's
+   eligible to host a new actor - but only if the assignment still points at
+   this actor (guarding against a concurrent reassignment).
+2. **Updates the actor**: promotes `in_progress_snapshot` into
+   `latest_snapshot_info`, then clears `ateom_pod_namespace`,
+   `ateom_pod_name`, `ateom_pod_ip`, and `worker_pool_name`, and sets the final
+   status.
+
+The two flows write different `SnapshotInfo` variants:
+
+- **Suspend** → `SnapshotInfo{ external: ExternalSnapshotInfo{ snapshot_uri_prefix } }`, status `SUSPENDED`.
+- **Pause** → `SnapshotInfo{ local: LocalSnapshotInfo{ snapshot_prefix, node_vms_with_local_snapshots: [nodeName] } }`, status `PAUSED`. The node name is read from the worker being released, so the following resume knows which node still holds the snapshot.
+
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code> ·
+<code class="fileref">cmd/ateapi/internal/controlapi/workflow_pause.go</code>
+
+## What gets checkpointed
+
+The checkpoint contents are decided by the snapshot **scope**, chosen per
+trigger in `snapshotsConfig` - `onCommit` for suspend, `onPause` for pause
+(with `onCommit` a subset of `onPause`). See [Snapshot](/concepts/snapshot/) for
+the `Full` vs. `Data` scopes and the exact on-disk layout. atelet treats the
+files as opaque: it ships exactly what `runsc` wrote, each zstd-compressed, plus
+a `manifest.json`. For gVisor that's a `checkpoint.img` (sentry state,
+registers, FD table, filesystem deltas) plus any pages images `runsc` emits;
+resume streams RAM pages in lazily, which is what keeps resume fast even on
+multi-GB checkpoints.
 
 ## What if the workload is unresponsive?
 
-`runsc checkpoint` doesn't gracefully ask the workload to pause - gVisor
-freezes the sentry, then writes the state. From the workload's perspective,
-its next syscall just blocks until resume. There's no SIGTERM, no cleanup
-hook.
+`runsc checkpoint` doesn't gracefully ask the workload to pause - gVisor freezes
+the sentry, then writes the state. From the workload's perspective, its next
+syscall just blocks until resume. There's no SIGTERM, no cleanup hook.
 
 ## What about in-flight requests?
 
-Suspend is **not graceful**. There is no drain phase, no signal to the
-workload, and no coordination with the L7 proxy - the proxy keeps
-routing right up until the sandbox is destroyed. Two distinct cases are
-worth pulling apart.
+Neither suspend nor pause is **graceful**. There is no drain phase, no signal to
+the workload, and no coordination with the L7 proxy - the proxy keeps routing
+right up until the sandbox is destroyed. Two distinct cases are worth pulling
+apart.
 
-### Requests *already inside* the sandbox when suspend fires
+### Requests *already inside* the sandbox when the checkpoint fires
 
-Once `ateom-gvisor.CheckpointWorkload` runs, the sequence inside the
-worker pod is:
+Once `ateom-gvisor.CheckpointWorkload` runs, the sequence inside the worker pod
+is:
 
-1. `runsc checkpoint pause` - freezes the sentry of the pause container
-   (which roots the sandbox). Any goroutine in the workload that was
-   mid-syscall stops where it is. The kernel never sees the syscall
-   complete; userspace never sees the result.
-2. `runsc delete` on every application container, then on `pause`.
-   The sandbox process tree is destroyed.
-3. `eth0` is moved back out of the interior (sandbox) netns into the
-   pod's own netns.
+1. `runsc checkpoint` on the `pause` container (which roots the sandbox) freezes
+   the sentry. Any goroutine in the workload that was mid-syscall stops where it
+   is. The kernel never sees the syscall complete; userspace never sees the
+   result.
+2. Best-effort `runsc delete` on the application containers and the `pause`
+   container. The sandbox process tree is destroyed.
+3. The **actor veth pair is torn down** (`cleanupActorNetwork`): ateom deletes
+   the host-side veth `ateom0` (which also removes its peer) and any interior
+   veth, undoing the link-local `169.254.17.0/30` wiring and the `ateom_actor`
+   nftables rules. (This is the current model - the actor no longer moves a real
+   `eth0` between netns; the pod keeps its own `eth0` throughout.)
 
-That order matters. By step 2, the sentry that owned the request's
-sockets is gone, so any TCP state the workload was holding (open
-connections from the L7 proxy, half-written HTTP responses, in-flight
-DB queries to external services) is dropped on the floor. By step 3,
-even segments still in flight on the wire land on a `eth0` with no
-listener - the kernel responds with RST. The L7 proxy sees the
+That order matters. By step 2, the sentry that owned the request's sockets is
+gone, so any TCP state the workload was holding (open connections from the L7
+proxy, half-written HTTP responses, in-flight DB queries to external services)
+is dropped. By step 3, even segments still in flight land on a torn-down veth
+with no listener - the kernel responds with RST. The L7 proxy sees the
 connection close mid-response and propagates that to the client as a
-**502 / upstream-reset**. The work is lost; the checkpoint captured
-the state *before* the request finished, so the next resume has no
-memory it ever happened.
+**502 / upstream-reset**. The work is lost; the checkpoint captured the state
+*before* the request finished, so the next resume has no memory it ever
+happened.
 
-This is also the moment any non-durable work disappears: an open file
-write that wasn't `fsync`'d, an outbound RPC whose response hadn't
-arrived yet, a metric increment that lived only in process memory.
-**Suspend has at-most-once semantics for whatever the workload was
-doing.** Anything that needs to survive must be flushed to durable
-storage before the request appears done from the workload's side -
-which, since suspend can be called at any moment, is the same
-discipline you'd want anyway.
+This is also the moment any non-durable work disappears: an open file write that
+wasn't `fsync`'d, an outbound RPC whose response hadn't arrived yet, a metric
+increment that lived only in process memory. **Freezing an actor has
+at-most-once semantics for whatever the workload was doing.** Anything that
+needs to survive must be flushed to durable storage before the request appears
+done from the workload's side - which, since suspend/pause can be called at any
+moment, is the same discipline you'd want anyway.
 
-<code class="fileref">cmd/ateom-gvisor/main.go:308-382</code>
+<code class="fileref">cmd/ateom-gvisor/main.go</code>
 
-### Requests that arrive *during* the suspend window
+### Requests that arrive *during* the freeze window
 
-New requests routed by the L7 proxy go through ExtProc, which always
-calls `ResumeActor` on every request. While the SuspendActor workflow
-holds `lock:actor:<id>` in Redis, that `ResumeActor` call returns gRPC
+New requests routed by the L7 proxy go through ExtProc, which always calls
+`ResumeActor` on every request. While the Suspend or Pause workflow holds
+`lock:actor:<atespace>:<name>` in Redis, that `ResumeActor` call returns gRPC
 `Aborted` ("another operation is in progress for this actor").
 
-Crucially, this **does not** propagate to the client as an error. The
-router's `ActorResumer` wraps the call in a `singleflight.Group` plus an
-explicit retry loop: on `Aborted` it backs off and retries with an
-exponential backoff (7 steps, starting at 200ms, factor 1.5, jitter 0.2,
-capped by a 15s background context). All concurrent requests for the
-same actor share the single in-flight call via `singleflight.DoChan`, so
-the suspend → resume transition causes one resume to happen and every
-waiting request piggybacks on it.
+Crucially, this **does not** propagate to the client as an error. The router's
+`ActorResumer` wraps the call in a `singleflight.Group` (keyed
+`<atespace>/<actor_name>`) plus an explicit retry loop: on `Aborted` it backs
+off and retries with an exponential backoff (7 steps, starting at 200ms, factor
+1.5, jitter 0.2, capped by a 15s background context). All concurrent requests
+for the same actor share the single in-flight call via `singleflight.DoChan`, so
+the freeze → resume transition causes one resume to happen and every waiting
+request piggybacks on it.
 
-The client-visible effect is **added latency** (suspend duration plus a
-cold resume) rather than a failure. The only way these requests turn
-into errors is if the retry budget runs out - i.e. suspend takes longer
-than ~15 seconds, which exceeds even the workflow's own 28s timeout
-budget and would point at a stuck checkpoint upload. If that happens,
-the gRPC `Aborted` falls through `mapResumeError`'s default branch and
-the client gets HTTP 500.
+The client-visible effect is **added latency** (the freeze duration plus a
+resume) rather than a failure. The only way these requests turn into errors is
+if the retry budget runs out - i.e. the freeze takes longer than ~15 seconds,
+which exceeds even the workflow's own 28s timeout budget and would point at a
+stuck checkpoint. If that happens, the gRPC `Aborted` falls through
+`mapResumeError`'s default branch and the client gets HTTP 500.
 
-<code class="fileref">cmd/atenet/internal/app/router/resumer.go:42-93</code> ·
-<code class="fileref">cmd/atenet/internal/app/router/errors.go:56-92</code>
+<code class="fileref">cmd/atenet/internal/router/resumer.go</code> ·
+<code class="fileref">cmd/atenet/internal/router/errors.go</code>
 
 ### Net effect
 
 | Request state when `Checkpoint` runs | Outcome |
 |---|---|
 | Already routed to the worker, being handled by the workload | Sandbox destroyed under it. Proxy sees connection reset, client gets 502, work is lost. |
-| Still in ExtProc / not yet routed | `ResumeActor` returns `Aborted`, router's `singleflight` + backoff retries until the suspend completes, then routes to a fresh worker. Added latency, no error. |
+| Still in ExtProc / not yet routed | `ResumeActor` returns `Aborted`, router's `singleflight` + backoff retries until the freeze completes, then routes to a worker. Added latency, no error. |
 
-The lack of a drain phase is a deliberate trade - it keeps suspend
-cheap and bounded (no waiting for indeterminate request lifetimes), at
-the cost of pushing exactly-once semantics onto the workload. There's
-a tracked plan to do this more gracefully via a finalizer-based
-controller that holds the pod `Terminating` until the actor is
-suspended; see the comment in `cmd/ateapi/internal/controlapi/syncer.go:147-160`
-and [issue #23](https://github.com/agent-substrate/substrate/issues/23).
+The lack of a drain phase is a deliberate trade - it keeps suspend/pause cheap
+and bounded (no waiting for indeterminate request lifetimes), at the cost of
+pushing exactly-once semantics onto the workload. There's a tracked plan to do
+this more gracefully via a finalizer-based controller that holds the pod
+`Terminating` until the actor is suspended; see
+[issue #23](https://github.com/agent-substrate/substrate/issues/23).
 
 ## Failure modes
 
-- **Lock conflict**: a concurrent operation on the same actor returns
-  gRPC `Aborted` ("another operation is in progress for this actor").
-  Client should back off and retry.
-- **GCS upload fails**: actor stays in `SUSPENDING` with
-  `InProgressSnapshot` set. No proactive cleanup runs - partial objects
-  at that URI are simply overwritten on the next `SuspendActor` attempt
-  (`MarkSuspending` skips re-allocating the URI when status is already
-  `SUSPENDING`).
+- **Lock conflict**: a concurrent operation on the same actor returns gRPC
+  `Aborted` ("another operation is in progress for this actor"). Client should
+  back off and retry.
+- **External upload fails (suspend)**: atelet returns `codes.DataLoss` carrying
+  the `actorCrashed` directive; ateapi's `maybeCrashActor` moves the actor to
+  **`CRASHED`** (external snapshot files aren't cached on failure, so the
+  workflow can't safely retry - tracked as
+  [#362](https://github.com/agent-substrate/substrate/issues/362)).
+- **No worker at checkpoint time**: if the actor is `SUSPENDING`/`PAUSING` but
+  has no assigned worker, the workflow crashes the actor (`crashActor`) - see
+  [actor lifecycle](/flows/actor-lifecycle/).
 - **Worker pod dies mid-checkpoint**: the syncer's `releaseActorOnDeadWorker`
-  resets the actor to `SUSPENDED`, clears `InProgressSnapshot`, and
-  leaves `LastSnapshot` alone - so the previous successful snapshot (if
+  resets the actor to `SUSPENDED` (unless already `CRASHED`), clears
+  `in_progress_snapshot` and the `ateom_pod_*`/`worker_pool_name` pointers, and
+  leaves `latest_snapshot_info` alone - so the previous successful snapshot (if
   any) is still the resume target.
 
 ## Related
 
 - [Resume actor](/flows/resume-actor/) - the reverse flow.
-- [Actor lifecycle](/flows/actor-lifecycle/) - full state machine.
-- [atelet](/components/atelet/) - the node-side machinery (Cut 3).
+- [Actor lifecycle](/flows/actor-lifecycle/) - full state machine, including
+  `PAUSED` and `CRASHED`.
+- [Snapshot](/concepts/snapshot/) - external vs. local snapshots and scopes.
+- [atelet](/components/atelet/) - the node-side machinery.

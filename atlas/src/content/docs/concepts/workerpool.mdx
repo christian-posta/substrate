@@ -1,11 +1,18 @@
 ---
 title: WorkerPool
-description: The CRD that declares a pool of pre-warmed gVisor worker pods. atecontroller reconciles it into a Deployment.
+description: The CRD that declares a pool of pre-warmed worker pods for a sandbox class. atecontroller reconciles it into a Deployment.
 ---
 
-`WorkerPool` is one of Substrate's two CRDs. It says: *"I want N pre-warmed
-worker pods running this ateom-gvisor image, ready to host actors of
-templates that target this pool."*
+`WorkerPool` is one of Substrate's CRDs. It says: *"I want N pre-warmed
+worker pods of a given sandbox class, ready to host actors."* From a single
+pool, `atecontroller` maintains a Kubernetes `Deployment`.
+
+:::note[Decoupled from ActorTemplate]
+A WorkerPool no longer knows anything about templates, and templates no
+longer name a pool. Eligibility is **selector-based**: an actor lands on a
+pool whose `sandboxClass` matches the template's and whose labels satisfy the
+template's `workerSelector` (AND'd with the actor's own `worker_selector`).
+:::
 
 ## The spec
 
@@ -14,12 +21,38 @@ apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
 metadata:
   name: default
+  labels:
+    tier: gpu                     # matched against ActorTemplate.workerSelector
 spec:
-  replicas: 10
-  ateomImage: ghcr.io/agent-substrate/ateom-gvisor:vX
+  replicas: 10                    # required
+  ateomImage: ghcr.io/agent-substrate/ateom-gvisor:vX   # required
+  sandboxClass: gvisor            # gvisor (default) | microvm
+  sandboxConfigName: gvisor-default   # optional; else the class default
+  template:                       # optional pod scheduling / resources
+    nodeSelector: { cloud.google.com/gke-nodepool: gpu }
+    tolerations: [...]
+    priorityClassName: high
+    nodeAffinity: {...}
+    resources:
+      requests: { cpu: "2", memory: 4Gi }
 status:
-  replicas: 10           # actual count
+  replicas: 10                    # actual count
 ```
+
+Fields:
+
+- `replicas` (required, `>= 0`) - desired worker pod count.
+- `ateomImage` (required) - the ateom container image to deploy as workers.
+- `sandboxClass` (`gvisor` default, or `microvm`) - the runtime family. It
+  drives the worker pod shape (for `microvm`, `/dev/kvm` mount plus
+  node placement) and which [SandboxConfig](/concepts/sandboxconfig/)s are
+  eligible.
+- `sandboxConfigName` (optional) - a cluster-scoped `SandboxConfig` to fetch
+  sandbox binaries from. Its `sandboxClass` must match this pool's. If empty,
+  the cluster default `SandboxConfig` for the class is used.
+- `template` (optional, `WorkerPoolPodTemplate`) - `nodeSelector`,
+  `tolerations`, `priorityClassName`, `nodeAffinity`, and `resources` for the
+  worker pods.
 
 <code class="fileref">pkg/api/v1alpha1/workerpool_types.go</code>
 
@@ -48,9 +81,11 @@ status:
   replicas: 2
 ```
 
-The whole spec is two fields. atecontroller's `WorkerPool` reconciler
-turned that into a Deployment named `kagent-default-deployment` (the
-`-deployment` suffix is hard-coded by the reconciler):
+The spec omits `sandboxClass` (so it defaults to `gvisor`) and
+`sandboxConfigName` (so it resolves the cluster default gVisor
+`SandboxConfig`). atecontroller's `WorkerPool` reconciler turned that into a
+Deployment named `kagent-default-deployment` (the `-deployment` suffix is
+hard-coded by the reconciler):
 
 ```text
 $ kubectl get deploy -n kagent kagent-default-deployment
@@ -65,20 +100,19 @@ kagent-default-deployment-7f464cd64c-r6lhv   1/1     Running   0          11h
 
 A few things worth pointing out:
 
-- **`ateomImage` is the gVisor-hosting pod image, not the agent image.**
-  Every pod in this Deployment runs `ateom-gvisor`, which is the
-  per-node manager that boots runsc sandboxes for actors. Actor
-  containers (e.g. the `golang-adk` image from `hello-substrate`) live
-  *inside* runsc, not in this pod's container spec. See
-  [ateom-gvisor](/components/ateom-gvisor/).
-- **`replicas: 2` is the whole capacity knob.** This cluster can host
-  exactly two actors concurrently per template-pool binding. Bump it
-  and atecontroller scales the Deployment; new pods register themselves
-  with `WorkerPoolSyncer` and Redis without restarting anything.
+- **`ateomImage` is the sandbox-hosting pod image, not the agent image.**
+  Every pod in this Deployment runs ateom (here `ateom-gvisor`), the
+  per-node manager that boots sandboxes for actors. Actor containers (e.g.
+  the `golang-adk` image from `hello-substrate`) live *inside* the sandbox,
+  not in this pod's container spec. See [ateom-gvisor](/components/ateom-gvisor/).
+- **`replicas: 2` is the whole capacity knob.** This pool can host exactly
+  two actors concurrently. Bump it and atecontroller scales the Deployment;
+  new pods register themselves with `ateapi` and Redis without restarting
+  anything.
 - **The pods are `privileged` and mount `/var/lib/ateom-gvisor` from
-  the host.** That's how ateom-gvisor manages runsc state across the
-  pod boundary - actors that survive a pod restart do so via files on
-  the host path, not in the pod's ephemeral storage.
+  the host.** That's how ateom manages sandbox state across the pod
+  boundary - actors that survive a pod restart do so via files on the host
+  path, not in the pod's ephemeral storage.
 - **The Deployment selector is `ate.dev/worker-pool=kagent-default`.**
   ateapi uses this label to find pool members when reconciling
   Redis-side worker records.
@@ -94,44 +128,55 @@ flowchart LR
   D --> P1[pod 1]
   D --> P2[pod 2]
   D --> PN[...]
-  P1 -- Ready --> S[ateapi<br/>WorkerPoolSyncer]
+  P1 -- Ready --> S[ateapi<br/>worker syncer]
   P2 -- Ready --> S
   PN -- Ready --> S
   S --> R[(Redis: idle worker records)]
+
+  click CTR "/components/atecontroller/" "atecontroller"
+  click S "/components/ateapi/" "ateapi"
 ```
 
-1. Reconciler reads `spec.replicas` and `spec.ateomImage`.
+1. Reconciler reads the spec and builds a Deployment apply-config
+   (`buildDeploymentApplyConfig`). For `sandboxClass: microvm` it also
+   mounts `/dev/kvm` and pins placement to KVM-capable nodes via a
+   `ate.dev/sandboxClass=microvm` nodeSelector + toleration; `spec.template`
+   settings are merged in.
 2. Server-side-applies a Deployment named `<workerpool-name>-deployment`
-   with that replica count and image.
+   with the replica count, `ateomImage`, and pod shape.
 3. Updates `status.replicas` with what K8s reports.
 
 That's the whole reconciler. **It doesn't insert worker records into
-Redis** - that happens later via ateapi's `WorkerPoolSyncer`, which
-watches the pods directly.
+Redis** - that happens later via ateapi's worker syncer, which watches the
+pods directly.
 
-<code class="fileref">internal/controllers/workerpool_controller.go:52-176</code>
+<code class="fileref">cmd/atecontroller/internal/controllers/workerpool_controller.go</code>
 
-## Isolation boundary
+## Isolation and eligibility
 
-`ActorTemplate.spec.workerPoolRef` pins each template to a specific pool.
-Different pools never share workers. Use this to:
+Pools are the isolation and capacity boundary. Because binding is
+selector-based, you can use them to:
 
-- Run actors with different sandbox images.
+- Separate sandbox runtimes: a `gvisor` pool and a `microvm` pool never
+  share workers, and snapshots aren't portable across classes.
+- Steer workloads with labels: label a pool (e.g. `tier: gpu`) and gate
+  templates to it with `workerSelector`.
 - Scale capacity for different workload classes independently.
 - Isolate failure domains.
 
 ## Scaling
 
 Edit `spec.replicas`, apply, done. atecontroller updates the Deployment,
-new pods come up, the syncer registers them. No actor downtime.
+new pods come up, the syncer registers them. No actor downtime. The CRD
+exposes a `scale` subresource, so `kubectl scale` works too.
 
 Scaling down: terminated pods that were hosting actors trigger the
-"worker died" recovery path - actors are reset to `SUSPENDED` from their
-`LastSnapshot`.
+"worker died" recovery path - actors are reset from their latest snapshot.
 
 ## Related
 
 - [Worker](/concepts/worker/) - what a pool member actually is.
-- [Workers component](/components/workers/) - pod-level detail.
+- [SandboxConfig](/concepts/sandboxconfig/) - where a pool's sandbox binaries come from.
+- [ActorTemplate](/concepts/actortemplate/) - the `sandboxClass` + `workerSelector` that gate a pool.
 - [Worker lifecycle](/flows/worker-lifecycle/) - the state machine.
 - [atecontroller](/components/atecontroller/) - the reconciler.

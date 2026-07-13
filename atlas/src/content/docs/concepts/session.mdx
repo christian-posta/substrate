@@ -25,34 +25,55 @@ apps/<appid>/users/<userid>/sessions/<sessionid>
 ```
 
 `MintCert` issues an X.509 cert whose SPIFFE URI uses the singular form
-`app/<appid>/user/<userid>/session/<sessionid>`. The substrate-specific
-metadata is also exposed via an extension claim keyed `ate.dev`.
+`spiffe://substrate-session.local/app/<appid>/user/<userid>/session/<sessionid>`.
+The substrate-specific metadata is also exposed via an extension claim keyed
+`ate.dev`.
+
+:::note[Plural in the JWT, singular in the cert]
+The minted JWT `sub` is **plural** -
+`apps/<appid>/users/<userid>/sessions/<sessionid>` - as built in code
+(`fmt.Sprintf("apps/%s/users/%s/sessions/%s", ...)`). The SPIFFE URI in the
+minted certificate uses the **singular** `app/.../user/.../session/...` form.
+(The proto comment on `MintJWTResponse` still describes a singular subject; the
+code is authoritative and mints the plural form.)
+:::
 
 ## The SessionIdentity gRPC service
 
-Two RPCs on ateapi, defined at
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto:187-197</code>:
+Two RPCs on ateapi, defined in
+<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
+(the `SessionIdentity` service):
 
 | RPC | Output |
 |---|---|
-| `MintJWT` | JWT with `sub=apps/<appid>/users/<userid>/sessions/<sessionid>`, 15-min TTL, NotBefore back-dated 5 min, issuer `https://broker.agentic-substrate-session-id-broker.svc`. The substrate metadata is in a JWT extension claim keyed `ate.dev`. |
-| `MintCert` | X.509 cert whose SPIFFE URI is `app/<appid>/user/<userid>/session/<sessionid>` (singular) with the same 15-min TTL. |
+| `MintJWT` | JWT with `sub=apps/<appid>/users/<userid>/sessions/<sessionid>`, 15-min TTL, NotBefore back-dated 5 min, issuer `https://broker.agentic-substrate-session-id-broker.svc`. Requires at least one requested `audience`. The substrate metadata (`appID`/`userID`/`sessionID`) is in a JWT extension claim keyed `ate.dev`. |
+| `MintCert` | X.509 cert whose SPIFFE URI is `spiffe://substrate-session.local/app/<appid>/user/<userid>/session/<sessionid>` (singular), signed from a CSR, with the same 15-min TTL. |
 
-Two auth modes are supported:
+The two RPCs authenticate their callers differently:
 
-- **Bearer token**: the pod's K8s ServiceAccount token, accepted by either RPC.
-- **mTLS client cert**: required by `MintCert`, optional on `MintJWT`. The
-  server is configured with `VerifyClientCertIfGiven` so callers may present
-  one or not.
+- **`MintJWT`** requires a **bearer token** in the `authorization` metadata -
+  the pod's K8s ServiceAccount token, verified against the configured OIDC
+  issuer/audience (`k8sjwt.Verify`).
+- **`MintCert`** requires a **client certificate**: it reads the peer's TLS
+  state and fails `Unauthenticated` if no peer certificate is present. ateapi's
+  gRPC server is configured with `tls.VerifyClientCertIfGiven`
+  (`cmd/ateapi/main.go`), so a client cert is optional at the transport level
+  but mandatory for `MintCert`.
 
-<code class="fileref">cmd/ateapi/internal/sessionidentity/sessionidentity.go:42-100</code>
+:::caution[Not the same as ateapi's client-auth mode]
+Session identity is about the credentials a **workload** presents to *external*
+services. It is distinct from how a client authenticates **to ateapi** itself
+(mTLS by default, with an optional JWT auth mode) - a separate concern.
+:::
+
+<code class="fileref">cmd/ateapi/internal/sessionidentity/sessionidentity.go</code>
 
 ## Session vs. actor
 
 | | Actor | Session |
 |---|---|---|
 | Scope | Substrate internals | Workload's identity to external services |
-| Identifier | `actor_id` | `app/user/session` triple |
+| Identifier | `(atespace, name)` tuple | `app`/`user`/`session` triple |
 | Persisted in | Redis | The credentials' issued JWTs/certs |
 | Lifetime | Until DeleteActor | Defined by app logic; survives worker moves |
 

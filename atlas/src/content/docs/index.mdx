@@ -26,9 +26,13 @@ import topologyHero from '../../assets/topology-hero.svg?raw';
 
 **Agent Substrate** is a Kubernetes-native runtime for highly-multiplexed actor
 workloads - AI agents, sandboxed environments, stateful services. It decouples
-actor lifecycle from Pods, so a small pool of pre-warmed gVisor workers can host
-**30× more actors than there are pods**, by suspending idle actors to object
-storage and restoring them on demand.
+actor lifecycle from Pods, so a small pool of pre-warmed sandbox workers -
+**gVisor or micro-VM** - can host **30× more actors than there are pods**, by
+suspending idle actors to object storage and restoring them on demand.
+
+Each actor lives in an [**atespace**](/concepts/atespace/) (Substrate's tenancy
+boundary), so its identity is the tuple `(atespace, name)` - which is why you'll
+see that pair in DNS names, storage keys, and every API call throughout this atlas.
 
 The bird's-eye view:
 
@@ -57,8 +61,8 @@ The bird's-eye view:
     [Open →](/components/ateapi/)
   </Card>
   <Card title="Concepts glossary" icon="document">
-    Quick definitions for the domain terms - actor, worker, session,
-    snapshot, WorkerPool, ActorTemplate.
+    Quick definitions for the domain terms - actor, atespace, worker,
+    session, snapshot, WorkerPool, ActorTemplate.
     [Open Actor →](/concepts/actor/)
   </Card>
   <Card title="Source on GitHub" icon="github">
@@ -79,7 +83,8 @@ The bird's-eye view:
 
 :::note[Authoritative sources]
 The atlas is a visual layer over the prose in
-[`docs/architecture.md`](https://github.com/agent-substrate/substrate/blob/main/docs/architecture.md)
+[`docs/architecture.md`](https://github.com/agent-substrate/substrate/blob/main/docs/architecture.md),
+[`docs/glossary.md`](https://github.com/agent-substrate/substrate/blob/main/docs/glossary.md),
 and [`docs/api-guide.md`](https://github.com/agent-substrate/substrate/blob/main/docs/api-guide.md).
-When the two disagree, the code wins.
+When they disagree, the code wins.
 :::
