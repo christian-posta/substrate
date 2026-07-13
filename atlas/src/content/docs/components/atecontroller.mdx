@@ -1,33 +1,39 @@
 ---
 title: atecontroller
-description: The Kubernetes reconciler. Watches the two Substrate CRDs (WorkerPool and ActorTemplate) and turns them into Deployments and golden snapshots.
+description: The Kubernetes reconciler. Watches the WorkerPool and ActorTemplate CRDs and turns them into Deployments and golden snapshots.
 ---
 
 `atecontroller` is the Kubernetes-native half of the control plane.
 Everything declarative about Substrate goes through it: `WorkerPool` and
-`ActorTemplate` are the CRDs it owns, and reconciling them produces real
+`ActorTemplate` are the CRDs it reconciles, and reconciling them produces real
 K8s resources (Deployments) and ateapi state (golden snapshots).
 
 ## What it owns
+
+It runs **exactly two reconcilers** - one per CRD:
 
 ```mermaid
 flowchart LR
   subgraph CTRL["atecontroller process"]
     direction TB
-    WPR["WorkerPool reconciler"]
-    ATR["ActorTemplate reconciler"]
+    WPR["WorkerPoolReconciler"]
+    ATR["ActorTemplateReconciler"]
   end
 
   K8s[(K8s API)] --> WPR
   K8s --> ATR
 
   WPR -- SSA apply --> DEP["K8s Deployment<br/>(N worker pods)"]
-  ATR -- CreateActor /<br/>ResumeActor /<br/>SuspendActor --> API[ateapi]
+  ATR -- CreateAtespace /<br/>CreateActor /<br/>ResumeActor /<br/>SuspendActor --> API[ateapi]
 
   click API "/components/ateapi/" "ateapi"
 ```
 
-<code class="fileref">cmd/atecontroller/main.go:49-107</code>
+<code class="fileref">cmd/atecontroller/main.go</code>
+
+There is no atespace or SandboxConfig reconciler here. `SandboxConfig` is a
+cluster-scoped CRD, but ateapi consumes it directly (via a lister) when
+scheduling - atecontroller does not reconcile it.
 
 ## WorkerPool reconciler
 
@@ -39,18 +45,26 @@ metadata:
 spec:
   replicas: 10
   ateomImage: ghcr.io/.../ateom-gvisor:vX
+  sandboxClass: gvisor
 ```
 
 The reconciler:
 
 1. Reads desired state from `WorkerPool.spec`.
-2. Server-side-applies a K8s `Deployment` named `<workerpool-name>-deployment`.
-3. Updates `WorkerPool.status` with actual replica count.
+2. Server-side-applies a K8s `Deployment` named `<workerpool-name>-deployment`
+   (owning it, so pod changes re-trigger reconcile).
+3. Updates `WorkerPool.status.replicas` with the Deployment's actual replica
+   count.
 
-That's it. No data plane involvement, no Redis writes. The pods themselves
-get registered in Redis by ateapi's `WorkerPoolSyncer` once they go Ready.
+That's it. No data plane involvement, no Redis writes. The pods themselves get
+registered in Redis by ateapi's `WorkerPoolSyncer` once they go Ready.
 
-<code class="fileref">internal/controllers/workerpool_controller.go:52-176</code>
+Crucially, a WorkerPool is **decoupled from ActorTemplate**: templates no longer
+reference a pool. Instead, placement is selector-based - the scheduler ANDs a
+template's `workerSelector` with the actor's own `worker_selector` and matches
+against pool labels (and `sandboxClass`).
+
+<code class="fileref">cmd/atecontroller/internal/controllers/workerpool_controller.go</code>
 
 ## ActorTemplate reconciler
 
@@ -60,46 +74,59 @@ kind: ActorTemplate
 metadata:
   name: my-agent
 spec:
-  workerPoolRef: { name: default }
+  sandboxClass: gvisor
+  workerSelector: { matchLabels: { pool: default } }
   containers: [...]
   pauseImage: ...
   snapshotsConfig: { location: gs://my-bucket/actors }
 ```
 
-This one is more interesting - it runs the **5-phase golden snapshot
-bootstrap** described in [Golden snapshot](/flows/golden-snapshot/):
+This one is more interesting - it runs a **golden snapshot bootstrap** as a
+small phase machine (`ActorTemplate.Status.Phase`), described in
+[Golden snapshot](/flows/golden-snapshot/):
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Initial
-  Initial --> ResumeGoldenActor: CreateActor()
-  ResumeGoldenActor --> WaitGoldenActor: ResumeActor()<br/>(record TakeGoldenSnapshotAt = now + 20s)
-  WaitGoldenActor --> Ready: requeue fires, SuspendActor()
-  Ready --> [*]
+  [*] --> PhaseInitial
+  PhaseInitial --> PhaseResumeGoldenActor: CreateAtespace(ate-golden)<br/>+ CreateActor()
+  PhaseResumeGoldenActor --> PhaseWaitGoldenActor: ResumeActor()<br/>(stamp TakeGoldenSnapshotAt)
+  PhaseWaitGoldenActor --> PhaseReady: requeue fires, SuspendActor()
+  PhaseReady --> [*]
 ```
 
-`PhaseFailed` is declared in the CRD type but the reconciler never assigns
-it - errors just return and trigger a requeue. The 20s wait between resume
-and suspend is not a blocking sleep; the reconciler stamps
-`Status.TakeGoldenSnapshotAt` and uses `RequeueAfter` to come back later.
+Two things worth calling out:
 
-The result: every ready ActorTemplate has a `Status.GoldenSnapshot` URI that
-new actors of this template can restore from in milliseconds.
+- **The golden actor lives in the reserved `ate-golden` atespace.** In
+  `PhaseInitial` the reconciler first ensures that atespace exists
+  (`CreateAtespace`, tolerating `AlreadyExists`), then creates a golden actor
+  there whose name is a fresh UUID (`Status.GoldenActorID`).
+- **The warmup wait is readyz-gated.** The reconciler stamps
+  `Status.TakeGoldenSnapshotAt` and uses `RequeueAfter` (not a blocking sleep)
+  before it suspends the golden actor to capture the snapshot. That delay is
+  `goldenSnapshotWarmup` (**20s**) *only as a fallback*: if every container in
+  the template declares a `readyz` probe, the delay is **0**, because
+  `ResumeActor` already blocked until the workload reported readiness. A
+  template with no containers keeps the 20s default.
 
-<code class="fileref">internal/controllers/actortemplate_controller.go:55-162</code>
+The reconciler never assigns a `PhaseFailed`; on error it just returns and lets
+controller-runtime requeue. The result: every ready ActorTemplate has a
+`Status.GoldenSnapshot` URI (read from the suspended golden actor's
+`latest_snapshot_info.external.snapshot_uri_prefix`) that new actors of this
+template can restore from in milliseconds.
+
+<code class="fileref">cmd/atecontroller/internal/controllers/actortemplate_controller.go</code>
 
 ## Why is this a separate process from ateapi?
 
 It uses the Kubernetes informer cache and has reconcile-loop semantics -
 the standard operator pattern. ateapi is stateless gRPC, optimized for QPS.
-Different concerns, different scaling profiles. (Note: the manager is
-constructed with `ctrl.Options{Scheme: scheme}`, so leader election is
-**off** by default. If you scale this to multiple replicas, they will all
-reconcile concurrently.)
+Different concerns, different scaling profiles. (The manager is constructed
+without leader election, so if you scale this to multiple replicas they will
+all reconcile concurrently.)
 
 ## Entry point
 
-<code class="fileref">cmd/atecontroller/main.go:49-107</code> - controller-runtime
+<code class="fileref">cmd/atecontroller/main.go</code> - controller-runtime
 manager setup, scheme registration, both reconcilers wired up.
 
 ## Related
@@ -107,4 +134,5 @@ manager setup, scheme registration, both reconcilers wired up.
 - [WorkerPool](/concepts/workerpool/) · [ActorTemplate](/concepts/actortemplate/)
 - [Golden snapshot bootstrap](/flows/golden-snapshot/) - the ActorTemplate
   reconciler's interesting flow.
+- [Atespace](/concepts/atespace/) - including the reserved `ate-golden` atespace.
 - [ateapi](/components/ateapi/) - atecontroller's only gRPC client.

@@ -132,7 +132,7 @@
   <g filter="url(#sketch)">
     <rect x="110" y="600" width="260" height="140" rx="10" class="box-file"/>
   </g>
-  <text x="240" y="624" text-anchor="middle" class="label-med">actors/{ns}:{tmpl}:{id}/</text>
+  <text x="240" y="624" text-anchor="middle" class="label-med">actors/{atespace}:{name}/</text>
   <text x="240" y="644" text-anchor="middle" class="label-sm">restore-state/</text>
   <text x="240" y="668" text-anchor="middle" class="label-tiny">├── checkpoint.img</text>
   <text x="240" y="686" text-anchor="middle" class="label-tiny">├── pages.img</text>

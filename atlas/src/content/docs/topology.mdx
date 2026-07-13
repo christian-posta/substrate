@@ -21,7 +21,7 @@ flowchart LR
   KAPI[(K8s API)]
   ATECTRL["atecontroller<br/>(Deployment)<br/>CRD reconciler"]
   ATEAPI["ateapi<br/>(Deployment)<br/>gRPC :443"]
-  REDIS[("Redis / Valkey<br/>actors · workers · locks")]
+  REDIS[("Redis / Valkey<br/>actors · workers · locks · atespaces")]
 
   ATECTRL -- "reconciles<br/>ActorTemplate · WorkerPool" --> KAPI
   ATEAPI -- "watches worker pods" --> KAPI
@@ -41,7 +41,7 @@ Stateless workloads, declarative inputs. `atecontroller` owns the CRDs;
 flowchart LR
   ATELET["atelet<br/>(DaemonSet)<br/>gRPC :8085"]
 
-  subgraph WPOD["Worker pod"]
+  subgraph WPOD["Worker pod (gVisor pool shown)"]
     direction TB
     ATEOM["ateom-gvisor<br/>gRPC over Unix socket"]
     RUNSC[["runsc<br/>(gVisor runtime)"]]
@@ -62,8 +62,26 @@ flowchart LR
 ```
 
 Every node runs one `atelet` DaemonSet pod and many worker pods. atelet is
-the single component on the node that touches object storage; ateom-gvisor
-is the only thing that talks to runsc.
+the single component on the node that touches object storage.
+
+There are **two sandbox runtimes**, chosen per-pool by a `SandboxClass`:
+`gvisor` (shown above - `ateom-gvisor` shelling out to `runsc`) and `microvm`
+(`ateom-microvm`, a kata + cloud-hypervisor micro-VM needing `/dev/kvm`).
+
+A **WorkerPool is single-class**: its `spec.sandboxClass` is one value, so every
+worker pod in the pool runs that one runtime. And a gVisor checkpoint (a `runsc`
+image) is a completely different format from a micro-VM snapshot (a
+cloud-hypervisor memory image) - **you can't restore one on the other**. So the
+scheduler treats sandbox class as a **hard gate**: an actor whose ActorTemplate
+is `gvisor` is only ever placed on `gvisor` workers, and its snapshots only move
+between workers of that same class. An actor is effectively pinned to one runtime
+family for life. (See [ActorTemplate](/concepts/actortemplate/) and
+[SandboxConfig](/concepts/sandboxconfig/) for how class is declared and resolved.)
+
+Whichever runtime a pool uses, atelet drives it over the same
+`Run · Checkpoint · Restore` gRPC on a Unix socket. See
+[ateom-gvisor](/components/ateom-gvisor/); the micro-VM sibling
+`ateom-microvm` gets its own deep-dive in the Components section.
 
 ### 3 · Request flow
 
@@ -75,7 +93,7 @@ flowchart LR
   ATEAPI["ateapi"]
   WORKLOAD[["Worker workload"]]
 
-  Client -- "1. resolve actorId.actors…ate.dev" --> DNS
+  Client -- "1. resolve name.atespace.actors…ate.dev" --> DNS
   DNS -- "2. router ClusterIP" --> Client
   Client -- "3. HTTP request" --> ROUTER
   ROUTER -- "4. ResumeActor (per request)" --> ATEAPI
@@ -99,10 +117,10 @@ case), see [Resume actor](/flows/resume-actor/).
 |---|---|---|
 | **ateapi** | Deployment | Source of truth for actor & worker state. Serves `Control` and `SessionIdentity` gRPC services. Owns the suspend/resume workflows. |
 | **atecontroller** | Deployment | Watches the K8s API. Reconciles `WorkerPool` (→ Deployments of worker pods) and `ActorTemplate` (→ golden snapshot bootstrap). |
-| **atenet** | Deployments (one binary, two subcommands) | `atenet router` runs an L7 proxy + ExtProc and does the per-request dance to find the right worker. `atenet dns` programs CoreDNS so `<actorId>.actors.resources.substrate.ate.dev` resolves. Each subcommand is typically deployed as its own Deployment. |
-| **atelet** | DaemonSet | Lives on each worker node. Receives gRPC calls from ateapi. Pulls images, manages OCI bundles, talks to ateom over a Unix socket, ships snapshots to GCS/S3. |
-| **ateom-gvisor** | In-pod helper | Lives inside every worker pod. Tiny gRPC server on a Unix socket. Shells out to `runsc checkpoint` / `runsc restore`. |
-| **Worker pods** | Deployment-spawned (from `WorkerPool`) | Pre-warmed gVisor sandboxes. Each can host one actor at a time; the gVisor sandbox (with its pause process) is created on assignment, not at pod start. |
+| **atenet** | Deployments (one binary, two subcommands) | `atenet router` runs an L7 proxy + ExtProc and does the per-request dance to find the right worker. `atenet dns` programs CoreDNS so `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` resolves. Each subcommand is typically deployed as its own Deployment. |
+| **atelet** | DaemonSet | Lives on each worker node. Receives gRPC calls from ateapi. Pulls images, manages OCI bundles, talks to `ateom` over a Unix socket, ships snapshots to GCS/S3. |
+| **ateom** | In-pod helper | Lives inside every worker pod. Tiny gRPC server on a Unix socket that drives the sandbox runtime. Two implementations: `ateom-gvisor` (shells out to `runsc`) and `ateom-microvm` (kata + cloud-hypervisor). |
+| **Worker pods** | Deployment-spawned (from `WorkerPool`) | Pre-warmed gVisor **or** micro-VM sandboxes (one class per pool). Each can host one actor at a time; the sandbox (with its pause process) is created on assignment, not at pod start. |
 | **Redis / Valkey** | StatefulSet | Holds actor records, worker records, and the per-actor distributed locks that serialize workflows. |
 | **GCS / S3** | External | Holds the checkpoint images (RAM + sentry state + lazy-load pages), zstd-compressed. |
 | **podcertcontroller** | Deployment | Polyfill for the upstream K8s Pod Certificate signers feature. Not on the hot path. |
@@ -136,7 +154,8 @@ sub-second resume times against 30× more actors than pods.
 :::tip[Where in the code]
 - ateapi entry: <code class="fileref">cmd/ateapi/main.go:70-161</code>
 - atecontroller entry: <code class="fileref">cmd/atecontroller/main.go:49-107</code>
-- atenet router init: <code class="fileref">cmd/atenet/internal/app/router/router.go:164-218</code>
+- atenet router init: <code class="fileref">cmd/atenet/internal/router/router.go</code>
 - atelet entry: <code class="fileref">cmd/atelet/main.go</code>
-- ateom-gvisor entry: <code class="fileref">cmd/ateom-gvisor/main.go</code>
+- ateom-gvisor / ateom-microvm entry: <code class="fileref">cmd/ateom-gvisor/main.go</code>, <code class="fileref">cmd/ateom-microvm/main.go</code>
+- domain terms: <code class="fileref">docs/glossary.md</code>
 :::

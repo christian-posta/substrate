@@ -1,6 +1,6 @@
 ---
 title: Worker
-description: A pre-warmed gVisor sandbox pod ready to host an actor. Members of a WorkerPool, registered in Redis once they go Ready.
+description: A pre-warmed sandbox pod ready to host an actor. Members of a WorkerPool, registered in Redis once they go Ready.
 ---
 
 A **worker** is a Pod that's pre-warmed to host actors. It's not the actor
@@ -14,17 +14,17 @@ their lifetime.
 flowchart LR
   subgraph POD["Worker pod (a.k.a. one worker)"]
     direction TB
-    OM[ateom-gvisor container]
-    SANDBOX[("gVisor sandbox<br/>(created on assignment -<br/>pause process lives inside)")]
+    OM[ateom container]
+    SANDBOX[("sandbox<br/>(created on assignment -<br/>pause process lives inside)")]
   end
 ```
 
 Two pieces:
-1. `ateom-gvisor` running as the pod's only container, ready to receive
-   Run/Checkpoint/Restore RPCs.
-2. A gVisor sandbox that ateom-gvisor will create on assignment - its
-   pause process lives **inside** that sandbox, not as a peer pod-level
-   container.
+1. `ateom` running as the pod's only container, ready to receive
+   Run/Checkpoint/Restore RPCs. Its runtime family (gVisor or micro-VM)
+   is set by the pool's `sandboxClass`.
+2. A sandbox that ateom will create on assignment - its pause process lives
+   **inside** that sandbox, not as a peer pod-level container.
 
 ## Worker record (in Redis)
 
@@ -32,23 +32,34 @@ Two pieces:
 key:   worker:<worker_namespace>:<worker_pool>:<worker_pod>
 value: {
   worker_namespace, worker_pool, worker_pod, worker_pod_uid, ip, version,
-  actor_id, actor_namespace, actor_template,
+  node_name, sandbox_class, labels{},
+  assignment: { actor_template: {namespace, name}, actor: {atespace, name} },
 }
 ```
 
 (Proto field names from `pkg/proto/ateapipb/ateapi.proto`. There is no
 `pod_name` field; the pod-name component is `worker_pod`.)
 
-When `actor_id == ""`, the worker is **idle**. Otherwise it's **assigned**
-to that actor.
+The old flat `actor_id` / `actor_namespace` / `actor_template` fields are
+gone. An assignment is now a single `Assignment` message (field 4):
 
-<code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go:40-80</code>
+- `actor_template` - a `KubeNamespacedObjectRef` (`namespace`, `name`).
+- `actor` - an `ObjectRef` (`atespace`, `name`), the actor's identity tuple.
+
+When no `assignment` is set, the worker is **idle**. Otherwise it's
+**assigned** to that actor. The worker also caches pool metadata -
+`sandbox_class` and `labels{}` - so the scheduler can match eligibility
+without re-reading the pool.
+
+<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
+<code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
 
 ## One actor per worker
 
-A worker hosts **at most one** actor at a time. The actor's gVisor sandbox
-gets the whole pod's resources. When the actor suspends, the worker
-returns to the idle pool.
+A worker hosts **at most one** actor at a time. The actor's sandbox gets the
+whole pod's resources. When the actor suspends, the worker returns to the
+idle pool. Assignment and scheduling are scoped by the actor's `(atespace,
+actor_name)` identity.
 
 ## How workers get *created*
 
@@ -60,7 +71,7 @@ inserted into Redis as a worker by ateapi's syncer.
 
 When a pod terminates (manual delete, eviction, node drain), the syncer's
 `DeleteFunc` removes the worker record. If an actor was assigned, it's
-forced back to `SUSPENDED` first.
+forced back to a snapshot first.
 
 ## Related
 

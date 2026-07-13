@@ -1,71 +1,105 @@
 ---
 title: Snapshot
-description: A frozen point-in-time image of an actor's RAM and sentry state. Three zstd-compressed files in GCS/S3 that runsc restore can lazy-page back into a sandbox.
+description: A frozen point-in-time image of an actor's state that lets it be restored on any worker. Kept on the node VM when paused, or uploaded to GCS/S3 when suspended.
 ---
 
-A **snapshot** is what makes Substrate actors portable. It's an on-disk
-representation of an actor's full in-process state at the moment it was
-suspended - captured by `runsc checkpoint`, restored by
-`runsc restore -background`.
+A **snapshot** is what makes Substrate actors portable. It's a persisted
+representation of an actor's state at the moment it was checkpointed, so the
+actor can later be restored onto a (potentially different) worker instead of
+cold-booting. The exact bytes depend on the sandbox runtime, but the actor
+record refers to a snapshot through one uniform message: `SnapshotInfo`.
 
-## The three files
+## SnapshotInfo: external or local
 
-```
-<ActorTemplate.spec.snapshotsConfig.location>/<actorId>/<RFC3339-ts>-<random>/
-├── checkpoint.img.zstd        # sentry state, registers, FD table
-├── pages.img.zstd             # RAM page contents       (optional)
-└── pages_meta.img.zstd        # page index              (optional)
-```
+`SnapshotInfo` (`pkg/proto/ateapipb/ateapi.proto`) is a `oneof data` with two
+variants - a snapshot is either uploaded to object storage or kept on the node:
 
-The prefix comes entirely from `ActorTemplate.spec.snapshotsConfig.location`
-(e.g. `gs://my-bucket/some/prefix`); ateapi appends `/<actorId>/<ts>-<rand>`.
-There is no fixed `actors/` or `snapshots/` segment.
+| Variant | Message | Where it lives | Set by |
+|---|---|---|---|
+| **External** | `ExternalSnapshotInfo{ snapshot_uri_prefix }` | Object storage (GCS/S3) at a URI prefix | `SuspendActor` |
+| **Local** | `LocalSnapshotInfo{ snapshot_prefix, node_vms_with_local_snapshots[] }` | On the worker node VM(s) listed in `node_vms_with_local_snapshots` | `PauseActor` |
 
-| File | Size | When read |
+An actor's `latest_snapshot_info` field carries whichever of these was most
+recently produced. (There is no longer a `SnapshotType` enum or a
+`last_snapshot` string - those are gone.)
+
+:::note[Pause vs. Suspend]
+A **Pause** keeps a snapshot **local** to the node VM so the following Resume
+can be steered back onto the same node (fast, no upload). A **Suspend** commits
+an **external** snapshot to object storage, freeing the node entirely. See
+[Actor](/concepts/actor/) for the `PAUSED`/`SUSPENDED` lifecycle states.
+:::
+
+## Snapshot scope: what goes in
+
+Independently of *where* a snapshot lands, the `ActorTemplate`'s
+`snapshotsConfig` decides *what* it contains, via the **`SnapshotScope`** enum
+(`pkg/api/v1alpha1/actortemplate_types.go`):
+
+| Scope | Contents | On resume |
 |---|---|---|
-| `checkpoint.img.zstd` | Small (KB-MB) | Up front during restore. Always present. |
-| `pages.img.zstd` | **Big** (often GB) | Lazily, page by page, as the workload touches memory. Uploaded only if produced by `runsc checkpoint`. |
-| `pages_meta.img.zstd` | Small (KB) | Up front + during lazy paging. Uploaded only if produced. |
+| **`Full`** | Process memory plus the filesystem delta on top of the OCI image (which includes any attached [DurableDir](/concepts/actortemplate/) volumes, since they live inside rootfs) | Restores hot from the memory image |
+| **`Data`** | Only the contents of snapshot-supporting volumes (currently `DurableDir`); process memory and the rest of rootfs are discarded | Cold-boots from the OCI image with `DurableDir` contents restored |
 
-The trick that makes resume fast is that `pages.img` is **not** read fully
-on restore - `runsc restore -background` returns control as soon as the
-sentry is up, and individual RAM pages stream in only when the workload
-touches them.
+Scope is chosen per trigger in `SnapshotsConfig`:
 
-## Where snapshots are produced
+- **`onPause`** (default `Full`) - what a Pause captures and keeps on the node.
+- **`onCommit`** (default `Full`) - what a Suspend captures and uploads.
 
-Only one place: ateom-gvisor running `runsc checkpoint` inside a worker
-pod, then atelet zstd-compressing and uploading the result. See the
-[suspend flow](/flows/suspend-actor/).
+`onCommit` must be a **subset** of `onPause` (enforced by a CEL validation rule
+on the CRD): if `onPause` is `Full`, `onCommit` may be `Full` or `Data`; if
+`onPause` is `Data`, `onCommit` must be `Data`.
 
-## Where snapshots are consumed
+## What's on disk
 
-Only one place: atelet downloading and decompressing them onto a worker
-pod's local volume, then ateom-gvisor running `runsc restore` against
-them. See the [resume flow](/flows/resume-actor/).
+atelet drives whichever sandbox runtime a pool uses over the same
+`Checkpoint`/`Restore` gRPC, and treats the checkpoint contents as **opaque** -
+it ships exactly the files the runtime wrote, each **zstd-compressed** (regular
+files use a sparse-extent zstd format that skips holes; magic `ATESPRSE`), plus
+a `manifest.json` it writes beside them to pin the sandbox binary versions and
+file list.
 
-## Two flavors of snapshot
+- **gVisor** (`ateom-gvisor`, `runsc checkpoint`/`restore`): a `checkpoint.img`
+  holding memory, sentry state, and filesystem deltas, plus any pages images
+  `runsc` emits. ateom reports exactly the files `runsc` wrote rather than a
+  hardcoded list (`cmd/ateom-gvisor/main.go`), so resume can stream RAM pages
+  in lazily instead of reading the whole image up front.
+- **micro-VM** (`ateom-microvm`, cloud-hypervisor): a `config.json`, a
+  `state.json`, and a sparse `memory-ranges` file - the guest's writable rootfs
+  upper lives in guest RAM, so process memory *and* rootfs writes are both
+  captured by the memory snapshot (`cmd/ateom-microvm/checkpoint.go`).
+
+Snapshots are **not portable across sandbox classes** - a gVisor snapshot can
+only be restored into a gVisor worker, and likewise for micro-VM.
+
+## Where snapshots are produced and consumed
+
+atelet is the only component on a node that touches object storage. On
+checkpoint it collects the files ateom wrote and either leaves them on the node
+(Pause) or uploads them zstd-compressed to the external prefix (Suspend). On
+restore it downloads/decompresses (or reads the local copy) onto the worker,
+then has ateom restore against them. See the [suspend flow](/flows/suspend-actor/)
+and [resume flow](/flows/resume-actor/).
+
+## Golden vs. latest snapshot
 
 | Kind | Stored where | When created |
 |---|---|---|
-| **LastSnapshot** | On the Actor record | Every time `SuspendActor` finishes |
-| **GoldenSnapshot** | On the ActorTemplate status | Once, by atecontroller's [bootstrap loop](/flows/golden-snapshot/) |
+| **Golden Snapshot** | On the `ActorTemplate` status | Once, when the template is created, from a throwaway "golden" boot (see the [bootstrap flow](/flows/golden-snapshot/)) |
+| **Last / latest snapshot** | On the Actor record (`latest_snapshot_info`) | Every time `SuspendActor` (or `PauseActor`) finishes for that specific actor |
 
-The resume workflow's strategy selection prefers `LastSnapshot` if one
-exists; otherwise falls back to `GoldenSnapshot`; otherwise cold boots.
+The resume workflow prefers the actor's latest snapshot if one exists;
+otherwise it falls back to the template's golden snapshot; otherwise it cold
+boots. (`ResumeActor` with `boot=true` skips the golden snapshot and cold
+boots deliberately.)
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go:213-265</code>
+## How external snapshots are addressed
 
-## How they're addressed
-
-By URI prefix:
-
-```
-<snapshots-location>/<actorId>/<timestamp>-<random>/
-```
-
-The actor record stores just the URI prefix; atelet appends the three
-file names when reading or writing.
+By URI prefix. The prefix comes from `ActorTemplate.spec.snapshotsConfig.location`
+(e.g. `gs://my-bucket/some/prefix`); ateapi appends a per-snapshot segment. The
+actor record stores just this prefix in `ExternalSnapshotInfo.snapshot_uri_prefix`;
+atelet appends the individual file names (each with a `.zstd` suffix) plus
+`manifest.json` when reading or writing.
 
 ## Why zstd, not gzip?
 
@@ -77,3 +111,10 @@ because decompress happens on the critical path of resume.
 - [Suspend actor](/flows/suspend-actor/) · [Resume actor](/flows/resume-actor/)
 - [Golden snapshot bootstrap](/flows/golden-snapshot/)
 - [Storage](/components/storage/) - the GCS/S3 layer.
+
+:::tip[Where in the code]
+- `SnapshotInfo` / `ExternalSnapshotInfo` / `LocalSnapshotInfo`: <code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
+- `SnapshotScope`, `SnapshotsConfig` (`onPause`/`onCommit`): <code class="fileref">pkg/api/v1alpha1/actortemplate_types.go</code>
+- gVisor checkpoint files: <code class="fileref">cmd/ateom-gvisor/main.go</code>; micro-VM: <code class="fileref">cmd/ateom-microvm/checkpoint.go</code>
+- upload + sparse-zstd: <code class="fileref">cmd/atelet/main.go</code>, <code class="fileref">cmd/atelet/internal/ategcs/sparsezstd.go</code>
+:::
