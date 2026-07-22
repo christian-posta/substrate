@@ -9,8 +9,7 @@ needs and have completely different access patterns.
 ## Redis / Valkey - hot path
 
 The source of truth for actor and worker state. Every routing decision
-reads from here. The deployed backend is **ValKey 9.1**
-(<code class="fileref">manifests/ate-install/valkey.yaml</code>), run as a TLS
+reads from here. The deployed backend is **ValKey 9.1**, run as a TLS
 cluster; the cluster reloads its own TLS certificate on an interval
 (`tls-auto-reload-interval`, 12h in the shipped config) so pod-certificate
 rotations take effect without a restart.
@@ -18,9 +17,9 @@ rotations take effect without a restart.
 ```mermaid
 flowchart LR
   API[ateapi] -- read/write --> R[(Redis / Valkey)]
-  SYNC[WorkerPoolSyncer] -- write --> R
+  SYNC[Worker-pool syncer] -- write --> R
   WF[Workflow engine] -- read/write/lock --> R
-  R -- WatchWorkers --> WC[In-memory worker cache]
+  R -- worker updates --> WC[In-memory worker cache]
 
   click API "/components/ateapi/" "ateapi"
 ```
@@ -34,10 +33,8 @@ flowchart LR
 | `worker:<ns>:<pool>:<pod>` | Worker proto (JSON) | One per Ready worker pod |
 | `lock:actor:<atespace>:<name>` | Workflow-instance ID | 30s TTL, used by ateapi workflows |
 
-<code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
-
 To speed up scheduling, ateapi also fronts the worker keys with an in-memory
-worker cache that streams changes over Redis pub/sub (`WatchWorkers`) and
+worker cache that streams changes over Redis pub/sub and
 relists periodically. See [ateapi](/components/ateapi/).
 
 ### Why Redis (and not the K8s API)?
@@ -53,14 +50,11 @@ starts on an actor. The workflow itself runs under a context that times out at
 28 seconds (TTL minus 2s of padding). Two concurrent operations on the same
 actor cannot both succeed - the second returns `Aborted`.
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow.go</code>
-
 ## Snapshots: external vs. local
 
 A snapshot is the memory + sandbox state that lets a stopped actor come back to
 life. There are now **two storage locations**, modeled as a oneof on
-`SnapshotInfo` (`Actor.latest_snapshot_info`,
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>):
+`SnapshotInfo` (`Actor.latest_snapshot_info`):
 
 | `SnapshotInfo` variant | Where it lives | Backs which state |
 |---|---|---|
@@ -86,8 +80,7 @@ flowchart LR
 ### Object layout
 
 The external snapshot prefix is built by ateapi from the per-template config,
-not a hardcoded bucket path
-(<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code>):
+not a hardcoded bucket path:
 
 ```
 <ActorTemplate.spec.snapshotsConfig.location>/<actorName>/<RFC3339-timestamp>-<random>/
@@ -101,18 +94,14 @@ the per-snapshot directory.
 
 atelet no longer ships a hardcoded set of image files. The sandbox runtime
 (e.g. ateom-gvisor via `runsc`) reports exactly the files it produced, and
-atelet uploads precisely that set, each zstd-compressed, plus a
-`manifest.json` so a later Restore on any node is self-describing
-(<code class="fileref">cmd/atelet/main.go</code>,
-<code class="fileref">cmd/atelet/sandbox_assets.go</code>). For a gVisor
-checkpoint this set is typically `checkpoint.img` (always) plus lazy-paged RAM
-images such as `pages.img` / `pages_meta.img` when produced; the micro-VM
-runtime uses a sparse-zstd on-disk format
-(<code class="fileref">cmd/atelet/internal/ategcs/sparsezstd.go</code>).
+atelet uploads precisely that set, each compressed with a **sparse-extent zstd
+format** (magic `ATESPRSE`) that skips file holes, plus a `manifest.json` so a
+later Restore on any node is self-describing. For a gVisor checkpoint this set is
+typically `checkpoint.img` (always) plus lazy-paged RAM images such as
+`pages.img` / `pages_meta.img` when produced; the micro-VM runtime writes CH's
+`memory-ranges` set. The sparse format is applied uniformly to both.
 
-Both the checkpoint **upload** and the restore **download** run in parallel via
-an `errgroup` (<code class="fileref">cmd/atelet/main.go</code>).
-<code class="fileref">cmd/atelet/internal/ategcs/</code>
+Both the checkpoint **upload** and the restore **download** run in parallel.
 
 ### Why compress?
 
@@ -122,19 +111,16 @@ CPU cost is paid once on suspend, hidden behind storage I/O on restore.
 
 ### Why GCS *or* S3?
 
-Both back-ends implement the same internal object interface
-(<code class="fileref">cmd/atelet/internal/ategcs/</code>, with `gcs.go` and
-`s3.go`). The choice is environmental - GCS in GCP, S3 in AWS - selected at
+Both back-ends implement the same internal object interface. The choice is
+environmental - GCS in GCP, S3 in AWS - selected at
 atelet startup, not per snapshot.
 
 ## Node-local snapshots
 
 For a `PAUSED` actor, atelet keeps the snapshot on the worker node's disk
 instead of uploading it, under a per-actor directory
-(`ateompath.LocalCheckpointsDir(atespace, actorName)`,
-`/var/lib/ateom-gvisor/...`, plus the `snapshot_prefix`), again beside a
-`manifest.json` (<code class="fileref">internal/ateompath/ateompath.go</code>,
-<code class="fileref">cmd/atelet/main.go</code>). Because the bytes never
+(rooted under `/var/lib/ateom-gvisor/...`, plus the `snapshot_prefix`), again
+beside a `manifest.json`. Because the bytes never
 leave the node, resuming a paused actor on the same node avoids the object-store
 round trip entirely; `LocalSnapshotInfo.node_vms_with_local_snapshots` records
 which nodes hold a copy.

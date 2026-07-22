@@ -31,18 +31,13 @@ The substrate-specific metadata is also exposed via an extension claim keyed
 
 :::note[Plural in the JWT, singular in the cert]
 The minted JWT `sub` is **plural** -
-`apps/<appid>/users/<userid>/sessions/<sessionid>` - as built in code
-(`fmt.Sprintf("apps/%s/users/%s/sessions/%s", ...)`). The SPIFFE URI in the
+`apps/<appid>/users/<userid>/sessions/<sessionid>`. The SPIFFE URI in the
 minted certificate uses the **singular** `app/.../user/.../session/...` form.
-(The proto comment on `MintJWTResponse` still describes a singular subject; the
-code is authoritative and mints the plural form.)
 :::
 
 ## The SessionIdentity gRPC service
 
-Two RPCs on ateapi, defined in
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
-(the `SessionIdentity` service):
+Two RPCs on ateapi, on the `SessionIdentity` service:
 
 | RPC | Output |
 |---|---|
@@ -53,20 +48,17 @@ The two RPCs authenticate their callers differently:
 
 - **`MintJWT`** requires a **bearer token** in the `authorization` metadata -
   the pod's K8s ServiceAccount token, verified against the configured OIDC
-  issuer/audience (`k8sjwt.Verify`).
+  issuer/audience.
 - **`MintCert`** requires a **client certificate**: it reads the peer's TLS
-  state and fails `Unauthenticated` if no peer certificate is present. ateapi's
-  gRPC server is configured with `tls.VerifyClientCertIfGiven`
-  (`cmd/ateapi/main.go`), so a client cert is optional at the transport level
-  but mandatory for `MintCert`.
+  state and fails authentication if no peer certificate is present. ateapi's
+  gRPC server verifies a client cert only if one is given, so a client cert is
+  optional at the transport level but mandatory for `MintCert`.
 
 :::caution[Not the same as ateapi's client-auth mode]
 Session identity is about the credentials a **workload** presents to *external*
 services. It is distinct from how a client authenticates **to ateapi** itself
 (mTLS by default, with an optional JWT auth mode) - a separate concern.
 :::
-
-<code class="fileref">cmd/ateapi/internal/sessionidentity/sessionidentity.go</code>
 
 ## Session vs. actor
 

@@ -37,9 +37,6 @@ of the **workload** running inside it.
   can discover its own `(atespace, name)` without parsing headers. See
   [atelet](/components/atelet/).
 
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code> ·
-<code class="fileref">cmd/ateapi/internal/sessionidentity/sessionidentity.go</code>
-
 ## Authenticating to the control plane
 
 Calls into `ateapi` are authenticated in one of two modes, selected by the
@@ -64,10 +61,6 @@ Both are backed by a local CA and are expected to be replaced by upstream signer
 over time. Note that not every internal hop is mTLS: atelet talks to `ateom`
 over a **Unix domain socket** inside the worker pod (addressed by pod UID), not a
 network connection.
-
-<code class="fileref">internal/ateapiauth/server.go</code> ·
-<code class="fileref">cmd/ateapi/internal/k8sjwt</code> ·
-<code class="fileref">cmd/podcertcontroller/main.go</code>
 
 ## Isolation, layer by layer
 
@@ -102,9 +95,6 @@ flowchart TB
   with an `ateom_actor` nftables table doing egress masquerade and inbound DNAT.
   The workload never sits directly on the pod's network.
 
-<code class="fileref">cmd/ateom-gvisor/main.go</code> ·
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code>
-
 ## Secrets & log hygiene
 
 - **Secret env:** an ActorTemplate container may source an env var from a
@@ -115,8 +105,9 @@ flowchart TB
   bearer tokens / query params don't leak into logs.
 - **Store transport:** ValKey (v9.1) is fronted by TLS and reloads its certs
   every 12h, so cert rotation doesn't require a restart. ateapi can additionally
-  authenticate to it with Google Cloud **IAM** (`--redis-use-iam-auth`, on by
-  default), and it is the only component that connects to the database. See
+  authenticate to it with Google Cloud **IAM** (`--redis-use-iam-auth`, a string
+  flag defaulting to `"true"`; IAM is used unless it is set to `"false"`), and it
+  is the only component that connects to the database. See
   [Storage](/components/storage/).
 
 ## Integrity controls
@@ -135,7 +126,7 @@ flowchart TB
 - **Input validation.** atelet validates every RPC field that becomes a host
   filesystem path (atespace, name, container names, hashes) against DNS-1123 /
   length rules, so a malicious control-plane input can't traverse out of an
-  actor's directory. See <code class="fileref">internal/resources/validate.go</code>.
+  actor's directory.
 
 ## Threats & mitigations
 
@@ -163,8 +154,9 @@ Some notable invariants the threat model calls for that are **not yet guaranteed
   restore even passes `runsc`'s `-direct` flag, which *assumes the snapshot source
   is trusted*, so snapshot integrity rests on securing the object store, not on a
   verified digest.
-- **Deprivileged worker pods** - worker/atelet components currently run
-  `privileged: true` to manage sandboxes and namespaces.
+- **Deprivileged worker pods** - the worker pods still run `privileged: true` to
+  manage sandboxes and namespaces (the `atelet` DaemonSet was recently
+  deprivileged, but the workers themselves have not been yet).
 - **Snapshot-access credentials scoped away from the sandbox**, and **audit
   logging** across the API and node components.
 

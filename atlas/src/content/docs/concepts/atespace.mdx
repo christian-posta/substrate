@@ -54,15 +54,14 @@ flowchart LR
 
 An `Atespace` is **global-scoped**: it does not itself live inside another
 atespace, so its `metadata.atespace` is empty and its identity is just
-`metadata.name`. `DeleteAtespace` refuses (gRPC `FailedPrecondition`) to remove
-an atespace that still contains actors.
+`metadata.name`. `DeleteAtespace` refuses to remove an atespace that still
+contains actors.
 
 ## The reserved golden atespace
 
 Per-template **golden actors** (the throwaway boots used to capture a
 [golden snapshot](/flows/golden-snapshot/)) live in a reserved system atespace
-named **`ate-golden`** rather than in any tenant atespace. See
-`resources.GoldenActorAtespace`.
+named **`ate-golden`** rather than in any tenant atespace.
 
 ## Why identity is scoped this way
 
@@ -71,12 +70,6 @@ Scoping the name to an atespace lets two tenants each have an actor named, say,
 off the same `(atespace, name)` pair. Worker assignment and the per-actor
 workflow lock are both scoped by this tuple, so the same actor name in two
 different atespaces never contends.
-
-:::tip[Where in the code]
-- DNS name + reserved atespace: <code class="fileref">internal/resources/actor.go</code>
-- Redis key layout: <code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
-- `Atespace` / `ObjectRef` / `ResourceMetadata` messages: <code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
-:::
 
 ## Related
 

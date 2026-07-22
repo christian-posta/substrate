@@ -50,11 +50,9 @@ timestamps) on write. There is no `last_snapshot` string field - snapshot
 state now lives in `latest_snapshot_info` (a `SnapshotInfo`).
 
 No call to atelet or atecontroller. One K8s lister hit (to verify the
-referenced `ActorTemplate` exists - `FailedPrecondition` if not), one Redis
-`AtespaceExists` check (`FailedPrecondition` if the atespace does not exist),
-and one conditional Redis write.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/create_actor.go</code>
+referenced `ActorTemplate` exists - fails with a precondition error if not),
+one Redis atespace-exists check (fails with a precondition error if the
+atespace does not exist), and one conditional Redis write.
 
 ## Why this is so simple
 

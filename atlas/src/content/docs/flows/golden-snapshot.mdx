@@ -59,9 +59,6 @@ stateDiagram-v2
 `PhaseFailed` is declared in the CRD type but the reconciler never assigns
 it - errors return up and trigger a normal requeue.
 
-<code class="fileref">cmd/atecontroller/internal/controllers/actortemplate_controller.go</code>
-<code class="fileref">pkg/api/v1alpha1/actortemplate_types.go</code>
-
 ## Sequence
 
 ```mermaid
@@ -110,11 +107,10 @@ Once `ActorTemplate.Status.GoldenSnapshot` is set:
 
 - Any subsequent `CreateActor + ResumeActor` for an actor of this template
   will be **restored from the golden snapshot** - unless the actor has its
-  own newer snapshot. `CallAteletRestoreStep` picks the strategy in this
+  own newer snapshot. The resume workflow picks the restore strategy in this
   order: the actor's own `latest_snapshot_info` (local or external) if set,
   else the template's `GoldenSnapshot` (when `ResumeActor` was not called
-  with `boot=true`), else a cold boot from the template spec. See
-  <code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code>.
+  with `boot=true`), else a cold boot from the template spec.
 - The result: new actors of this template come up in **lazy-page-restore
   time**, not cold-boot time.
 
@@ -127,22 +123,20 @@ controller-runtime re-fires reconcile later.
 
 The warmup is now a **fallback**, not a fixed 20 seconds for everyone:
 
-- If **every** container in the template declares a `readyz` HTTP probe,
-  `goldenSnapshotWarmupFor` returns **0**. `ResumeActor` already blocks until
-  each container's `readyz` reports 200 (both runtimes call `readyz.WaitAll`
-  before `Run`/`Restore` returns), so the workload is already initialized by
-  the time the controller gets `RUNNING` back - no extra wait is needed.
+- If **every** container in the template declares a `readyz` HTTP probe, the
+  warmup is **0**. `ResumeActor` already blocks until each container's `readyz`
+  reports 200 (both runtimes wait for every readiness probe before `Run` /
+  `Restore` returns), so the workload is already initialized by the time the
+  controller gets `RUNNING` back - no extra wait is needed.
 - Otherwise (any container lacks a probe, or the template declares no
-  containers), it falls back to the default **`goldenSnapshotWarmup`
-  = 20 s** as a coarse "give the workload time to initialize" budget.
+  containers), it falls back to a default **20 s** warmup as a coarse "give the
+  workload time to initialize" budget.
 
 If you rely on the fallback and your workload needs longer (e.g. downloading
 a model), the resulting golden snapshot will be of a partially-initialized
 process - and that's what every actor of this template will restore from.
 Declaring a `readyz` probe (or baking the heavy initialization into your
 container image) is the way to make this deterministic.
-
-<code class="fileref">cmd/atecontroller/internal/controllers/actortemplate_controller.go</code>
 
 ## What about the workload running during the wait?
 

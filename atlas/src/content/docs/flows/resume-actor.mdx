@@ -41,28 +41,28 @@ sequenceDiagram
   C->>E: HTTP request, :authority=actor.atespace.actors.resources.substrate.ate.dev
 
   E->>X: ext_proc: ProcessRequest (headers)
-  Note over X: handleRequestHeaders()<br/>parses host → (atespace, actor_name)
+  Note over X: parse request headers<br/>host → (atespace, actor_name)
 
-  X->>A: ResumeActor(ObjectRef{atespace, name})<br/>(via singleflight dedupe, key atespace/name)
+  X->>A: ResumeActor(ObjectRef{atespace, name})<br/>(de-duplicated, key atespace/name)
 
   rect rgb(240,240,255)
     Note over A,R: Workflow engine runs under<br/>lock:actor:{atespace}:{name} (30s TTL, 28s workflow timeout)
 
-    A->>R: LoadActorForResume → fetch actor + template
-    A->>R: AssignWorker: pick random idle eligible worker<br/>(local snapshot? restrict to nodes that hold it)
+    A->>R: Load actor → fetch actor + template
+    A->>R: Assign worker: pick random idle eligible worker<br/>(local snapshot? restrict to nodes that hold it)
     A->>R: UPDATE worker (assignment), UPDATE actor (RESUMING + ateom pod ref)
 
     Note over A,L: Dial atelet on the *node* hosting<br/>the assigned worker pod (atelet pod IP : 8085)
     A->>L: Restore(snapshot config, ateom pod, workload spec)
     L->>G: Fetch manifest, then download checkpoint images (zstd, parallel)<br/>[LocalSnapshotInfo → copy from node instead]
     G-->>L: bytes
-    L->>O: RestoreWorkload (gRPC over Unix socket)
+    L->>O: Restore call (gRPC over Unix socket)
     O->>O: setup veth+nftables, exec runsc restore -background -direct -detach
     O->>O: wait on container readyz (200)
     O-->>L: ok (sentry up; pages lazy-load)
     L-->>A: Restore ok
 
-    A->>R: FinalizeRunning: UPDATE actor (RUNNING)
+    A->>R: Finalize → RUNNING: UPDATE actor (RUNNING)
   end
 
   A-->>X: Actor{ ateom_pod_ip, status=RUNNING }
@@ -84,40 +84,30 @@ not the worker IP. This is deliberate: the worker IP isn't known until ExtProc
 consults ateapi, and it may change between requests if the actor moves between
 workers.
 
-<code class="fileref">cmd/atenet/internal/dns/dns.go</code> ·
-<code class="fileref">cmd/atenet/internal/dns/corefile.go</code>
-
 ### 4–5. L7 proxy + ExtProc
 
 The L7 proxy accepts the request on `:8080` and applies a single `ext_proc` filter
 that streams headers to **ExtProc on `:50051`**. ExtProc parses the `:authority`
-(or `Host`) header into an **`(atespace, actor_name)`** pair via
-`resources.ParseActorDNSName` (port stripped); an unparseable host is answered
-with a 404.
+(or `Host`) header into an **`(atespace, actor_name)`** pair (port stripped); an
+unparseable host is answered with a 404.
 
-<code class="fileref">cmd/atenet/internal/router/extproc.go</code>
-(`handleRequestHeaders` lives in `extproc.go`; `extproc_in.go` holds the
-`requestMetadata` / `parseActorRef` helpers.)
+### 6. ResumeActor (with request coalescing)
 
-### 6. ResumeActor (with singleflight)
-
-ExtProc calls `ateapi.ResumeActor` with an `ObjectRef{atespace, name}`. To avoid
-stampedes when 50 concurrent requests hit a cold actor, ExtProc wraps the call
-in a `singleflight.Group` keyed by `<atespace>/<actor_name>` so only the first
-call goes through; the rest piggyback on its result. The in-flight resume runs
-under a detached background timeout so a caller disconnecting doesn't abort the
-resume for the others, and `Aborted` (a concurrent resume) is retried with
-backoff. ExtProc also opens an OTel span here.
-
-<code class="fileref">cmd/atenet/internal/router/resumer.go</code>
+ExtProc calls `ResumeActor` with an `ObjectRef{atespace, name}`. To avoid
+stampedes when 50 concurrent requests hit a cold actor, ExtProc dedupes
+concurrent calls keyed by `<atespace>/<actor_name>` so only the first call goes
+through; the rest piggyback on its result. The in-flight resume runs under a
+detached background timeout so a caller disconnecting doesn't abort the resume
+for the others, and `Aborted` (a concurrent resume) is retried with backoff.
+ExtProc also opens an OTel span here.
 
 ### 7–9. ateapi runs the resume workflow
 
 ateapi acquires `lock:actor:<atespace>:<name>` in Redis (30s TTL, 2s padding →
 28s workflow timeout) and steps through:
 
-1. **LoadActorForResume** - fetch actor + ActorTemplate.
-2. **AssignWorker** - random shuffle over idle **eligible** workers (the
+1. **Load the actor** and its `ActorTemplate`.
+2. **Assign a worker** - random shuffle over idle **eligible** workers (the
    worker's `sandbox_class` must match the template's, and both the template's
    `workerSelector` and the actor's own `worker_selector` must match the
    worker's labels), then claim one via an `assignment`; the actor goes
@@ -125,15 +115,12 @@ ateapi acquires `lock:actor:<atespace>:<name>` in Redis (30s TTL, 2s padding →
    the free-worker search is restricted to the nodes in
    `node_vms_with_local_snapshots` so the resume lands back on a node that
    already holds the bytes.
-3. **CallAteletRestore** - pick which restore strategy to use, then
+3. **Call atelet to restore** - pick which restore strategy to use, then
    resolve the atelet DaemonSet pod that runs on the *same node* as the
    assigned worker and dial that atelet's pod IP on `:8085`. atelet is a
    per-node DaemonSet, not a per-pod sidecar - one atelet serves every worker
    pod scheduled to its node.
-4. **FinalizeRunning** - set actor to `RUNNING`.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code> ·
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow.go</code>
+4. **Finalize** - set actor to `RUNNING`.
 
 The restore strategy branches on the actor's `latest_snapshot_info` first, then
 the template's golden snapshot, then a cold boot:
@@ -143,7 +130,7 @@ if actor.latest_snapshot_info is set          → Restore from it
     ├─ LocalSnapshotInfo  → CHECKPOINT_TYPE_LOCAL, scope = onPause
     └─ ExternalSnapshotInfo → CHECKPOINT_TYPE_EXTERNAL, scope = onCommit
 else if template.GoldenSnapshot != "" && !boot → Restore from golden snapshot
-else                                          → atelet.Run (cold boot from spec)
+else                                          → cold boot from spec (Run)
 ```
 
 `boot=true` on the `ResumeActorRequest` forces the cold path by skipping the
@@ -153,7 +140,7 @@ golden snapshot.
 
 :::note[What ateom-gvisor actually is]
 A worker pod runs **exactly one container** - and that container is
-**ateom-gvisor**, the small gRPC server in `cmd/ateom-gvisor/`. ateom-gvisor
+**ateom-gvisor**, a small gRPC server. ateom-gvisor
 is **not** itself sandboxed; it runs as PID 1 in the worker pod with normal
 container privileges. Its job is to receive RPCs from atelet and `exec`
 `runsc` (the gVisor runtime), which spawns a **separate gVisor sandbox**.
@@ -164,11 +151,11 @@ RPC surface.
 :::
 
 **Where the actor's state actually lands: on the node, not in the pod.**
-atelet's `Restore` handler first fetches the small `manifest.json` (which pins
+When atelet restores, it first fetches the small `manifest.json` (which pins
 the sandbox binaries and lists the checkpoint files), then downloads the
 snapshot images from GCS/S3 in parallel and zstd-decompresses them onto the
 **node's own filesystem**, under
-`/var/lib/ateom-gvisor/actors/<atespace>:<name>/restore-state/`. For a
+`/var/lib/ateom-gvisor/actors/<actor-uid>/restore-state/`. For a
 `LocalSnapshotInfo` there's no download at all - atelet copies the images from
 the node's local checkpoint dir instead. The files are owned by the host -
 they're not written into either pod's container filesystem.
@@ -184,7 +171,7 @@ exactly the same bytes - no copy, no network, same inode.
 This is also why the gRPC channel from atelet to ateom-gvisor can be a
 **unix socket**: the socket file `/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`
 sits in the same shared hostPath, so both ends address it by the same
-path. atelet opens it and calls `RestoreWorkload`; ateom-gvisor, listening
+path. atelet opens it and makes the Restore call; ateom-gvisor, listening
 on the same path inside the worker pod, accepts the call and proceeds with
 the restore.
 
@@ -207,21 +194,20 @@ The pieces worth noticing in that picture:
 - **ateom-gvisor and the actor live at different layers.** ateom-gvisor is
   the *pod's* container (PID 1, unsandboxed). The actor runs in a
   *runsc-managed gVisor sandbox* that ateom-gvisor spawns - a sibling
-  process tree, not a child of the ateom-gvisor binary. When you read
-  "exec runsc restore" in the code, that's the moment the sandbox comes
-  into existence.
-- **The snapshot images are downloaded in parallel** via an `errgroup` and
-  streamed through `zstd` on the way to disk. atelet doesn't assume a fixed
-  file list - the manifest tells it exactly which files the runtime wrote.
+  process tree, not a child of the ateom-gvisor binary. The "exec runsc
+  restore" step is the moment the sandbox comes into existence.
+- **The snapshot images are downloaded in parallel** and streamed through
+  `zstd` on the way to disk. atelet doesn't assume a fixed file list - the
+  manifest tells it exactly which files the runtime wrote.
 - **The download and the bundle prep overlap.** atelet runs the checkpoint
   download (or local copy) *concurrently* with fetching the sandbox assets and
-  unpacking the OCI image, since only the final `RestoreWorkload` needs both.
+  unpacking the OCI image, since only the final Restore call needs both.
 - **The unix socket path is conventional, not negotiated.** atelet
   composes it from the worker pod's UID
   (`/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`) and dials it
   directly. ateom-gvisor inside the worker pod is listening on the same
   path because it sees the same mount.
-- **OCI bundle goes there too.** Before calling `RestoreWorkload`, atelet
+- **OCI bundle goes there too.** Before making the Restore call, atelet
   writes a fresh `config.json` + rootfs (unpacked from the actor's image)
   into the hostPath so `runsc restore` finds everything in one place.
 - **The actor's identity file is (re)written on every resume.** atelet writes
@@ -230,9 +216,6 @@ The pieces worth noticing in that picture:
   container - so the value is correct even when the actor was restored from a
   shared golden snapshot whose checkpointed process env would otherwise carry
   the golden actor's identity.
-
-<code class="fileref">cmd/atelet/main.go</code> ·
-<code class="fileref">cmd/atelet/oci.go</code>
 
 ### 15–16. ateom-gvisor sets up networking, then runs `runsc restore -background -direct`
 
@@ -289,14 +272,10 @@ A few things to note about this trick:
 - **`-detach` is what makes `runsc restore` return.** Without it, the exec
   would block until the sandboxed process exited. Combined with `-background`,
   the sentry is up in milliseconds without paging the whole memory image in.
-- **`RestoreWorkload` still waits on readyz.** After the restore exec returns,
+- **The Restore call still waits on readyz.** After the restore exec returns,
   ateom-gvisor blocks until every readyz-enabled container reports HTTP 200
-  (`internal/readyz`, probing the actor's veth IP) before it returns `ok` to
-  atelet. So ateapi finalizes the actor to `RUNNING` only once the workload is
-  actually serving.
-
-<code class="fileref">cmd/ateom-gvisor/main.go</code> ·
-<code class="fileref">cmd/ateom-gvisor/runsc.go</code>
+  (probing the actor's veth IP) before it returns `ok` to atelet. So ateapi
+  finalizes the actor to `RUNNING` only once the workload is actually serving.
 
 This is the trick that makes resume *fast*: we don't wait for the entire
 snapshot to be paged in before serving the request - only what the workload
@@ -309,9 +288,6 @@ ExtProc emits a header-mutation response telling the proxy to overwrite
 `:authority` with `<pod_ip>:80`. The proxy then forwards the request to the
 worker.
 
-<code class="fileref">cmd/atenet/internal/router/extproc.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/extproc_out.go</code>
-
 ### 19–22. The workload responds
 
 From the workload's perspective, this is a plain old HTTP request arriving at
@@ -319,13 +295,10 @@ its listener. It has no idea it was suspended five seconds ago.
 
 ## What if there are no idle workers?
 
-ateapi's `AssignWorkerStep` retries 5 times with exponential backoff (10ms
+ateapi's assign-worker step retries a few times with exponential backoff (10ms
 initial, factor 2, jitter). If no eligible worker is available after that, it
-returns `codes.FailedPrecondition` (`"no free workers available"`), which
-ExtProc maps to HTTP **503 ServiceUnavailable**.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/errors.go</code>
+fails with a "no free workers available" precondition error, which ExtProc maps
+to HTTP **503 ServiceUnavailable**.
 
 ## What about the warm path?
 
@@ -338,9 +311,9 @@ straight to step 17. Same code path, just no atelet / GCS / runsc work.
 ```mermaid
 stateDiagram-v2
   [*] --> SUSPENDED: CreateActor
-  SUSPENDED --> RESUMING: ResumeActor<br/>(AssignWorker)
+  SUSPENDED --> RESUMING: ResumeActor<br/>(assign worker)
   PAUSED --> RESUMING: ResumeActor<br/>(prefers node with<br/>local snapshot)
-  RESUMING --> RUNNING: FinalizeRunning
+  RESUMING --> RUNNING: Finalize → RUNNING
   RESUMING --> CRASHED: restore fails
   RUNNING --> SUSPENDING: SuspendActor
   RUNNING --> PAUSING: PauseActor

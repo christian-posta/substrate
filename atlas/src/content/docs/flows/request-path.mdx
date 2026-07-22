@@ -59,7 +59,7 @@ Redis.
 
 ```mermaid
 flowchart LR
-  REQ[Request] --> EXT[ExtProc<br/>handleRequestHeaders]
+  REQ[Request] --> EXT[ExtProc<br/>request headers]
   EXT -->|ResumeActor| API[ateapi]
   API --> RED[(Redis)]
   RED --> API
@@ -73,18 +73,12 @@ stale routing data. If an actor moved from worker A to worker B between two
 requests, the second request sees the new IP without any cache invalidation
 choreography.
 
-<code class="fileref">cmd/atenet/internal/router/extproc.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/extproc_out.go</code>
-
-## The singleflight optimization
+## The request-coalescing optimization
 
 Hammering ExtProc with 50 simultaneous requests for the same cold actor
-would otherwise produce 50 `ResumeActor` calls. ExtProc wraps the call in a
-[`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight)
-group keyed by `<atespace>/<actor_name>` - the first call goes through, the rest
-piggyback on its result.
-
-<code class="fileref">cmd/atenet/internal/router/resumer.go</code>
+would otherwise produce 50 `ResumeActor` calls. ExtProc dedupes concurrent
+calls for the same actor by keying on `<atespace>/<actor_name>` - the first call
+goes through, the rest piggyback on its result.
 
 ## Tracing
 
@@ -93,10 +87,9 @@ per request (when an OTLP collector is configured on the xDS snapshot), and
 ExtProc extracts any inbound `traceparent` from the request headers to start its
 own `ExtProc.RequestHeaders` span, with a nested `ResumeActor` span, so the
 per-request work links back to the Envoy ingress span. The ExtProc gRPC server
-also runs the `otelgrpc` stats handler.
-
-<code class="fileref">cmd/atenet/internal/router/extproc.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/resumer.go</code>
+also runs the `otelgrpc` stats handler. On the control-plane side, `ateapi`
+now tags its own spans with the actor's `ate.*` telemetry identity (atespace,
+name), so a resume can be followed end to end across the router and ateapi.
 
 ## L7 proxy configuration via xDS
 
@@ -116,11 +109,8 @@ When an OTLP collector address is configured, the snapshot also carries an
 tracing provider, so the proxy emits ingress spans.
 
 The snapshot is refreshed every 5 seconds by a controller loop that
-re-reads `atStore.readyTemplates(...)` and rebuilds the snapshot - it's a
+re-reads the ready templates and rebuilds the snapshot - it's a
 **periodic poll**, not an informer-driven watch.
-
-<code class="fileref">cmd/atenet/internal/router/xds.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/controller.go</code>
 
 ## DNS - why we resolve to the router, not the worker
 
@@ -135,13 +125,10 @@ Corefile `template` plugin). The router (via ExtProc) does the per-request
 lookup that yields the current worker IP - and rewrites `:authority` so the
 proxy's `dynamic_forward_proxy_cluster` hits it.
 
-<code class="fileref">cmd/atenet/internal/dns/dns.go</code> ·
-<code class="fileref">cmd/atenet/internal/dns/corefile.go</code>
-
 ## Error mapping
 
-`mapResumeError` translates the gRPC status from ateapi into an HTTP status
-(the original error is preserved via `Unwrap` for logging):
+The router translates the gRPC status from ateapi into an HTTP status
+(the original error is preserved for logging):
 
 | ateapi gRPC code | HTTP status |
 |---|---|
@@ -156,9 +143,7 @@ proxy's `dynamic_forward_proxy_cluster` hits it.
 
 An unparseable `:authority`/`Host` is rejected earlier with a 404 before any
 `ResumeActor` call. `Aborted` (a concurrent resume) never reaches this table:
-`ActorResumer` retries it internally with backoff.
-
-<code class="fileref">cmd/atenet/internal/router/errors.go</code>
+the router retries it internally with backoff.
 
 ## Related
 

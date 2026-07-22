@@ -61,7 +61,7 @@ inside the sandbox.
 
 ## The worker record
 
-Each worker's Redis record (an `ateapipb.Worker`) carries, among other fields:
+Each worker's Redis record carries, among other fields:
 
 - `assignment` - an **`Assignment{actor_template: KubeNamespacedObjectRef,
   actor: ObjectRef}`**; `nil` means idle. This replaces the old flat
@@ -73,8 +73,6 @@ Each worker's Redis record (an `ateapipb.Worker`) carries, among other fields:
   both cached for eligibility and node-local snapshot placement.
 - `ip`, `worker_pod_uid` - the pod IP and UID (the UID is the ateom socket
   address).
-
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
 
 ## How a worker is created
 
@@ -91,17 +89,15 @@ spec:
   # sandboxConfigName: ...    # else the cluster-default SandboxConfig for the class
 ```
 
-`atecontroller` turns this into a Deployment named `<workerpool-name>-deployment`
-with `replicas` pods. As each pod goes Ready, ateapi's `WorkerPoolSyncer`
-inserts an idle worker record into Redis (stamping in the pool's
-`sandbox_class`, `node_name`, and `labels`).
-
-<code class="fileref">cmd/atecontroller/internal/controllers/workerpool_controller.go</code> ·
-<code class="fileref">cmd/ateapi/internal/controlapi/syncer.go</code>
+`atecontroller` turns this into a Deployment named `<workerpool-name>`
+with `replicas` pods. As each pod gets a `PodIP`, ateapi inserts an idle worker
+record into Redis (stamping in the pool's `sandbox_class`, `node_name`, and
+`labels`). Registration is keyed on the pod having an IP, **not** on the Ready
+condition.
 
 ## How a worker is assigned
 
-When `ResumeActor` runs, ateapi's `AssignWorkerStep`:
+When ResumeActor runs, ateapi's worker-assignment step:
 
 1. Filters workers to those with **no assignment** that are **eligible** for
    the actor - the worker's `sandbox_class` must equal the template's class,
@@ -113,28 +109,22 @@ When `ResumeActor` runs, ateapi's `AssignWorkerStep`:
 4. Sets the worker's `assignment` and stamps the worker's pool + IP back onto
    the actor.
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code>
-
 ## How a worker is released
 
-After `SuspendActor` finishes the checkpoint and upload, ateapi's
-`FinalizeSuspendedStep` clears the worker's `assignment` (and the actor's
-`worker_pool_name`). The worker is immediately eligible for the next actor.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code>
+After SuspendActor finishes the checkpoint and upload, ateapi clears the
+worker's `assignment` (and the actor's `worker_pool_name`). The worker is
+immediately eligible for the next actor.
 
 ## What happens when a worker pod dies
 
-The WorkerPoolSyncer's pod-delete handler runs `releaseActorOnDeadWorker`:
+When a worker pod is deleted, ateapi's recovery path:
 
 1. If the worker had an `assignment`, that actor is **forced back to
    SUSPENDED** (with whatever latest snapshot it already had).
 2. The worker record is deleted from Redis.
 
-This is a recovery path with a known race against concurrent `SuspendActor`
+This is a recovery path with a known race against concurrent SuspendActor
 calls.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/syncer.go</code>
 
 ## Why two runtimes?
 

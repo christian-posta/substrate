@@ -17,9 +17,9 @@ worker record: **no assignment = idle**; an assignment = hosting one actor.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Idle: pod gets a PodIP<br/>(syncer.CreateWorker)
-  Idle --> Assigned: ResumeActor:<br/>AssignWorker step
-  Assigned --> Idle: SuspendActor:<br/>FinalizeSuspended step
+  [*] --> Idle: pod gets a PodIP<br/>(create worker record)
+  Idle --> Assigned: ResumeActor:<br/>assign worker
+  Assigned --> Idle: SuspendActor:<br/>Finalize → SUSPENDED
   Assigned --> [*]: pod deleted<br/>(syncer cleanup)
   Idle --> [*]: pod deleted<br/>(syncer cleanup)
 
@@ -58,16 +58,13 @@ assignment is scoped by the actor's `(atespace, name)` identity, not a bare
 id. The cached `sandbox_class` and `labels` are what the scheduler matches
 eligibility against without re-reading the `WorkerPool`.
 
-<code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
-
-## The WorkerPoolSyncer keeps this fresh
+## The worker-pool syncer keeps this fresh
 
 ```mermaid
 flowchart LR
-  K[K8s pod informer] -- Add/Update<br/>(PodIP assigned) --> C[CreateWorker<br/>assignment=nil<br/>+ cache node_name,<br/>sandbox_class, labels]
-  K -- DeleteFunc<br/>(pod gone) --> R[releaseActorOnDeadWorker<br/>if assignment set:<br/>actor → SUSPENDED]
-  R --> D[DeleteWorker]
+  K[K8s pod informer] -- Add/Update<br/>(PodIP assigned) --> C[Create worker record<br/>assignment=nil<br/>+ cache node_name,<br/>sandbox_class, labels]
+  K -- pod gone<br/>(delete/soft-delete) --> R[dead-worker recovery<br/>if assignment set:<br/>actor → SUSPENDED]
+  R --> D[Delete worker record]
   C -.-> RED[(Redis)]
   D -.-> RED
   R -.-> RED
@@ -75,26 +72,23 @@ flowchart LR
 
 On Add/Update the syncer reads the pod's `WorkerPool` to cache the pool's
 `sandboxClass` and labels onto the worker record (and refreshes them if they
-change). `releaseActorOnDeadWorker` runs **before** `DeleteWorker`, and only
-acts when the worker has an `assignment` (and the actor still points back at
-this pod), so the actor is restored to `SUSPENDED` while the worker record
-is still readable. A `CRASHED` actor is left `CRASHED`, not forced back to
-`SUSPENDED`. Eligibility to create a worker is keyed on
-`pod.Status.PodIP != ""`, not on the Ready condition.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/syncer.go</code>
+change). The release-on-death handler runs **before** the worker record is
+deleted, and only acts when the worker has an `assignment` (and the actor still
+points back at this pod), so the actor is restored to `SUSPENDED` while the
+worker record is still readable. A `CRASHED` actor is left `CRASHED`, not forced
+back to `SUSPENDED`. Eligibility to create a worker is keyed on the pod having a
+`PodIP`, not on the Ready condition.
 
 ## How workers get *assigned*
 
-When `ResumeActor` runs, `AssignWorkerStep` reads the in-memory
+When `ResumeActor` runs, the assign-worker step reads the in-memory
 [worker cache](/components/ateapi/), filters to **eligible idle workers**,
 and does a randomized shuffle to pick one. If none are available it retries
-up to 5 times with exponential backoff (10ms initial). After that:
-`FailedPrecondition`.
+a few times with exponential backoff (10ms initial). After that it fails with
+a "no free workers" precondition error, which the router maps to a 503.
 
-There is no `WorkerPoolRef` anymore - eligibility is **selector-based**
-(`isWorkerEligibleForActor`). A worker is eligible for an actor when **all**
-of these hold:
+There is no `WorkerPoolRef` anymore - eligibility is **selector-based**.
+A worker is eligible for an actor when **all** of these hold:
 
 1. **Sandbox class matches** - the worker's cached `sandbox_class` equals
    the template's `sandboxClass` (snapshots are not portable across
@@ -111,20 +105,17 @@ restricted to workers on one of those nodes.
 This is the bypass-the-K8s-scheduler trick: pod allocation is just a filter
 plus a shuffle over the cached worker set, not a scheduler decision.
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code>
-
 ## How workers get *released*
 
-When `SuspendActor` finishes, `FinalizeSuspendedStep` clears the worker's
+When `SuspendActor` finishes, the finalize step clears the worker's
 `assignment` (sets it to nil) and writes it back to Redis, and clears the
-actor's `worker_pool_name` / `ateom_pod_*` pointers. The worker is
+actor's `worker_pool_name` and `ateom_pod_namespace`/`ateom_pod_name`/`ateom_pod_ip`
+pointers. The worker is
 immediately idle again and eligible to host a different actor.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code>
 
 ## What happens when a worker pod dies
 
-The syncer's `DeleteFunc` fires on pod removal. If the worker had an
+The syncer's pod-delete handler fires on pod removal. If the worker had an
 `assignment`, the syncer **forces the actor back to `SUSPENDED`** without
 producing a snapshot (the actor's existing `latest_snapshot_info`, if any,
 is still valid) and clears its pod pointers and `worker_pool_name`. A
@@ -145,7 +136,7 @@ loss.
 
 The `WorkerPool` CRD owns a Deployment of N replicas. atecontroller
 reconciles changes to that CRD into Deployment spec changes. Pods come up,
-start the pool's ateom runtime (`ateom-gvisor` or `ateom-microvm`), get a
+start the pool's ateom runtime (ateom-gvisor or ateom-microvm), get a
 PodIP, and the syncer registers them as **Idle** workers - caching the
 pool's `sandboxClass` and labels onto each record.
 
@@ -156,13 +147,11 @@ flowchart LR
   DEP --> P1[Pod 1: ateom runtime]
   DEP --> P2[Pod 2: ateom runtime]
   DEP --> PN[...]
-  P1 -- has PodIP --> SYNC[WorkerPoolSyncer]
+  P1 -- has PodIP --> SYNC[worker-pool syncer]
   P2 -- has PodIP --> SYNC
   PN -- has PodIP --> SYNC
-  SYNC -- CreateWorker --> RED[(Redis: Idle worker)]
+  SYNC -- create worker record --> RED[(Redis: Idle worker)]
 ```
-
-<code class="fileref">cmd/atecontroller/internal/controllers/workerpool_controller.go</code>
 
 ## Worker pools are isolation boundaries
 

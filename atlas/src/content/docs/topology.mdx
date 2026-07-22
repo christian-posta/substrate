@@ -151,11 +151,7 @@ pre-warmed worker out of Redis and tells atelet to restore into it**. The
 Kubernetes scheduler is never on the critical path. That's how Substrate gets
 sub-second resume times against 30× more actors than pods.
 
-:::tip[Where in the code]
-- ateapi entry: <code class="fileref">cmd/ateapi/main.go:70-161</code>
-- atecontroller entry: <code class="fileref">cmd/atecontroller/main.go:49-107</code>
-- atenet router init: <code class="fileref">cmd/atenet/internal/router/router.go</code>
-- atelet entry: <code class="fileref">cmd/atelet/main.go</code>
-- ateom-gvisor / ateom-microvm entry: <code class="fileref">cmd/ateom-gvisor/main.go</code>, <code class="fileref">cmd/ateom-microvm/main.go</code>
-- domain terms: <code class="fileref">docs/glossary.md</code>
+:::tip[Go deeper]
+Each component box above links to its own page. For the current implementation,
+browse the source and the authoritative `docs/` (architecture, glossary, API guide).
 :::

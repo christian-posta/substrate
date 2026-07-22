@@ -17,7 +17,7 @@ flowchart LR
     CTL[Control service<br/>actor + atespace RPCs]
     SID[SessionIdentity service<br/>MintJWT / MintCert]
     WF[Workflow engine<br/>resume / suspend / pause]
-    SYNC[WorkerPoolSyncer<br/>K8s pod informers]
+    SYNC[Worker-pool syncer<br/>watches K8s worker pods]
     WCACHE[In-memory worker cache]
     STORE[Redis store adapter]
   end
@@ -49,12 +49,10 @@ actor's identity is the tuple **`(atespace, name)`** - the old bare `actor_id`
 is gone. Requests reference a resource with an `ObjectRef{atespace, name}`, or
 carry the resource body itself (e.g. `CreateActorRequest{actor: Actor}` where
 the identity lives in `actor.metadata`). See the [Atespace](/concepts/atespace/)
-concept and `docs/api-style-guide.md` for the Create/Get/List/Delete +
+concept for the Create/Get/List/Delete +
 `ObjectRef`/`ResourceMetadata` conventions.
 
 ## The Control gRPC service
-
-Defined in <code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>.
 
 | RPC | Request → Response | Notes |
 |---|---|---|
@@ -65,21 +63,21 @@ Defined in <code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>.
 | `PauseActor` | `PauseActorRequest{actor: ObjectRef}` → `PauseActorResponse{actor}` | Running → Paused; keeps the snapshot on the node VM |
 | `ResumeActor` | `ResumeActorRequest{actor: ObjectRef, boot: bool}` → `ResumeActorResponse{actor}` | Suspended/Paused → Running. `boot=true` skips the golden snapshot and cold-boots |
 | `DeleteActor` | `DeleteActorRequest{actor: ObjectRef}` → `Actor` | Only a `SUSPENDED` or `CRASHED` actor may be deleted; returns the deleted record |
-| `ListWorkers` | `ListWorkersRequest{}` → `ListWorkersResponse{workers}` | All worker records |
-| `ListActors` | `ListActorsRequest{page_size, page_token, atespace}` → `ListActorsResponse{actors, next_page_token}` | Paginated; optional `atespace` scopes the scan |
+| `ListWorkers` | `ListWorkersRequest{page_size, page_token}` → `ListWorkersResponse{workers, next_page_token}` | Paginated |
+| `ListActors` | `ListActorsRequest{atespace, page_size, page_token}` → `ListActorsResponse{actors, next_page_token}` | Paginated; optional `atespace` scopes the scan |
 | `CreateAtespace` | `CreateAtespaceRequest{atespace: Atespace}` → `Atespace` | Atespace CRUD (see below) |
 | `GetAtespace` | `GetAtespaceRequest{atespace: ObjectRef}` → `Atespace` | |
-| `ListAtespaces` | `ListAtespacesRequest{}` → `ListAtespacesResponse{atespaces}` | |
+| `ListAtespaces` | `ListAtespacesRequest{page_size, page_token}` → `ListAtespacesResponse{atespaces, next_page_token}` | Paginated |
 | `DeleteAtespace` | `DeleteAtespaceRequest{atespace: ObjectRef}` → `Atespace` | Rejects `FailedPrecondition` if any actors remain |
-| `DebugClear` | `DebugClearRequest{}` → `DebugClearResponse{}` | Flush Redis (debug only) |
 
 Actor status is one of `SUSPENDED`, `RESUMING`, `RUNNING`, `SUSPENDING`,
-`PAUSING`, `PAUSED`, or `CRASHED` (`Actor.Status` in the proto). `PAUSING`,
+`PAUSING`, `PAUSED`, or `CRASHED`. `PAUSING`,
 `PAUSED`, and `CRASHED` are recent additions that go with the pause/crash flows.
 
-Handlers live in <code class="fileref">cmd/ateapi/internal/controlapi/</code>
-(one file per RPC, e.g. `create_actor.go`, `pause_actor.go`,
-`list_actors.go`, `create_atespace.go`), wired up in `service.go`.
+The destructive `DebugClear` (drop all data from the database) no longer lives on
+`Control` - it was split out into a separate **`Debug`** service, which opens the
+door to gating it independently. Note that today the server always registers the
+`Debug` service; there is no flag to disable or access-control it separately yet.
 
 ### Atespaces
 
@@ -91,8 +89,7 @@ atespace that still holds actors. See [Atespace](/concepts/atespace/).
 
 ## The SessionIdentity gRPC service
 
-A second service on the same server, defined at
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>.
+A second service on the same server.
 
 Workloads call these from inside their sandbox to mint **session-scoped
 credentials** that survive worker migration:
@@ -108,22 +105,18 @@ The workload authenticates either with its K8s service-account bearer token
 credential belongs to the pod currently mapped to the requested session, then
 signs.
 
-<code class="fileref">cmd/ateapi/internal/sessionidentity/sessionidentity.go</code>
-
 ## The workflow engine
 
-All actor state transitions go through a small generic workflow engine
-(`RunWorkflow` over a list of idempotent `WorkflowStep`s). Each workflow:
+All actor state transitions go through a small generic workflow engine that
+runs a workflow as a list of idempotent steps. Each workflow:
 
 1. **Acquires `lock:actor:<atespace>:<name>` in Redis** with a 30s TTL. The
    workflow runs under a context that times out at 28s (TTL minus 2s of
    padding) so the lock cannot be released after it has already expired.
-2. **Runs its steps** in order - each step checks `IsComplete` (so a retried
-   workflow fast-forwards), then reads/writes Redis and may call atelet over
-   gRPC.
+2. **Runs its steps** in order - each step first checks whether it is already
+   complete (so a retried workflow fast-forwards), then reads/writes Redis and
+   may call atelet over gRPC.
 3. **Returns `Aborted`** to the caller if the lock is already held.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow.go</code>
 
 ```mermaid
 flowchart LR
@@ -137,31 +130,28 @@ flowchart LR
   UNLOCK --> OUT[return Actor]
 ```
 
-The step lists for each workflow:
+The steps for each workflow:
 
 | Workflow | Steps |
 |---|---|
-| **Resume** | LoadActorForResume → AssignWorker → CallAteletRestore → FinalizeRunning |
-| **Suspend** | LoadActorForSuspend → MarkSuspending → CallAteletSuspend → FinalizeSuspended |
-| **Pause** | LoadActorForPause → MarkPausing → CallAteletPause → FinalizePaused |
+| **Resume** | load the actor → assign a worker → tell atelet to restore → finalize as Running |
+| **Suspend** | load the actor → mark it Suspending → tell atelet to suspend → finalize as Suspended |
+| **Pause** | load the actor → mark it Pausing → tell atelet to pause → finalize as Paused |
 
-## The WorkerPoolSyncer and worker cache
+## The worker-pool syncer and worker cache
 
 The hot path needs to answer "give me a free worker in pool X" fast. That
-answer comes from Redis, fronted by an **in-memory worker cache**. The
-**WorkerPoolSyncer** keeps Redis in sync with actual K8s state, and the cache
+answer comes from Redis, fronted by an **in-memory worker cache**. A
+**worker-pool syncer** keeps Redis in sync with actual K8s state, and the cache
 keeps an in-process view current:
 
-- **Informer on worker pods**: pod becomes Ready → `CreateWorker` (idle, no
-  `assignment`) in Redis.
-- **Informer DeleteFunc**: pod is gone → `releaseActorOnDeadWorker` (if the
-  worker had an `Assignment`, reset its actor to `SUSPENDED`), then
-  `DeleteWorker`.
-- The worker cache (<code class="fileref">cmd/ateapi/internal/workercache/workercache.go</code>)
-  streams updates via the store's `WatchWorkers` and periodically relists to
-  recover from missed events, exposing an O(1) view for scheduling.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/syncer.go</code>
+- **Watching worker pods**: pod gets a `PodIP` → a worker record (idle, with no
+  assignment) is written to Redis. (Registration is keyed on the pod having an
+  IP, **not** on the Ready condition.)
+- **Pod removal**: pod is gone → if the worker held an assignment, its actor is
+  reset to `SUSPENDED`, then the worker record is deleted from Redis.
+- The worker cache streams worker updates from the store and periodically
+  relists to recover from missed events, exposing an O(1) view for scheduling.
 
 :::caution[Known race]
 If a pod dies **and** a concurrent `SuspendActor` is in flight, the actor can
@@ -177,23 +167,15 @@ get released twice. Best-effort cleanup only - tracked upstream.
 | `worker:<ns>:<pool>:<pod>` | Worker proto (JSON) | Keyed by pod identity |
 | `lock:actor:<atespace>:<name>` | Lock owner ID | 30s TTL |
 
-<code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
-
 ## Authentication
 
-Incoming gRPC auth is selected by `--auth-mode`
-(<code class="fileref">cmd/ateapi/main.go</code>):
+Incoming gRPC auth is selected by `--auth-mode`:
 
 - **`mtls`** (default) - client identity comes from transport-level mTLS.
 - **`jwt`** - *additionally* requires a Kubernetes ServiceAccount Bearer token
   on every RPC, verified against the cluster's OIDC issuer in a gRPC
   interceptor. This mode is a stopgap that will be dropped once Pod Certificates
   are enabled by default in the minimum supported Kubernetes version.
-
-## Entry point
-
-<code class="fileref">cmd/ateapi/main.go</code> - gRPC server setup, Redis/Valkey
-connection, K8s informer wiring, TLS config, and auth-mode selection.
 
 ## Related
 

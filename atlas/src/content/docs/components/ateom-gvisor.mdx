@@ -30,9 +30,6 @@ flowchart LR
   click AT "/components/atelet/" "atelet"
 ```
 
-<code class="fileref">cmd/ateom-gvisor/main.go</code> ·
-<code class="fileref">cmd/ateom-gvisor/runsc.go</code>
-
 ## The three operations
 
 Each RPC is a thin wrapper over `runsc` shell-outs (the runsc binary itself is
@@ -41,7 +38,7 @@ request; the pinned release is `20260622`). Every application container's
 stdout/stderr is forwarded to the pod logs tagged with its container name
 (`ate.dev/container_name`).
 
-### RunWorkload - boot from scratch
+### Run - boot from scratch
 
 Sets up the actor network, then creates + starts the `pause` container (the
 sandbox root) and each application container:
@@ -52,13 +49,10 @@ runsc -root <state-dir> start <container>
 ```
 
 Before returning, it **blocks until every readyz-enabled container reports
-200** (`internal/readyz`), probing the actor's veth IP. Used when there's no
+200** (a readiness wait), probing the actor's veth IP. Used when there's no
 snapshot to restore from - the cold path.
 
-<code class="fileref">cmd/ateom-gvisor/main.go</code> ·
-<code class="fileref">cmd/ateom-gvisor/runsc.go</code>
-
-### CheckpointWorkload - freeze to disk
+### Checkpoint - freeze to disk
 
 For a `Full` snapshot it checkpoints the `pause` container (sandbox root); for
 a `Data` snapshot it `fscheckpoint`s only the durable-dir volumes:
@@ -71,10 +65,7 @@ It then reports **exactly the files runsc wrote** (rather than a hardcoded
 list) so atelet ships precisely that set - historically `checkpoint.img` plus
 the `pages*` images. After checkpointing it tears down the actor network.
 
-<code class="fileref">cmd/ateom-gvisor/main.go</code> ·
-<code class="fileref">cmd/ateom-gvisor/runsc.go</code>
-
-### RestoreWorkload - thaw from disk
+### Restore - thaw from disk
 
 Sets up the actor network, then creates and restores the `pause` container and
 each application container:
@@ -97,9 +88,6 @@ As with Run, restore then **waits on container readyz** before returning. A
 `Data` snapshot instead `create`s each container with `--fs-restore-image-path`
 and cold-boots the process (only the durable-dir contents are restored).
 
-<code class="fileref">cmd/ateom-gvisor/main.go</code> ·
-<code class="fileref">cmd/ateom-gvisor/runsc.go</code>
-
 ## Actor networking: veth pair + nftables
 
 ateom-gvisor no longer moves the worker pod's `eth0` into the sandbox netns.
@@ -107,7 +95,7 @@ Instead, on each activation it builds a fresh **point-to-point veth pair** into
 a named interior netns and installs **nftables** rules in the pod netns. The
 pair is torn down on checkpoint and rebuilt on restore.
 
-The concrete wiring (all constants from `cmd/ateom-gvisor/main.go`):
+The concrete wiring:
 
 | Thing | Value |
 |---|---|
@@ -131,8 +119,6 @@ Keeping every rule in one ateom-owned table makes teardown a single
 delete-table, and avoids touching CNI-managed chains. The path is IPv4-only
 today.
 
-<code class="fileref">cmd/ateom-gvisor/main.go</code>
-
 ## Why a separate process per pod?
 
 The sandbox has to be **inside** the pod's namespaces. atelet runs on the
@@ -150,8 +136,6 @@ Each pod's ateom listens at:
 The directory is host-bind-mounted into the pod, so atelet (on the host)
 sees the same socket the pod's ateom is binding. The pod UID in the path
 is the addressing scheme.
-
-<code class="fileref">internal/ateompath/ateompath.go</code>
 
 ## Footprint
 
