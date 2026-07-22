@@ -16,8 +16,8 @@ It runs **exactly two reconcilers** - one per CRD:
 flowchart LR
   subgraph CTRL["atecontroller process"]
     direction TB
-    WPR["WorkerPoolReconciler"]
-    ATR["ActorTemplateReconciler"]
+    WPR["WorkerPool reconciler"]
+    ATR["ActorTemplate reconciler"]
   end
 
   K8s[(K8s API)] --> WPR
@@ -28,8 +28,6 @@ flowchart LR
 
   click API "/components/ateapi/" "ateapi"
 ```
-
-<code class="fileref">cmd/atecontroller/main.go</code>
 
 There is no atespace or SandboxConfig reconciler here. `SandboxConfig` is a
 cluster-scoped CRD, but ateapi consumes it directly (via a lister) when
@@ -51,20 +49,18 @@ spec:
 The reconciler:
 
 1. Reads desired state from `WorkerPool.spec`.
-2. Server-side-applies a K8s `Deployment` named `<workerpool-name>-deployment`
-   (owning it, so pod changes re-trigger reconcile).
+2. Server-side-applies a K8s `Deployment` named `<workerpool-name>` (same name as
+   the pool; owning it, so pod changes re-trigger reconcile).
 3. Updates `WorkerPool.status.replicas` with the Deployment's actual replica
    count.
 
 That's it. No data plane involvement, no Redis writes. The pods themselves get
-registered in Redis by ateapi's `WorkerPoolSyncer` once they go Ready.
+registered in Redis by ateapi's worker-pool syncer once they go Ready.
 
 Crucially, a WorkerPool is **decoupled from ActorTemplate**: templates no longer
 reference a pool. Instead, placement is selector-based - the scheduler ANDs a
 template's `workerSelector` with the actor's own `worker_selector` and matches
 against pool labels (and `sandboxClass`).
-
-<code class="fileref">cmd/atecontroller/internal/controllers/workerpool_controller.go</code>
 
 ## ActorTemplate reconciler
 
@@ -101,9 +97,9 @@ Two things worth calling out:
   (`CreateAtespace`, tolerating `AlreadyExists`), then creates a golden actor
   there whose name is a fresh UUID (`Status.GoldenActorID`).
 - **The warmup wait is readyz-gated.** The reconciler stamps
-  `Status.TakeGoldenSnapshotAt` and uses `RequeueAfter` (not a blocking sleep)
+  `Status.TakeGoldenSnapshotAt` and requeues (rather than blocking on a sleep)
   before it suspends the golden actor to capture the snapshot. That delay is
-  `goldenSnapshotWarmup` (**20s**) *only as a fallback*: if every container in
+  **20s** *only as a fallback*: if every container in
   the template declares a `readyz` probe, the delay is **0**, because
   `ResumeActor` already blocked until the workload reported readiness. A
   template with no containers keeps the 20s default.
@@ -114,8 +110,6 @@ controller-runtime requeue. The result: every ready ActorTemplate has a
 `latest_snapshot_info.external.snapshot_uri_prefix`) that new actors of this
 template can restore from in milliseconds.
 
-<code class="fileref">cmd/atecontroller/internal/controllers/actortemplate_controller.go</code>
-
 ## Why is this a separate process from ateapi?
 
 It uses the Kubernetes informer cache and has reconcile-loop semantics -
@@ -123,11 +117,6 @@ the standard operator pattern. ateapi is stateless gRPC, optimized for QPS.
 Different concerns, different scaling profiles. (The manager is constructed
 without leader election, so if you scale this to multiple replicas they will
 all reconcile concurrently.)
-
-## Entry point
-
-<code class="fileref">cmd/atecontroller/main.go</code> - controller-runtime
-manager setup, scheme registration, both reconcilers wired up.
 
 ## Related
 

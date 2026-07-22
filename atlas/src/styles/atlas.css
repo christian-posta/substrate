@@ -24,22 +24,6 @@ pre.mermaid svg {
   height: auto;
 }
 
-/* Inline file:line refs - soft pill, kept low-contrast in dark mode so a
-   dense list of refs doesn't overwhelm the surrounding prose. */
-.fileref {
-  font-family: var(--sl-font-mono);
-  font-size: 0.85em;
-  background: var(--sl-color-gray-6);
-  padding: 0.1em 0.35em;
-  border-radius: 0.25em;
-  color: var(--sl-color-text-accent);
-}
-
-:root[data-theme='dark'] .fileref {
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--sl-color-gray-2);
-}
-
 /* The hero topology SVG is a hand-drawn whiteboard - in dark mode it looks like
    a glaring lightbox punched into the page. Wrap it in the same canvas style as
    mermaid blocks so it visually integrates rather than fighting the theme. */

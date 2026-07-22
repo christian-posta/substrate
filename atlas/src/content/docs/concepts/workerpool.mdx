@@ -54,8 +54,6 @@ Fields:
   `tolerations`, `priorityClassName`, `nodeAffinity`, and `resources` for the
   worker pods.
 
-<code class="fileref">pkg/api/v1alpha1/workerpool_types.go</code>
-
 ## A real example: `kagent-default`
 
 Here's the live `WorkerPool` from the `kagent` namespace - installed by
@@ -84,18 +82,18 @@ status:
 The spec omits `sandboxClass` (so it defaults to `gvisor`) and
 `sandboxConfigName` (so it resolves the cluster default gVisor
 `SandboxConfig`). atecontroller's `WorkerPool` reconciler turned that into a
-Deployment named `kagent-default-deployment` (the `-deployment` suffix is
-hard-coded by the reconciler):
+Deployment that takes the pool's own name, `kagent-default` (upstream dropped
+the old `-deployment` suffix to avoid redundant object names):
 
 ```text
-$ kubectl get deploy -n kagent kagent-default-deployment
-NAME                        READY   UP-TO-DATE   AVAILABLE   AGE
-kagent-default-deployment   2/2     2            2           11h
+$ kubectl get deploy -n kagent kagent-default
+NAME             READY   UP-TO-DATE   AVAILABLE   AGE
+kagent-default   2/2     2            2           11h
 
 $ kubectl get pods -n kagent -l ate.dev/worker-pool=kagent-default
-NAME                                         READY   STATUS    RESTARTS   AGE
-kagent-default-deployment-7f464cd64c-m2fps   1/1     Running   0          11h
-kagent-default-deployment-7f464cd64c-r6lhv   1/1     Running   0          11h
+NAME                              READY   STATUS    RESTARTS   AGE
+kagent-default-7f464cd64c-m2fps   1/1     Running   0          11h
+kagent-default-7f464cd64c-r6lhv   1/1     Running   0          11h
 ```
 
 A few things worth pointing out:
@@ -124,7 +122,7 @@ A few things worth pointing out:
 ```mermaid
 flowchart LR
   WP[WorkerPool CRD] --> CTR[atecontroller<br/>WorkerPool reconciler]
-  CTR -- SSA apply --> D["K8s Deployment<br/>{name}-deployment"]
+  CTR -- SSA apply --> D["K8s Deployment<br/>{name}"]
   D --> P1[pod 1]
   D --> P2[pod 2]
   D --> PN[...]
@@ -137,20 +135,17 @@ flowchart LR
   click S "/components/ateapi/" "ateapi"
 ```
 
-1. Reconciler reads the spec and builds a Deployment apply-config
-   (`buildDeploymentApplyConfig`). For `sandboxClass: microvm` it also
-   mounts `/dev/kvm` and pins placement to KVM-capable nodes via a
-   `ate.dev/sandboxClass=microvm` nodeSelector + toleration; `spec.template`
-   settings are merged in.
-2. Server-side-applies a Deployment named `<workerpool-name>-deployment`
-   with the replica count, `ateomImage`, and pod shape.
+1. Reconciler reads the spec and builds a Deployment apply-config. For
+   `sandboxClass: microvm` it also mounts `/dev/kvm` and pins placement to
+   KVM-capable nodes via a `ate.dev/sandboxClass=microvm` nodeSelector +
+   toleration; `spec.template` settings are merged in.
+2. Server-side-applies a Deployment named `<workerpool-name>` (same name as the
+   pool) with the replica count, `ateomImage`, and pod shape.
 3. Updates `status.replicas` with what K8s reports.
 
 That's the whole reconciler. **It doesn't insert worker records into
 Redis** - that happens later via ateapi's worker syncer, which watches the
 pods directly.
-
-<code class="fileref">cmd/atecontroller/internal/controllers/workerpool_controller.go</code>
 
 ## Isolation and eligibility
 

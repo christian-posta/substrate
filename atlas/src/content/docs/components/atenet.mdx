@@ -38,9 +38,6 @@ flowchart LR
   click API "/components/ateapi/" "ateapi"
 ```
 
-<code class="fileref">cmd/atenet/internal/router/router.go</code> ·
-<code class="fileref">cmd/atenet/internal/dns/dns.go</code>
-
 ## The Router subsystem
 
 Three pieces sharing one process:
@@ -64,11 +61,8 @@ When an OTLP collector address is configured, the snapshot also carries an
 tracing provider so Envoy emits ingress spans.
 
 The router's controller loop runs every 5 seconds and re-snapshots after
-polling `atStore.readyTemplates(...)` (a periodic poll, not an informer-driven
+polling for ready templates (a periodic poll, not an informer-driven
 watch).
-
-<code class="fileref">cmd/atenet/internal/router/xds.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/controller.go</code>
 
 ### ExtProc server (:50051)
 
@@ -76,24 +70,20 @@ This is the brain of the routing. The L7 proxy hands every request's
 headers off to ExtProc; ExtProc:
 
 1. Parses the `:authority` / `Host` header into an **`(atespace, actor_name)`**
-   pair (`ParseActorDNSName` on
-   `<actor_name>.<atespace>.actors.resources.substrate.ate.dev`, port
+   pair from
+   `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` (port
    stripped). An unparseable host is answered with a 404.
-2. Calls `ateapi.ResumeActor` with an `ObjectRef{atespace, name}` (dedup'd via
-   singleflight).
+2. Asks ateapi to resume that actor, referencing it by `ObjectRef{atespace, name}`.
+   Concurrent requests for the same actor collapse into a single resume.
 3. Receives the `Actor` back and reads `ateom_pod_ip`.
 4. Returns a `HeaderMutation` telling the proxy to overwrite `:authority`
-   with `<pod_ip>:80`. (The `:80` is currently hardcoded - see the
-   `TODO(bowei)` in `extproc.go` about supporting other actor ports.)
+   with `<pod_ip>:80`. (The `:80` is currently hardcoded; supporting other
+   actor ports is a known follow-up.)
 
 After that, the proxy's dynamic forward proxy carries the request to the
 worker. The server is instrumented with OTel: it extracts any inbound
 `traceparent` from the request headers and starts a span so its work links to
 the Envoy ingress span.
-
-<code class="fileref">cmd/atenet/internal/router/extproc.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/extproc_in.go</code> ·
-<code class="fileref">cmd/atenet/internal/router/extproc_out.go</code>
 
 ### Proxy runner
 
@@ -102,8 +92,6 @@ reconciliation - it's not a sidecar pattern, the proxy pods are a separate
 fleet that this process keeps healthy. Bootstrap config points the proxies
 at the xDS server above. (Reconciliation of the proxy Deployment is skipped
 in standalone / file-backed modes.)
-
-<code class="fileref">cmd/atenet/internal/router/envoyrunner.go</code>
 
 ## The DNS subsystem
 
@@ -115,7 +103,7 @@ reconciles on an interval and:
    `ate-system` namespace.
 2. Generates a CoreDNS Corefile whose `template` plugin answers any
    `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` name (both
-   labels are DNS-1123, matched with `ResourceNameRegexPattern`) with the
+   labels are DNS-1123) with the
    **`atenet-router` ClusterIP**.
 3. Writes the Corefile to the shared volume and signals CoreDNS to reload
    (`SIGUSR1`), and points GKE's `kube-dns` ConfigMap `stubDomains` at the
@@ -124,27 +112,20 @@ reconciles on an interval and:
 The trick: DNS answers point at the **router**, not at any worker. Worker
 IPs change too often for DNS to be a good source of truth.
 
-<code class="fileref">cmd/atenet/internal/dns/dns.go</code> ·
-<code class="fileref">cmd/atenet/internal/dns/corefile.go</code>
-
-## The singleflight optimization
+## The request-coalescing optimization
 
 If 50 simultaneous requests hit a cold actor, ExtProc would naïvely fire
-50 `ResumeActor` calls at ateapi. A `singleflight.Group` keyed by
-`<atespace>/<actor_name>` collapses them: only the first goes through, the
+50 `ResumeActor` calls at ateapi. Instead, concurrent requests keyed by
+`<atespace>/<actor_name>` collapse: only the first goes through, the
 rest piggyback on its result. The in-flight resume also runs under a detached
 background timeout so a caller disconnecting doesn't abort the resume for the
 others, and `Aborted` responses (a concurrent resume) are retried with backoff.
-
-<code class="fileref">cmd/atenet/internal/router/resumer.go</code>
 
 ## Logging hygiene
 
 The router's status dashboard records recent requests, but it **redacts the
 query string** off recorded paths (it may carry credentials) before storing
 them. Secrets are never logged verbatim.
-
-<code class="fileref">cmd/atenet/internal/router/status.go</code>
 
 ## Why ship router + DNS in one binary?
 

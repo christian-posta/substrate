@@ -40,8 +40,6 @@ flowchart LR
   click AT "/components/atelet/" "atelet"
 ```
 
-<code class="fileref">cmd/ateom-microvm/main.go</code>
-
 ## The building blocks
 
 ateom-microvm boots cloud-hypervisor **directly** (no kata shim) and does the
@@ -66,19 +64,17 @@ Guest sizing (memory, vCPUs) and kernel params come from a base kata
 forwarded to the pod logs tagged with the container name
 (`ate.dev/container_name`), matching ateom-gvisor.
 
-<code class="fileref">cmd/ateom-microvm/run.go</code>
-
 ## The three operations
 
-### RunWorkload - cold boot
+### Run - cold boot
 
 Sets up the actor network, prepares each container's overlay rootfs, launches
 CH + virtiofsd, creates and boots the VM, dials the kata-agent, then (as the
 shim would) creates the agent sandbox, configures guest networking, and starts
 each container. Before returning it **blocks until every readyz-enabled
-container reports 200** (`internal/readyz`).
+container reports 200** (a readiness wait).
 
-### CheckpointWorkload - snapshot the VM
+### Checkpoint - snapshot the VM
 
 Drives the CH api-socket: **pause → snapshot → tear the VMM down**. The
 snapshot dir holds CH's `config.json` + `state.json` + (sparse) `memory-ranges`
@@ -88,23 +84,22 @@ snapshot; the read-only lower is reconstructed from the OCI image at restore,
 so no rootfs disk ships. ateom reports exactly the files it wrote so atelet
 ships precisely that set.
 
-### RestoreWorkload - relaunch and resume
+### Restore - relaunch and resume
 
 Reconstructs each overlay RO lower from the local OCI bundle, rebuilds the
 per-activation veth + tap (the snapshot's virtio-net is fd-backed, so CH needs
 fresh tap FDs), rewrites the snapshot config's per-VM socket/console paths to
-this actor's, then **relaunches CH with `--restore` (OnDemand / userfaultfd)
-and resumes**. Guest RAM - including in-memory state, the tmpfs rootfs upper,
+this actor's, then **relaunches CH and issues a `vm.restore` over the REST
+api-socket** with `memory_restore_mode: OnDemand` (userfaultfd lazy paging) and
+the fresh tap FDs passed as SCM_RIGHTS, then resumes. (CH is launched only with
+`--api-socket`; the restore is a REST call, not a CLI flag.) Guest RAM -
+including in-memory state, the tmpfs rootfs upper,
 and the frozen network config - comes back from the memory snapshot. It then
 waits on container readyz before returning.
 
 Because CH's OnDemand snapshot only writes the pages faulted in since restore,
 a later Checkpoint of a restored actor **overlays that delta onto the source
 snapshot** to rebuild a complete, self-contained image.
-
-<code class="fileref">cmd/ateom-microvm/run.go</code> ·
-<code class="fileref">cmd/ateom-microvm/checkpoint.go</code> ·
-<code class="fileref">cmd/ateom-microvm/restore.go</code>
 
 ## Actor networking
 
@@ -122,8 +117,6 @@ guest `eth0`) so a restored guest's frozen ARP cache and interface config stay
 valid on any pod. The guest also gets the worker pod's `/etc/resolv.conf`
 copied into its rootfs so egress name resolution works.
 
-<code class="fileref">cmd/ateom-microvm/net.go</code>
-
 ## The socket convention
 
 Like ateom-gvisor, each pod's ateom listens at:
@@ -132,10 +125,8 @@ Like ateom-gvisor, each pod's ateom listens at:
 /var/lib/ateom-gvisor/ateoms/<pod-uid>/ateom.sock
 ```
 
-host-bind-mounted into the pod, addressed by pod UID. (The base path constant
-is shared across both runtimes.)
-
-<code class="fileref">internal/ateompath/ateompath.go</code>
+host-bind-mounted into the pod, addressed by pod UID. (The base path is shared
+across both runtimes.)
 
 ## Why a micro-VM instead of gVisor?
 

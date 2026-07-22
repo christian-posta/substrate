@@ -37,22 +37,18 @@ value: {
 }
 ```
 
-(Proto field names from `pkg/proto/ateapipb/ateapi.proto`. There is no
-`pod_name` field; the pod-name component is `worker_pod`.)
+(There is no `pod_name` field; the pod-name component is `worker_pod`.)
 
 The old flat `actor_id` / `actor_namespace` / `actor_template` fields are
-gone. An assignment is now a single `Assignment` message (field 4):
+gone. An assignment is now a single `Assignment` record:
 
-- `actor_template` - a `KubeNamespacedObjectRef` (`namespace`, `name`).
+- `actor_template` - a namespaced object reference (`namespace`, `name`).
 - `actor` - an `ObjectRef` (`atespace`, `name`), the actor's identity tuple.
 
 When no `assignment` is set, the worker is **idle**. Otherwise it's
 **assigned** to that actor. The worker also caches pool metadata -
 `sandbox_class` and `labels{}` - so the scheduler can match eligibility
 without re-reading the pool.
-
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
-<code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
 
 ## One actor per worker
 
@@ -64,14 +60,15 @@ actor_name)` identity.
 ## How workers get *created*
 
 Not directly. You declare a [`WorkerPool`](/concepts/workerpool/) and
-`atecontroller` reconciles a Deployment of N pods. Each Ready pod gets
-inserted into Redis as a worker by ateapi's syncer.
+`atecontroller` reconciles a Deployment of N pods. Each pod gets
+inserted into Redis as a worker by ateapi's syncer once it has a `PodIP`
+(registration is keyed on the pod having an IP, not on the Ready condition).
 
 ## How workers get *destroyed*
 
-When a pod terminates (manual delete, eviction, node drain), the syncer's
-`DeleteFunc` removes the worker record. If an actor was assigned, it's
-forced back to a snapshot first.
+When a pod terminates (manual delete, eviction, node drain), the syncer
+removes the worker record. If an actor was assigned, it's forced back to a
+snapshot first.
 
 ## Related
 

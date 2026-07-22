@@ -11,7 +11,7 @@ record refers to a snapshot through one uniform message: `SnapshotInfo`.
 
 ## SnapshotInfo: external or local
 
-`SnapshotInfo` (`pkg/proto/ateapipb/ateapi.proto`) is a `oneof data` with two
+`SnapshotInfo` is a `oneof data` with two
 variants - a snapshot is either uploaded to object storage or kept on the node:
 
 | Variant | Message | Where it lives | Set by |
@@ -33,8 +33,7 @@ an **external** snapshot to object storage, freeing the node entirely. See
 ## Snapshot scope: what goes in
 
 Independently of *where* a snapshot lands, the `ActorTemplate`'s
-`snapshotsConfig` decides *what* it contains, via the **`SnapshotScope`** enum
-(`pkg/api/v1alpha1/actortemplate_types.go`):
+`snapshotsConfig` decides *what* it contains, via the **`SnapshotScope`** enum:
 
 | Scope | Contents | On resume |
 |---|---|---|
@@ -62,12 +61,12 @@ file list.
 - **gVisor** (`ateom-gvisor`, `runsc checkpoint`/`restore`): a `checkpoint.img`
   holding memory, sentry state, and filesystem deltas, plus any pages images
   `runsc` emits. ateom reports exactly the files `runsc` wrote rather than a
-  hardcoded list (`cmd/ateom-gvisor/main.go`), so resume can stream RAM pages
-  in lazily instead of reading the whole image up front.
+  hardcoded list, so resume can stream RAM pages in lazily instead of reading
+  the whole image up front.
 - **micro-VM** (`ateom-microvm`, cloud-hypervisor): a `config.json`, a
   `state.json`, and a sparse `memory-ranges` file - the guest's writable rootfs
   upper lives in guest RAM, so process memory *and* rootfs writes are both
-  captured by the memory snapshot (`cmd/ateom-microvm/checkpoint.go`).
+  captured by the memory snapshot.
 
 Snapshots are **not portable across sandbox classes** - a gVisor snapshot can
 only be restored into a gVisor worker, and likewise for micro-VM.
@@ -111,10 +110,3 @@ because decompress happens on the critical path of resume.
 - [Suspend actor](/flows/suspend-actor/) · [Resume actor](/flows/resume-actor/)
 - [Golden snapshot bootstrap](/flows/golden-snapshot/)
 - [Storage](/components/storage/) - the GCS/S3 layer.
-
-:::tip[Where in the code]
-- `SnapshotInfo` / `ExternalSnapshotInfo` / `LocalSnapshotInfo`: <code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
-- `SnapshotScope`, `SnapshotsConfig` (`onPause`/`onCommit`): <code class="fileref">pkg/api/v1alpha1/actortemplate_types.go</code>
-- gVisor checkpoint files: <code class="fileref">cmd/ateom-gvisor/main.go</code>; micro-VM: <code class="fileref">cmd/ateom-microvm/checkpoint.go</code>
-- upload + sparse-zstd: <code class="fileref">cmd/atelet/main.go</code>, <code class="fileref">cmd/atelet/internal/ategcs/sparsezstd.go</code>
-:::

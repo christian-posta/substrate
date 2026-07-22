@@ -8,9 +8,9 @@ which entrypoint, which sandbox runtime, which volumes, and where snapshots
 go. From a single template you create many actors (instances).
 
 :::note[This spec is immutable]
-`ActorTemplate.spec` carries an `XValidation` rule (`self == oldSelf`) that
-rejects any edit after creation. Changing an image would invalidate the
-golden snapshot, so a new "version" means a **new template**, not an edit.
+`ActorTemplate.spec` is validated to reject any edit after creation. Changing
+an image would invalidate the golden snapshot, so a new "version" means a
+**new template**, not an edit.
 :::
 
 ## The spec
@@ -51,13 +51,10 @@ status:
   goldenSnapshot: gs://my-bucket/some/prefix/<id>/<ts-rand>/
 ```
 
-`spec.pauseImage` and `spec.snapshotsConfig` are `+required`; each
+`spec.pauseImage` and `spec.snapshotsConfig` are required; each
 `containers[].name` and `containers[].image` are required too. Both
-`containers[].image` and `pauseImage` carry an `XValidation` rule that the
-value must contain `@` (digest-pinning) - changing an image invalidates
-existing snapshots.
-
-<code class="fileref">pkg/api/v1alpha1/actortemplate_types.go</code>
+`containers[].image` and `pauseImage` must contain `@` (digest-pinning) -
+changing an image invalidates existing snapshots.
 
 ## What changed
 
@@ -78,6 +75,11 @@ The old `spec.workerPoolRef` and `spec.runsc` fields are **gone**:
 
 Each `containers[]` entry supports:
 
+- `command[]` / `args[]` - override the image entrypoint, mirroring Kubernetes
+  semantics: `command` overrides the image `ENTRYPOINT` and `args` overrides its
+  `CMD`. If `command` is set, both the image `ENTRYPOINT` and `CMD` are ignored
+  and the process argv is `command + args`. Unlike Kubernetes, `$(VAR)`
+  references are **not** expanded.
 - `env[]` - either a literal `value` or a `valueFrom.secretKeyRef` (a key
   from a `Secret` in the template's namespace). Exactly one of the two must be
   set. Literal values are **not** `$(VAR)`-interpolated.
@@ -192,8 +194,7 @@ A few things worth pointing out:
 
 Runs the **golden snapshot bootstrap** described in detail at
 [Golden snapshot](/flows/golden-snapshot/). The golden boot happens in the
-reserved `ate-golden` atespace (see `resources.GoldenActorAtespace` and the
-[Atespace](/concepts/atespace/) page):
+reserved `ate-golden` atespace (see the [Atespace](/concepts/atespace/) page):
 
 ```mermaid
 stateDiagram-v2
@@ -204,35 +205,23 @@ stateDiagram-v2
   Ready --> [*]
 ```
 
-`PhaseFailed` is declared in the CRD type but the reconciler never assigns
+A failed phase is declared in the CRD type but the reconciler never assigns
 it - errors return up and trigger a requeue. The "wait" is not a blocking
-sleep: the reconciler stamps `Status.TakeGoldenSnapshotAt` and uses
-`RequeueAfter` to come back later. The default warmup is 20s, but templates
-whose containers all declare a `readyz` probe skip that wait - `ResumeActor`
-only returns once `readyz` reports 200.
+sleep: the reconciler stamps `status.takeGoldenSnapshotAt` and comes back
+later. The default warmup is 20s, but templates whose containers all declare a
+`readyz` probe skip that wait - `ResumeActor` only returns once `readyz`
+reports 200.
 
 The result: `status.goldenSnapshot` points at a fresh, just-booted
 snapshot of the template's image. Future actors of this template can
 restore from it in milliseconds instead of cold-booting.
 
-<code class="fileref">cmd/atecontroller/internal/controllers/actortemplate_controller.go</code>
-
 ## What the golden snapshot is *for*
 
 In the resume workflow, when an actor has no snapshot of its own (because
-it's never run yet), the strategy selector falls back to the template's
-golden snapshot (unless `boot` is requested):
-
-```go
-} else if state.ActorTemplate.Status.GoldenSnapshot != "" && !input.Boot {
-    // restore from the template's golden snapshot
-}
-```
-
-So every brand-new actor of this template starts from the same
-pre-initialized state, not from cold boot.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code>
+it's never run yet), snapshot selection falls back to the template's
+golden snapshot (unless `boot` is requested). So every brand-new actor of this
+template starts from the same pre-initialized state, not from cold boot.
 
 ## Relationship to other concepts
 

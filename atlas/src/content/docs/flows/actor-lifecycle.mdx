@@ -7,8 +7,7 @@ Every actor is in exactly one of **eight states** at any moment. State is
 stored in Redis at `actor:<atespace>:<name>` and changed only by ateapi's
 workflow engine under a per-actor lock.
 
-The `Actor.Status` enum
-(`pkg/proto/ateapipb/ateapi.proto`) is:
+The actor status values are:
 `STATUS_UNSPECIFIED`, `STATUS_RESUMING`, `STATUS_RUNNING`, `STATUS_SUSPENDING`,
 `STATUS_SUSPENDED`, `STATUS_PAUSING`, `STATUS_PAUSED`, and `STATUS_CRASHED`.
 
@@ -23,13 +22,13 @@ where the snapshot lands.
 ```mermaid
 stateDiagram-v2
   [*] --> SUSPENDED: CreateActor
-  SUSPENDED --> RESUMING: ResumeActor<br/>(AssignWorker)
-  PAUSED --> RESUMING: ResumeActor<br/>(AssignWorker)
-  RESUMING --> RUNNING: FinalizeRunning
-  RUNNING --> SUSPENDING: SuspendActor<br/>(MarkSuspending)
-  SUSPENDING --> SUSPENDED: FinalizeSuspended<br/>(worker released)
-  RUNNING --> PAUSING: PauseActor<br/>(MarkPausing)
-  PAUSING --> PAUSED: FinalizePaused<br/>(worker released)
+  SUSPENDED --> RESUMING: ResumeActor<br/>(assign worker)
+  PAUSED --> RESUMING: ResumeActor<br/>(assign worker)
+  RESUMING --> RUNNING: Finalize → RUNNING
+  RUNNING --> SUSPENDING: SuspendActor<br/>(Mark SUSPENDING)
+  SUSPENDING --> SUSPENDED: Finalize → SUSPENDED<br/>(worker released)
+  RUNNING --> PAUSING: PauseActor<br/>(Mark PAUSING)
+  PAUSING --> PAUSED: Finalize → PAUSED<br/>(worker released)
   SUSPENDED --> [*]: DeleteActor
   CRASHED --> [*]: DeleteActor
 
@@ -49,8 +48,6 @@ stateDiagram-v2
     ever suspended.
   end note
 ```
-
-<code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
 
 ## What each state means
 
@@ -81,15 +78,14 @@ unrecoverably (see below).
 | `SUSPENDED` / `CRASHED` | `DeleteActor` | gone |
 
 `DeleteActor` accepts an actor **only when it is `SUSPENDED` or `CRASHED`**; any
-other status returns a `FailedPrecondition` error. The check lives in the store,
-in `DeleteActor` (`cmd/ateapi/internal/store/ateredis/ateredis.go`).
+other status is rejected with a precondition error. The store enforces this
+check on delete.
 
 Some "no-op" transitions are idempotent rather than rejected. Suspending an
 already-suspended actor short-circuits inside the workflow and returns the actor
-unchanged (`MarkSuspendingStep.IsComplete` returns early for
-`SUSPENDING`/`SUSPENDED` actors; `MarkPausingStep.IsComplete` does the same for
-`PAUSING`/`PAUSED`). The real serialization guarantee is the per-actor lock
-below.
+unchanged (the suspend workflow treats `SUSPENDING`/`SUSPENDED` actors as
+already complete; the pause workflow does the same for `PAUSING`/`PAUSED`). The
+real serialization guarantee is the per-actor lock below.
 
 ## The CRASHED state
 
@@ -98,54 +94,47 @@ recover from, ateapi moves the actor to `STATUS_CRASHED` rather than leaving it
 wedged in a transient state:
 
 - The suspend/pause workflows guard against calling atelet with no assigned
-  worker. If `MarkSuspending`/`MarkPausing` left the actor in `SUSPENDING` /
-  `PAUSING` but the actor has no `ateom_pod_namespace`/`ateom_pod_name`, the
-  step calls `crashActor` and fails
-  (`cmd/ateapi/internal/controlapi/workflow_suspend.go`,
-  `cmd/ateapi/internal/controlapi/workflow_pause.go`).
-- When an atelet RPC returns an error carrying the `actorCrashed` directive
-  (for example, atelet failing to upload an external snapshot returns
-  `codes.DataLoss`), `maybeCrashActor` moves the actor to `CRASHED` and returns
-  `codes.DataLoss` to the caller
-  (`cmd/ateapi/internal/controlapi/crash.go`).
+  worker. If the actor was marked `SUSPENDING` / `PAUSING` but has no assigned
+  worker pod, the step crashes the actor and fails - there's nothing to
+  checkpoint.
+- When an atelet RPC returns an error signalling that the actor should be
+  crashed (for example, atelet failing to upload an external snapshot returns a
+  data-loss error), ateapi moves the actor to `CRASHED` and returns the
+  data-loss error to the caller.
 
-A `CRASHED` actor keeps whatever `latest_snapshot_info` it had. It is not
-auto-recovered; the only exit is `DeleteActor`.
-
-<code class="fileref">cmd/ateapi/internal/controlapi/crash.go</code>
+Crashing an actor also **releases its worker and clears the binding**, so a
+`CRASHED` actor no longer pins a worker and can be cleanly deleted. It keeps
+whatever `latest_snapshot_info` it had, is not auto-recovered, and its only exit
+is `DeleteActor`.
 
 ## Who writes each transition
 
 ```mermaid
 flowchart LR
   subgraph WF_Resume["ResumeActor workflow"]
-    R1[LoadActorForResume<br/>SUSPENDED / PAUSED ✓]
-    R2[AssignWorker<br/>→ RESUMING]
-    R3[CallAteletRestore]
-    R4[FinalizeRunning<br/>→ RUNNING]
+    R1[Load actor<br/>SUSPENDED / PAUSED ✓]
+    R2[Assign worker<br/>→ RESUMING]
+    R3[Restore via atelet]
+    R4[Finalize → RUNNING]
     R1 --> R2 --> R3 --> R4
   end
 
   subgraph WF_Suspend["SuspendActor workflow"]
-    S1[LoadActorForSuspend<br/>RUNNING ✓]
-    S2[MarkSuspending<br/>→ SUSPENDING]
-    S3[CallAteletSuspend<br/>external upload]
-    S4[FinalizeSuspended<br/>→ SUSPENDED]
+    S1[Load actor<br/>RUNNING ✓]
+    S2[Mark SUSPENDING<br/>→ SUSPENDING]
+    S3[Checkpoint via atelet<br/>external upload]
+    S4[Finalize → SUSPENDED]
     S1 --> S2 --> S3 --> S4
   end
 
   subgraph WF_Pause["PauseActor workflow"]
-    P1[LoadActorForPause<br/>RUNNING ✓]
-    P2[MarkPausing<br/>→ PAUSING]
-    P3[CallAteletPause<br/>keep local]
-    P4[FinalizePaused<br/>→ PAUSED]
+    P1[Load actor<br/>RUNNING ✓]
+    P2[Mark PAUSING<br/>→ PAUSING]
+    P3[Checkpoint via atelet (local)<br/>keep local]
+    P4[Finalize → PAUSED]
     P1 --> P2 --> P3 --> P4
   end
 ```
-
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_resume.go</code> ·
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_suspend.go</code> ·
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow_pause.go</code>
 
 The suspend and pause workflows are near-identical four-step machines; the only
 differences are the checkpoint type they hand atelet (external upload vs.
@@ -162,23 +151,21 @@ actor cannot both succeed - the second gets `Aborted`.
 This is what prevents nasty races like "resume + suspend at the same time" or
 "delete while a worker is still assigned."
 
-<code class="fileref">cmd/ateapi/internal/controlapi/workflow.go</code>
-
 ## What can move an actor *without* an RPC?
 
-One path: **the worker pod dies**. The WorkerPoolSyncer's pod-delete (and
-soft-delete) handler runs `releaseActorOnDeadWorker`, which finds the actor via
-the worker's `Assignment` and forces it back to `SUSPENDED` - even mid-`RUNNING`
-- unless the actor is already `CRASHED`, in which case it is left alone. It also
-clears the actor's `ateom_pod_*` pointers, `in_progress_snapshot`, and
-`worker_pool_name`. The actor's `latest_snapshot_info` is left untouched
-(whatever it was before, or empty for never-run actors).
+One path: **the worker pod dies**. The worker-pool syncer's pod-delete (and
+soft-delete) handler finds the actor via the worker's `Assignment` and forces it
+back to `SUSPENDED` - even mid-`RUNNING` - unless the actor is already
+`CRASHED`, in which case it is left alone. It also clears the actor's
+`ateom_pod_namespace`/`ateom_pod_name`/`ateom_pod_ip` pointers,
+`in_progress_snapshot`, and `worker_pool_name` (the `ateom_pod_uid` is left set -
+only a crash clears it). The
+actor's `latest_snapshot_info` is left untouched (whatever it was before, or
+empty for never-run actors).
 
 This is a best-effort recovery path, not a normal transition, and it is known to
 race with concurrent `SuspendActor`/`PauseActor` calls (optimistic-version
 checking means whichever writes first wins).
-
-<code class="fileref">cmd/ateapi/internal/controlapi/syncer.go</code>
 
 ## Where state actually lives
 

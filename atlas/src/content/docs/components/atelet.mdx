@@ -18,7 +18,7 @@ flowchart LR
 
   subgraph AT_internals["atelet process"]
     direction TB
-    SRV["AteomHerder gRPC server"]
+    SRV["gRPC server"]
     PULL["Image puller<br/>(pre-stage OCI bundles)"]
     OCI["OCI bundle builder"]
     OBJ["GCS / S3 client<br/>(zstd compress/decompress)"]
@@ -30,7 +30,7 @@ flowchart LR
   SRV --> OBJ
   SRV --> SOCK
 
-  SOCK -- "RunWorkload /<br/>CheckpointWorkload /<br/>RestoreWorkload" --> OM[ateom<br/>in worker pod]
+  SOCK -- "Run /<br/>Checkpoint /<br/>Restore" --> OM[ateom<br/>in worker pod]
   OBJ <--> GCS[("GCS / S3")]
 
   click API "/components/ateapi/" "ateapi"
@@ -38,30 +38,25 @@ flowchart LR
   click GCS "/components/storage/" "Storage"
 ```
 
-<code class="fileref">cmd/atelet/main.go</code>
-
-## The AteomHerder gRPC service
+## The gRPC service
 
 Three RPCs, each called by ateapi during the corresponding workflow. Every
 request's path components (atespace, actor name, container names, target ateom
-UID, snapshot URI prefix) are validated up front through the shared
-`internal/resources` validators, and an invalid request is rejected with
-gRPC `InvalidArgument`.
+UID, snapshot URI prefix) are validated up front, and an invalid request is
+rejected as an invalid-argument error.
 
 | RPC | Caller | What atelet does |
 |---|---|---|
-| `Run(RunRequest)` | ateapi resume workflow (cold boot fallback) | Fetch sandbox assets, reset actor dirs, build OCI bundles, call `ateom.RunWorkload` |
-| `Checkpoint(CheckpointRequest)` | ateapi suspend / pause workflow | Re-fetch the recorded sandbox assets, call `ateom.CheckpointWorkload`, then ship exactly the files ateom reports (zstd-compressed) locally or to GCS/S3 |
-| `Restore(RestoreRequest)` | ateapi resume workflow | Fetch sandbox assets, download the snapshot files (parallel), decompress to a local volume, call `ateom.RestoreWorkload` |
-
-<code class="fileref">cmd/atelet/main.go</code>
+| Run | ateapi resume workflow (cold boot fallback) | Fetch sandbox assets, reset actor dirs, build OCI bundles, issue the Run call to ateom |
+| Checkpoint | ateapi suspend / pause workflow | Re-fetch the recorded sandbox assets, issue the Checkpoint call to ateom, then ship exactly the files ateom reports (zstd-compressed) locally or to GCS/S3 |
+| Restore | ateapi resume workflow | Fetch sandbox assets, download the snapshot files (parallel), decompress to a local volume, issue the Restore call to ateom |
 
 ## Sandbox assets (not a hardcoded runsc download)
 
-The runtime binaries are no longer a baked-in "download runsc" step. The
-`RunRequest` carries a **`SandboxAssets`** message: a `sandbox_class` plus a
-per-architecture set of content-addressed files (`url` + `sha256`). atelet
-projects that onto the node's `GOARCH`, then fetches each asset:
+The runtime binaries are no longer a baked-in "download runsc" step. The Run
+request carries a **sandbox-assets** description: a `sandbox_class` plus a
+per-architecture set of content-addressed files (URL + sha256). atelet projects
+that onto the node's architecture, then fetches each asset:
 
 - The download is **streamed to a temp file** (hashing as it goes, verified
   against the expected sha256 and capped) and atomically renamed into the
@@ -76,8 +71,6 @@ atelet also **records the asset set on the node** at Run/Restore
 request no longer carries the sandbox config - can re-fetch the identical
 binaries and pin them into the snapshot manifest.
 
-<code class="fileref">cmd/atelet/sandbox_assets.go</code>
-
 ## Actor identity file
 
 Before building the OCI bundles, atelet writes the actor's own name to
@@ -87,9 +80,6 @@ dir is **regenerated on every resume**, so the value is correct even when the
 actor was restored from a shared golden snapshot (whose checkpointed process
 environment would otherwise carry the golden actor's identity).
 
-<code class="fileref">cmd/atelet/oci.go</code> ·
-<code class="fileref">cmd/atelet/main.go</code>
-
 ## How atelet talks to ateom
 
 Each worker pod has a host-bind-mounted Unix socket at:
@@ -98,39 +88,35 @@ Each worker pod has a host-bind-mounted Unix socket at:
 /var/lib/ateom-gvisor/ateoms/<pod-uid>/ateom.sock
 ```
 
-atelet dials this socket (`DialAteomPod`, via `unix://` + `AteomSocketPath`)
-and gets a gRPC client to that specific pod's ateom. No TCP, no service
-discovery - the pod UID in the filesystem path is the addressing scheme. The
-base path constant lives in `internal/ateompath`, shared by atelet and ateom.
-
-<code class="fileref">cmd/atelet/main.go</code> ·
-<code class="fileref">internal/ateompath/ateompath.go</code>
+atelet dials this socket (over `unix://`) and gets a gRPC client to that
+specific pod's ateom. No TCP, no service discovery - the pod UID in the
+filesystem path is the addressing scheme. The base path is shared by atelet and
+ateom.
 
 ## Snapshot upload / download
 
 atelet is the **only** component that talks to object storage; the same
-interface fronts both GCS and S3 (see `cmd/atelet/internal/ategcs`).
+interface fronts both GCS and S3.
 
 ateom reports the exact set of files it wrote (rather than atelet assuming a
 fixed list), so atelet ships precisely that set: gVisor's checkpoint image
-files, or the micro-VM's cloud-hypervisor snapshot set. For the micro-VM
-runtime, memory images use a **sparse-extent zstd format** (magic `ATESPRSE`)
-so only resident pages are stored. Snapshots can be kept node-local (for
+files, or the micro-VM's cloud-hypervisor snapshot set. Every on-disk snapshot
+file is uploaded with a **sparse-extent zstd format** (magic `ATESPRSE`) that
+compresses only the populated extents and skips the holes - so a mostly-zero RAM
+image (whether a gVisor `pages.img` or a micro-VM `memory-ranges`) only costs its
+resident pages. Snapshots can be kept node-local (for
 Pause) or uploaded to external storage (for Suspend), keyed under the prefix
 supplied by the `ActorTemplate`. Restore downloads happen in parallel; zstd
 compression is applied on the atelet side to keep network bytes down.
 
-<code class="fileref">cmd/atelet/main.go</code> ·
-<code class="fileref">cmd/atelet/internal/ategcs/sparsezstd.go</code>
-
 ## Local filesystem layout
 
-atelet manages a tree on each node (paths from `internal/ateompath`):
+atelet manages a tree on each node:
 
 | Path | Contents |
 |---|---|
 | `/var/lib/ateom-gvisor/static-files/runsc-<sha>` | Content-addressed sandbox asset binaries |
-| `/var/lib/ateom-gvisor/actors/<atespace>:<name>/` | Per-actor working tree |
+| `/var/lib/ateom-gvisor/actors/<actor-uid>/` | Per-actor working tree (keyed by the actor's server-assigned UID) |
 | `.../identity/` | The `actor-id` file, bind-mounted read-only at `/run/ate` |
 | `.../sandbox-assets.json` | Recorded sandbox asset set (survives Run→Checkpoint) |
 | `.../bundles/<container>/` | OCI bundles per container |
@@ -139,8 +125,6 @@ atelet manages a tree on each node (paths from `internal/ateompath`):
 
 `checkpoint-state` and `restore-state` are kept separate so a future restore
 doesn't trample a checkpoint in progress.
-
-<code class="fileref">internal/ateompath/ateompath.go</code>
 
 ## Why a DaemonSet, not a sidecar?
 

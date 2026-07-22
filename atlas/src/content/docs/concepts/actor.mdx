@@ -32,8 +32,7 @@ stateDiagram-v2
   SUSPENDED --> [*]: DeleteActor
 ```
 
-The `Actor.Status` enum defines eight values
-(`pkg/proto/ateapipb/ateapi.proto`):
+An actor's status is one of eight values:
 `STATUS_UNSPECIFIED`, `STATUS_RESUMING`, `STATUS_RUNNING`, `STATUS_SUSPENDING`,
 `STATUS_SUSPENDED`, `STATUS_PAUSING`, `STATUS_PAUSED`, and `STATUS_CRASHED`.
 `RESUMING`, `SUSPENDING`, and `PAUSING` are transient - they're set when the
@@ -54,9 +53,7 @@ Both are caller-specified at creation and immutable thereafter.
 
 The canonical externally-facing handle - the `:authority` a client uses to
 reach an actor over HTTP - is
-`<actor_name>.<atespace>.actors.resources.substrate.ate.dev`
-(suffix `ActorDNSSuffix` and helper `ActorDNSName(atespace, actorName)` are
-defined in `internal/resources/actor.go`).
+`<actor_name>.<atespace>.actors.resources.substrate.ate.dev`.
 
 ## What's the relationship to a Pod?
 
@@ -90,9 +87,3 @@ cleared when the worker is freed).
 - [ActorTemplate](/concepts/actortemplate/) · [Worker](/concepts/worker/) ·
   [Snapshot](/concepts/snapshot/) · [Session](/concepts/session/)
 - [Actor lifecycle](/flows/actor-lifecycle/) - full state machine.
-
-:::tip[Where in the code]
-- `Actor` message, `Status` enum, `SnapshotInfo`: <code class="fileref">pkg/proto/ateapipb/ateapi.proto</code>
-- DNS name + reserved golden atespace: <code class="fileref">internal/resources/actor.go</code>
-- Redis key layout (`actor:<atespace>:<name>`): <code class="fileref">cmd/ateapi/internal/store/ateredis/ateredis.go</code>
-:::
