@@ -42,7 +42,7 @@ NAMESPACE="${NAMESPACE:-ate-system}"
 KUBECTL_CONTEXT="${KUBECTL_CONTEXT:-}"
 # kind contexts are named kind-<cluster>; fall back to kind's own default.
 KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-${KUBECTL_CONTEXT#kind-}}"
-KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-substrate}"
 
 # Keep in sync with the rustfs-bucket-init Job in
 # manifests/ate-install/kind/rustfs.yaml, which creates the bucket we upload into.

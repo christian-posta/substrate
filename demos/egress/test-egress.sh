@@ -32,7 +32,7 @@
 
 set -o errexit -o nounset -o pipefail
 
-CTX="${KUBECTL_CONTEXT:-kind-kind}"
+CTX="${KUBECTL_CONTEXT:-kind-substrate}"
 # The actor lives in the demo's atespace: --template resolves the
 # template by name within the actor's own atespace.
 ATESPACE="${ATESPACE:-ate-demo-egress}"
@@ -127,7 +127,7 @@ if [[ "${CODE}" == "200" ]]; then pass "actor fetched the target (HTTP 200)"; el
 if grep -q "RemoteAddr: ${GW_IP}" /tmp/egress-body.txt 2>/dev/null; then
   pass "target saw the egress gateway (${GW_IP}) as its client — traffic went through the gateway"
 else
-  info "target body RemoteAddr: $(grep -o 'RemoteAddr: [0-9.]*' /tmp/egress-body.txt 2>/dev/null || echo '?') (gateway IP ${GW_IP})"
+  fail "target did not see the egress gateway as its client: $(grep -o 'RemoteAddr: [0-9.]*' /tmp/egress-body.txt 2>/dev/null || echo '?') (gateway IP ${GW_IP})"
 fi
 if [[ "${DATAPLANE}" == "envoy" ]]; then
   # Envoy's access log identifies the peer by its certificate SAN, not by any
