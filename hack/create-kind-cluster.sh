@@ -17,7 +17,7 @@
 set -o errexit -o nounset -o pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-substrate}"
 KUBECTL_CONTEXT="kind-${KIND_CLUSTER_NAME}"
 reg_name="kind-registry"
 reg_port="${KIND_REGISTRY_PORT:-5001}"
@@ -29,7 +29,7 @@ if [[ $# -gt 0 ]]; then
       echo "Creates the kind cluster '${KIND_CLUSTER_NAME}' and a local registry container on port ${reg_port}."
       echo
       echo "Configured through the environment:"
-      echo "  KIND_CLUSTER_NAME  Name of the cluster to create (default: kind)."
+      echo "  KIND_CLUSTER_NAME  Name of the cluster to create (default: substrate)."
       echo "  IP_FAMILY          Address families for pods and Services: ipv4, ipv6 or dual (default: ipv4)."
       exit 0
       ;;

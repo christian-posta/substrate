@@ -1186,8 +1186,8 @@ delete_demo_actors_substrate() {
       prepare_actor_for_delete "${actor_name}" "${atespace}"
       run_kubectl_ate delete actor "${actor_name}" -a "${atespace}"
     done < <(
-      jq -r --arg as "${template_atespace}" --arg tmpl "${tmpl}" \
-        '.actors[]? | select(.actorTemplate.atespace == $as and .actorTemplate.name == $tmpl) | "\(.metadata.atespace)\t\(.metadata.name)"' \
+      jq -r --arg template_as "${template_atespace}" --arg tmpl "${tmpl}" \
+        '.actors[]? | select(.actorTemplate.atespace == $template_as and .actorTemplate.name == $tmpl) | "\(.metadata.atespace)\t\(.metadata.name)"' \
         <<<"${actors_json}"
     )
   done

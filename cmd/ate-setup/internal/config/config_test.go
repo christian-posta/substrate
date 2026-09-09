@@ -247,8 +247,8 @@ func TestLoadKindProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Context != "kind-kind" {
-		t.Errorf("Context = %q, want kind-kind", cfg.Context)
+	if cfg.Context != "kind-substrate" {
+		t.Errorf("Context = %q, want kind-substrate", cfg.Context)
 	}
 	if cfg.ProjectID != "" {
 		t.Errorf("ProjectID = %q, want it cleared for kind", cfg.ProjectID)

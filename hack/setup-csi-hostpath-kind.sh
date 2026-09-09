@@ -34,7 +34,7 @@ kubectl delete storageclass csi-hostpath-sc >/dev/null 2>&1 || true
 
 # Also clean up the host directories inside Kind node (best effort)
 echo "Cleaning up CSI directories on Kind node..."
-KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-substrate}"
 KIND_NODE=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o name | head -n 1 | cut -d'/' -f2)
 if [ -z "${KIND_NODE}" ]; then
   KIND_NODE=$(kubectl get nodes -o name | head -n 1 | cut -d'/' -f2)

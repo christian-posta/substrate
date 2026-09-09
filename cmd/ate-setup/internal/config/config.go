@@ -256,7 +256,7 @@ func loadImageSource(opts Options, env map[string]string) images.Source {
 func applyKindDefaults(cfg *Config) {
 	cfg.ProjectID = ""
 	cfg.ClusterLocation = ""
-	kindClusterName := firstNonEmpty(cfg.shellEnv["KIND_CLUSTER_NAME"], "kind")
+	kindClusterName := firstNonEmpty(cfg.shellEnv["KIND_CLUSTER_NAME"], "substrate")
 	cfg.Context = firstNonEmpty(cfg.Context, "kind-"+kindClusterName)
 	cfg.KODockerRepo = firstNonEmpty(cfg.KODockerRepo, "localhost:5001")
 	cfg.KODefaultPlatforms = "linux/" + runtime.GOARCH
