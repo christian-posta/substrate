@@ -39,7 +39,7 @@ export ATE_INSTALL_KIND="true"
 # default bucket name for local deployment (served by the in-cluster rustfs)
 export BUCKET_NAME="${BUCKET_NAME:-ate-snapshots}"
 # target the local kind cluster's context
-KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-substrate}"
 export KUBECTL_CONTEXT="${KUBECTL_CONTEXT:-kind-${KIND_CLUSTER_NAME}}"
 # unset other env from ate-dev-env.sh in case the developer already sourced them
 unset GCE_REGION CLUSTER_LOCATION NETWORK SUBNETWORK MEMORYSTORE_INSTANCE PROJECT_ID

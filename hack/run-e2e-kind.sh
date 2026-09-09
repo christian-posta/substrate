@@ -37,7 +37,7 @@ export KO_DEFAULTPLATFORMS="${KO_DEFAULTPLATFORMS:-linux/$(go env GOARCH)}"
 # default bucket name for local deployment (served by in-cluster rustfs)
 export BUCKET_NAME="${BUCKET_NAME:-ate-snapshots}"
 # target the local Kind cluster's context
-KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-substrate}"
 export KUBECTL_CONTEXT="${KUBECTL_CONTEXT:-kind-${KIND_CLUSTER_NAME}}"
 
 exec "${ROOT}/hack/run-e2e.sh" "$@"

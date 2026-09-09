@@ -36,7 +36,7 @@ export BUCKET_NAME="ate-snapshots"
 # the install doesn't land on whatever kubeconfig current-context happens to be,
 # or on nothing at all, which kubectl reports as a localhost:8080 dial failure.
 # An explicit KUBECTL_CONTEXT still wins.
-KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
+KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-substrate}"
 export KUBECTL_CONTEXT="${KUBECTL_CONTEXT:-kind-${KIND_CLUSTER_NAME}}"
 # unset other env from ate-dev-env.sh in case the developer already sourced them
 unset GCE_REGION CLUSTER_LOCATION NETWORK SUBNETWORK MEMORYSTORE_INSTANCE PROJECT_ID
