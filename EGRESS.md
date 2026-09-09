@@ -1,652 +1,628 @@
-# Actor Egress
+# Actor egress through agentgateway
 
-> How an actor's outbound traffic leaves the sandbox, how it is authenticated with the actor's own
-> identity, and what the egress gateway does and does not enforce. Companion to
-> [IDENTITY.md](./IDENTITY.md), which covers how the actor certificate is minted. The running
-> example is an actor calling an MCP server outside the Kubernetes cluster. To run the demo, see
-> [DEMO.md](./DEMO.md) and `demos/egress/README.md`.
+This document describes the agentgateway egress data plane shipped by Agent
+Substrate. It follows an outbound TCP connection from an actor, through
+`atunnel`, into the pinned agentgateway deployment, and then to the destination.
+It also distinguishes behavior present in this repository from behavior that is
+only planned or available in later upstream agentgateway changes.
 
-## The flow on one screen (default Envoy dataplane)
+## Data path
 
+```text
+actor sandbox (untrusted)
++---------------------------------------------------------------+
+| actor process                                                 |
+|     |                                                         |
+|     | normal TCP socket                                       |
+|     v                                                         |
+| actor network stack                                           |
+|     eth0: 169.254.17.2/30                                     |
+|     default route via 169.254.17.1                            |
++---------------- sandbox / worker boundary --------------------+
+                          |
+                          | packet crosses the veth boundary
+                          v
+trusted ateom worker pod network namespace
++---------------------------------------------------------------+
+| ateom0: 169.254.17.1/30                                       |
+|     |                                                         |
+|     | nftables PREROUTING in the worker namespace             |
+|     | matches source 169.254.17.2 + IPv4 TCP                  |
+|     | REDIRECT to local port 15001                            |
+|     v                                                         |
+| atunnel: 0.0.0.0:15001                                       |
++---------------------------------------------------------------+
+                          |
+                          | mTLS + HTTP/1.1
+                          | CONNECT <destination-IP>:<port>
+                          v
+atenet-egress.ate-system.svc:443
+                          |
+                          | Service targetPort -> agentgateway :8443
+                          v
+agentgateway outer listener
+                          |
+                          | authenticates an actor certificate
+                          | accepts the CONNECT tunnel
+                          | preserves peer identity on re-entry
+                          v
+agentgateway inner listener (protocol: AUTO)
+                          |
+                          +-- clear HTTP: parse and proxy HTTP
+                          +-- TLS: inspect ClientHello/SNI, then pass through
+                          +-- other TCP: pass opaque bytes through
+                          v
+destination
 ```
-┌────────────────────────── worker pod (pod netns) ───────────────────────────┐
-│  ┌─── actor sandbox (gVisor netns or micro-VM guest) ─┐                     │
-│  │  actor process                                     │                     │
-│  │    dial tcp <mcp-ip>:443     (thinks it is         │                     │
-│  │    eth0 = 169.254.17.2/30     talking directly)    │                     │
-│  │    default route → 169.254.17.1                    │                     │
-│  └───────────────────────┬────────────────────────────┘                     │
-│                          │ veth                                             │
-│                   ateom0 (169.254.17.1)                                     │
-│                          │                                                  │
-│        nftables prerouting: saddr==169.254.17.2 && tcp                      │
-│                → REDIRECT to :15001  (preserves SO_ORIGINAL_DST)            │
-│                          │                                                  │
-│  atunnel egress (inside the ateom process, :15001)                          │
-│    • getsockopt SO_ORIGINAL_DST → "<mcp-ip>:443"                            │
-│    • mTLS to atenet-egress.ate-system.svc:443                               │
-│         client cert = the ACTOR's one-hour certificate                      │
-│    • HTTP/1.1 CONNECT <mcp-ip>:443 — no identity/auth headers or tokens    │
-└──────────────────────────┬──────────────────────────────────────────────────┘
-                           │
-┌───────────────── atenet-egress pod (2 containers) ──────────────────────────┐
-│  Envoy (static config)                 atenet --mode=egress (ext_proc)      │
-│    • :443, require client cert           • re-verify chain in Go            │
-│      trusted_ca = actor-identity CA      • parse ActorIdentity extension    │
-│    • terminate CONNECT                   • GetActor: UID match + RUNNING     │
-│    • XFCC carries the full chain  ───▶   • allow (empty response) or 403/503│
-│    • dynamic_forward_proxy                                                  │
-└──────────────────────────┬──────────────────────────────────────────────────┘
-                           │ plain TCP to the CONNECT authority
-                           ▼
-                 MCP server, <mcp-ip>:443 (outside the cluster)
-                 sees the gateway pod IP as its client;
-                 the actor's own TLS rides opaquely inside the tunnel
-```
 
-Three load-bearing facts:
+> [!WARNING]
+> **The shipped data path is not a complete sandbox egress-control boundary.**
+> `atunnel` intercepts IPv4 TCP sourced from the configured actor address. The
+> worker currently forwards and masquerades all other IPv4 protocols, so UDP,
+> QUIC/HTTP/3, DTLS, ICMP, and custom non-TCP protocols bypass both `atunnel`
+> and agentgateway. Those flows carry no actor mTLS identity to the gateway and
+> receive no gateway authorization, destination logging, TLS interception, or
+> destination-policy enforcement placed at the gateway. In addition, the pinned
+> agentgateway v1.5.0 configuration does not yet enforce `EgressPolicy` even for
+> intercepted TCP. Deployments must not describe this configuration alone as
+> locking down all sandbox egress.
 
-1. **The actor is untouched.** It dials plain TCP. Interception is an nftables redirect in the
-   worker pod's network namespace. No proxy environment variables, no SDK, nothing inside the
-   sandbox.
-2. **Identity is the client certificate, not a header.** atunnel generates the outer CONNECT and
-   supplies no actor-controlled identity or authentication header. Nothing the actor writes into
-   the tunneled connection contributes to the gateway's identity decision.
-3. **The gateway authenticates the actor and checks its current incarnation; it does not yet
-   authorize destinations.** The default Envoy path requires the UID to match a RUNNING actor. An
-   egress policy API exists in the control plane, but no built-in dataplane reads it and nothing on
-   `main` injects credentials. Details under [Egress policy](#egress-policy).
+The nftables redirect is not installed inside the actor sandbox. `ateom`
+installs it in the worker pod network namespace, on the trusted side of the
+sandbox's veth boundary. `atunnel` also runs there. An actor process, including
+one running as root, has no namespace access that would let it edit the
+worker-side `ateom_actor` table. Actor-local routing or firewall changes can
+break the actor's own connectivity, but cannot remove that table.
 
-## The actor network
+Both sandbox runtimes converge on this same worker-side enforcement point. The
+gVisor runtime attaches its network stack to the interior side of the veth. The
+microVM runtime connects the guest's virtio-net device through a TAP and traffic
+control redirects to that veth. In both cases, externally-bound actor packets
+arrive on worker-side `ateom0` before they can reach the worker pod's `eth0`.
 
-ateom builds the actor's network in the worker pod's network namespace on every Run and Restore:
+This enforcement has important qualifications. The current nftables redirect
+matches IPv4 packets by source address `169.254.17.2` and TCP protocol. It does
+not match the ingress interface, enforce source-address anti-spoofing, or use a
+default-deny forwarding policy. Actor containers do not receive `NET_ADMIN` or
+`NET_RAW` by default, but an ActorTemplate may explicitly grant them. A
+network-privileged actor can then alter its sandbox network stack or construct
+packets, and the current worker rules are not sufficient to claim robust
+anti-bypass enforcement against that actor. Non-TCP traffic also bypasses
+`atunnel` through the compatibility masquerade described below. The strong
+statement supported by the code is therefore: ordinary IPv4 TCP emitted with
+the configured actor address is redirected outside the sandbox and cannot
+bypass `atunnel` by editing actor-local nftables.
 
-- A point-to-point `/30` veth pair. The pod side is `ateom0` at `169.254.17.1`; the actor side is
-  `eth0` at `169.254.17.2`, created directly inside the actor's namespace.
-- Inside the sandbox: loopback up, `eth0` addressed, and a default route via `169.254.17.1`. That
-  default route is the only network configuration the actor ever sees.
-- On gVisor, runsc joins the named namespace ateom created. On the micro-VM runtime, a tap device
-  is cross-connected to the veth with a TC redirect, guest networking is pushed over the kata
-  agent, and the gateway's ARP entry is pinned because snapshots freeze the guest ARP cache.
-- Actor networking is IPv4-only.
+The worker installs the redirect only when its Run or Restore request contains
+an egress gateway. With no gateway, `ateom` passes redirect port zero, installs
+no TCP redirect, and actor traffic remains on the masquerade path. The standard
+installation configures a gateway, but the data-path guarantee is conditional
+on that configuration reaching the worker.
 
-## Interception
+A stronger anti-bypass boundary would match traffic arriving on `ateom0`, drop
+spoofed actor source addresses, default-deny forwarded actor traffic with narrow
+exceptions such as the configured DNS resolver, define an IPv6 policy, and
+either deny network-administration capabilities or test them as part of the
+threat model. The repository does not implement that complete rule set today.
 
-One nftables table with three chains in the worker pod's namespace:
+Four facts are central to the current implementation:
 
-| Chain | Rule | Purpose |
-| --- | --- | --- |
-| prerouting | `ip saddr 169.254.17.2 && tcp → redirect :15001` | steer **all actor TCP** into atunnel. REDIRECT rather than TPROXY so the original destination is recoverable with `SO_ORIGINAL_DST` |
-| postrouting | `ip saddr 169.254.17.2 → masquerade` | escape hatch for non-TCP traffic, notably DNS over UDP |
-| forward | accept | let the pod kernel route between the actor veth and the pod's `eth0` |
-
-The redirect has no destination or port carve-outs. Everything TCP goes through the tunnel;
-everything non-TCP leaves masqueraded as the worker pod, unauthenticated and unpoliced. The
-`forward` chain's policy is accept. Restricting the masquerade to DNS toward the cluster resolver
-and dropping other non-tunneled egress remains a code TODO.
-
-**Tunneling is turned on by the control plane, not by the actor.** `ate-api-server` is started with
-`--egress-gateway-address=atenet-egress.ate-system.svc:443` in the default install. ateapi
-stamps that address onto every atelet Run/Restore, atelet relays it to ateom, and ateom installs
-the redirect. An empty address means no redirect rule and actor TCP takes the masquerade path.
-The flag is described in the manifest as temporary, pending the egress policy API; it has not
-been retired.
-
-**Fail-closed boot order.** Before any container starts, ateom mints the actor certificate; if that
-fails, the actor does not start. Then it installs the redirect, boots containers, waits for
-readiness, and only then activates atunnel ingress and egress. Between redirect installation and
-activation, redirected connections are accepted and closed, so nothing leaks untunneled.
-
-## atunnel
-
-`atunnel` is a Go package compiled into the ateom binaries. Everything runs in the worker pod,
-nothing in the sandbox, nothing on the host. It opens three listeners at ateom boot:
-
-| Listener | Port | Role |
-| --- | --- | --- |
-| HTTP ingress | `:443` | mTLS reverse proxy from the ingress router to the actor's HTTP port (`169.254.17.2:80`, or the port named by `X-Ate-Target-Port`). Accepts only the router's SPIFFE ID `spiffe://cluster.local/ns/ate-system/sa/atenet-router`. Used by the Envoy ingress dataplane. |
-| CONNECT ingress | `:8443` | mTLS CONNECT listener that relays opaque bytes to an actor port. Used by the agentgateway ingress dataplane as its backend tunnel. |
-| Egress | `:15001` | accepts redirected actor TCP, recovers the original destination, opens an mTLS CONNECT to the egress gateway |
-
-atunnel authenticates to the ingress router and to atelet with the worker's pod certificate
-(`/run/podidentity.podcert.ate.dev`), and verifies the egress gateway's serving certificate
-against the service-DNS trust bundle (`/run/servicedns.podcert.ate.dev`).
-
-The egress tunnel protocol is deliberately minimal:
-
-1. The destination must be a literal `IP:port`; atunnel never sees a hostname.
-2. TCP + TLS to the gateway, presenting the actor certificate. Once the certificate has expired
-   atunnel refuses to present it, so new tunnels fail until renewal succeeds.
-3. A Go HTTP/1.1 `CONNECT <ip:port>` request with ordinary protocol headers, but no identity or
-   authentication headers.
-4. Non-2xx closes the actor's socket. 2xx starts raw byte shuttling with half-close propagation.
-
-Certificate lifecycle (minting is described in IDENTITY.md): renew at 90% of remaining lifetime;
-past expiry, block new tunnels while retrying and let established tunnels drain; stop renewing for
-the activation if the broker says the actor was reassigned or deleted; on checkpoint or suspend,
-force-close every live tunnel. Key and certificate are per activation and in memory only, so
-nothing lands in a snapshot.
-
-## DNS
-
-The actor's `/etc/resolv.conf` is the worker pod's: bind-mounted on gVisor, copied into the
-rootfs on the micro-VM runtime. The actor therefore resolves external names against the cluster
-resolver. Those UDP queries miss the TCP-only redirect and leave masqueraded as the worker pod.
-
-Consequences: the gateway on the default path knows only the destination `IP:port`. The hostname
-the actor resolved, the SNI, the URL, and the protocol all ride opaquely inside the tunnel. The
-threat model lists "do not mount the worker pod's resolv.conf into actors" as an unimplemented
-mitigation.
-
-## Hop by hop: actor to external MCP server
-
-1. The actor resolves `mcp.example.com` over UDP to the cluster resolver; the query is masqueraded
-   out and returns the real external IP.
-2. The actor dials `tcp <mcp-ip>:443`; the default route sends it over the veth.
-3. nftables redirects it to atunnel `:15001`; conntrack records the original destination.
-4. atunnel checks that the activation is live and the certificate unexpired, and recovers
-   `<mcp-ip>:443`.
-5. atunnel dials the egress gateway **from the pod's own IP**, so it does not re-enter the redirect
-   (which matches only the actor's source address), completes mTLS with the actor certificate, and
-   sends `CONNECT <mcp-ip>:443`.
-6. The gateway refuses the handshake unless the client certificate chains to the actor-identity
-   CA. This alone shuts out every non-actor client.
-7. On the Envoy dataplane, ext_proc authenticates the identity and checks the actor is RUNNING:
-   2xx opens the tunnel; 403 or 503 makes atunnel's dial fail and the actor sees a closed
+1. The actor container does not run an egress proxy. The worker's `atunnel`
+   process receives traffic redirected from the actor network namespace.
+2. `atunnel` authenticates to agentgateway with the actor's short-lived mTLS
+   certificate.
+3. The pinned agentgateway v1.5.0 image extracts the actor name and Atespace from
+   the certificate URI SAN for HTTP request metadata and logging. It does not
+   call `ateapi` to prove that the certificate represents the current, running
+   actor incarnation.
+4. No configured component currently enforces the `EgressPolicy` API against a
+   destination. Once the tunnel is accepted, the configured routes proxy the
    connection.
-8. Envoy's dynamic forward proxy dials `<mcp-ip>:443`. The MCP server sees the **gateway pod IP**
-   as its client.
-9. The actor's own TLS handshake with the MCP server now proceeds end-to-end inside the tunnel.
-   The gateway cannot see or modify it.
-10. On suspend, every tunnel is closed. On resume, a new certificate is minted and egress is
-    re-activated on whatever node the actor lands on.
 
-## The default egress gateway: Envoy + atenet ext_proc
+## Actor network namespace
 
-### Shape
+Each actor receives a small, private network namespace created by its worker
+runtime:
 
-One Deployment, two containers, in `manifests/ate-install/atenet-egress.yaml`:
+| Interface | Address | Role |
+|---|---|---|
+| worker-side `ateom0` | `169.254.17.1/30` | Default gateway and interception point |
+| actor-side `eth0` | `169.254.17.2/30` | Actor network interface |
 
-- **Envoy** (digest-pinned v1.39, the same image as the ingress router), fully static config with
-  no xDS. One listener on `:443` bound to `::` with IPv4 compatibility: `require_client_certificate`,
-  `trusted_ca` = the actor-identity CA (loaded from a static filename), serving certificate via filesystem SDS
-  (so kubelet's certificate rotation is picked up). HTTP connection manager with CONNECT upgrade;
-  the full client chain is forwarded to ext_proc in `x-forwarded-client-cert`. The route timeout is
-  disabled because Envoy applies it to the whole lifetime of a CONNECT tunnel. Filter order:
-  **ext_proc (fail closed) → dynamic_forward_proxy → router**. The forward proxy resolves both
-  address families.
-- **ext_proc sidecar** is the `atenet` binary started with `--mode=egress` and
-  `--actor-identity-ca-file`. In egress mode it runs no xDS server, no template controller, and
-  creates no Kubernetes clients at all; the Deployment carries no RBAC. A bad or missing CA file
-  fails startup rather than turning into per-request errors.
+The actor's default route points through `169.254.17.1`. The `ateom` worker
+installs nftables rules in its own pod network namespace:
 
-### The per-CONNECT decision
+- IPv4 TCP sourced from `169.254.17.2` is redirected to local port 15001;
+- non-TCP forwarded traffic is accepted and masqueraded;
+- there are no destination or destination-port exclusions in the redirect
+  rule;
+- the forward chain has an accept policy and the masquerade rule matches the
+  configured actor source address.
 
-For each request the ext_proc handler, in order:
+The redirect is transparent to the actor application. The application opens a
+normal socket and does not need proxy environment variables or CONNECT support.
 
-1. requires the method to be CONNECT;
-2. fails with 503 if no CA roots are loaded (misconfiguration, deliberately not 403);
-3. extracts the certificate chain from `x-forwarded-client-cert`. Exactly one element is
-   required; Envoy's `SANITIZE_SET` makes it the sole writer of that header;
-4. **re-verifies the chain in Go** even though Envoy already did: validity window, leaf is not a
-   CA, an *explicit* ClientAuth EKU (an empty EKU means "any" to Go's verifier, which is a tested
-   regression), chain to the actor-identity roots, and exactly one valid `ActorIdentity` extension
-   with purpose `atunnel`;
-5. requires the atespace and actor name to be syntactically valid resource names; an illegal
-   name implies a compromised CA and is a 403;
-6. calls `GetActor` on ateapi and authorizes on **UID equality** (defeating delete-and-recreate
-   under the same name) and `RUNNING` state. Errors fail closed: not found is 403, unavailable or
-   timeout is 503;
-7. on success returns an **empty response**: no header mutation, no rewrite. The CONNECT proceeds
-   to the forward proxy unchanged.
+### TCP and non-TCP traffic differ
 
-The SPIFFE URI SAN is not used for the built-in CONNECT authorization; only the extension is. The
-SAN appears in Envoy's access log, which is the operational proof that identity came from the
-verified peer certificate rather than from anything atunnel or the actor sent.
+`atunnel` handles TCP only. The current worker rules forward and masquerade all
+IPv4 non-TCP traffic sourced from `169.254.17.2`; UDP, ICMP, and other IPv4
+protocols therefore bypass both `atunnel` and agentgateway. Keeping DNS over UDP
+working is the reason stated in the code, but the rule is broader than DNS. A
+code TODO calls this a compatibility masquerade and says it should be restricted
+to the configured DNS resolver while other non-tunneled traffic is dropped.
 
-The handler does **not** read an egress policy. Step 7's "proceed unchanged" is the only outcome
-after authentication.
+Consequently, the configured agentgateway path does not authorize or observe
+DNS queries, and the current implementation also permits other non-TCP IPv4
+egress outside that path.
 
-### Sharing one binary between ingress and egress safely
+NOTE: We should keep a close eye on this implementation and how it evolves.
 
-The ext_proc mux dispatches on the Envoy-asserted attribute `xds.filter_chain_name` (the egress
-filter chain is named `egress` in the manifest), never on anything in the request. Keying on
-CONNECT would let any external client reach the egress handler and use its errors as an
-actor-existence oracle. An absent or unknown attribute falls through to ingress, whose trust model
-assumes hostile headers, and a mode-restricted instance returns 404 for the direction it does not
-serve. Client-forged `xds.filter_chain_name` headers are tested not to work.
+### Example non-TCP bypasses
 
-Substrate-owned dataplane keys are rooted at `dev.ate.` (for example `dev.ate.authority` for the
-resolved original destination, `dev.ate.actor.identity`, `dev.ate.extproc.direction`), distinct
-from the dotted `ate.` telemetry namespace and the `ate.dev/` label form.
+An actor does not need special Linux capabilities to open a UDP socket. The
+current compatibility masquerade therefore enables examples such as:
 
-| | ingress (`atenet-router`) | egress (`atenet-egress`) |
-| --- | --- | --- |
-| Envoy config | dynamic via xDS from the co-located router | static ConfigMap |
-| Identity model | headers are hostile input; actor looked up by Host | identity only from the verified client certificate |
-| Upstream | original-destination cluster to the worker's atunnel `:443` over mTLS, with the resolved address carried as filter state and `:authority` kept as the actor DNS name; upstream mTLS credentials delivered via SDS so they rotate | dynamic forward proxy to the CONNECT authority, plain TCP |
-| Kubernetes access | actor templates and endpoint slices | none |
-| Extras | request parking and resume-on-demand; HTTP `:8080`, HTTPS `:8443`; arbitrary-port CONNECT ingress on `:8081` and `:8444` (HTTP(S) inside CONNECT, terminated and re-entered through the same ext_proc path) | — |
+- **DNS tunneling or exfiltration.** An actor can encode data in queries for an
+  attacker-controlled domain, either through the configured resolver or by
+  sending UDP port 53 traffic to another reachable resolver. Agentgateway does
+  not receive the queries and cannot associate them with the actor's mTLS
+  identity.
+- **QUIC or HTTP/3 over UDP port 443.** An actor can communicate with an
+  external QUIC endpoint without traversing agentgateway's CONNECT, TLS, or
+  HTTP processing. Gateway-side hostname rules, HTTP inspection, TLS
+  interception, and request logs would not cover that flow.
+- **Custom UDP or DTLS channels.** An actor can send data or maintain a
+  command-and-control channel using an attacker-controlled UDP protocol. Using
+  a common allowed-looking port does not change the path because the worker
+  redirect selects TCP by protocol rather than by destination port.
 
-## The agentgateway dataplane
+ICMP and crafted raw-packet channels are additional possibilities when an
+ActorTemplate grants `NET_RAW`; that capability is absent from the default
+actor capability set.
 
-`hack/install-ate.sh --atenet-router=envoy|agentgateway` selects the ingress and egress dataplane;
-Envoy is the default. With agentgateway, the router and egress Deployments run `agentgateway`
-alone: no Envoy, no `atenet` sidecar. agentgateway's native `substrateIngress` and
-`substrateEgress` policies call ateapi directly over pod-identity mTLS.
+These bypasses are independent of the unfinished `EgressPolicy`
+implementation. Completing policy enforcement at agentgateway will cover only
+traffic that reaches agentgateway; the worker must separately restrict or route
+non-TCP traffic for that policy to form a sandbox-wide egress boundary.
 
-**Ingress.** Public HTTP `:8080` and HTTPS `:8443`; CONNECT ingress on `:8081` and `:8444`
-re-enters an internal HTTP listener. Every worker connection is wrapped in mTLS CONNECT to
-atunnel's `:8443` listener. This supports HTTP(S) inside CONNECT, not raw TCP to arbitrary actor
-ports.
+The namespace receives the node's generated `/etc/resolv.conf`. A typical flow
+is therefore:
 
-**Egress.** An outer `:8443` HTTPS listener validates the actor certificate against the
-actor-identity CA and accepts CONNECT, then re-enters a protocol-detecting internal bind:
+1. the actor resolves a hostname over UDP;
+2. the actor connects to one of the returned IP addresses;
+3. nftables redirects that TCP connection to `atunnel`;
+4. `atunnel` sends the resolved IP address and port as the CONNECT authority.
 
-- inner **HTTP** applies `substrateEgress` against ateapi and forwards to the CONNECT authority;
-- inner **TLS** and generic **TCP** forward to the CONNECT authority with no further policy.
+The original hostname is absent from CONNECT unless the application protocol
+reveals it later.
 
-So on agentgateway, opaque TLS and TCP egress get the outer CA-chain gate only. There is no
-`ActorIdentity` extension or purpose check, and no per-CONNECT UID/RUNNING lookup, on those
-routes. The stronger per-CONNECT behavior described above is specific to the Envoy dataplane.
+> [!CAUTION]
+> This has the same two failure modes encountered with Istio-style transparent
+> egress interception: non-TCP traffic is outside the proxy path, and L4
+> interception sees a resolved destination IP rather than the hostname the
+> application originally used. A future egress policy must address both as one
+> boundary problem: separately restrict or route UDP and other non-TCP traffic,
+> and fail closed when intercepted TCP cannot be associated with an explicitly
+> allowed hostname, IP address, or CIDR. If unmatched or IP-only connections
+> are allowed through, an actor can dial an IP address directly and evade a
+> hostname-only policy even though the TCP connection still traverses
+> agentgateway.
 
-## TLS interception (opt-in)
+## Fail-closed behavior of intercepted TCP
 
-`--experimental-use-sdsmint` deploys a variant of the egress gateway that can terminate recognized
-TLS traffic and re-originate it, so the gateway can see and act on HTTP inside the tunnel.
+The fail-closed property in this section is limited to IPv4 TCP selected by the
+worker's redirect rule. It does not cover the non-TCP compatibility masquerade.
 
-- On Envoy, a separate `sdsmint` sidecar mints a short-lived leaf per SNI on demand and delivers it
-  over SDS. It is a separate container so the interception signing key never lands on the
-  dataplane container.
-- On agentgateway, the native `dynamicCa` feature is used instead; the CA certificate and key are
-  exported into the `egress-mitm-ca-pool` Secret.
+The worker runtime sets up egress in this order:
 
-On the Envoy variant, protocol inspection splits the inner stream three ways: TLS with SNI is
-terminated and parsed as HTTP, cleartext HTTP/h2c is parsed directly, and opaque raw TCP is passed
-through without decryption. A TLS client that omits SNI receives a certificate for
-`sni-required.egress.ate.invalid`, so normal verification fails rather than silently weakening the
-hostname boundary. The agentgateway variant similarly applies its HTTP policy to intercepted HTTP
-while its generic TCP route remains passthrough.
+1. request an actor certificate from `ateapi`;
+2. create the actor network namespace and install the TCP redirect;
+3. start `atunnel` and the actor containers;
+4. wait for actor readiness;
+5. activate the tunnel.
 
-Actors must trust the interception CA or their TLS fails. The trust pipeline: atecontroller
-publishes the `egress-mitm-ca-pool` roots as ClusterTrustBundle
-`egress-mitm.ate.dev:mitm:primary-bundle`; an ActorTemplate declares a `systemInfo` volume with a
-`trustBundle` data source named `egress-mitm.ate.dev`; atelet resolves it on the node and projects
-the PEM into the sandbox on every Run/Restore, on both runtimes. Templates must declare this
-themselves; automatic injection is under review. Runtimes with bundled CA stores (Node.js, for
-instance) also need runtime-specific configuration to honor the projected file. The operator guide
-is `docs/egress-trust-bundle.md`.
+Before activation, redirected TCP connections are accepted locally and closed.
+They do not bypass the gateway. If certificate issuance or tunnel setup fails,
+actor startup fails rather than allowing direct TCP egress.
 
-Interception adds L7 **visibility** for recognized HTTP/HTTPS traffic. Opaque raw TCP remains
-passthrough. Interception does not by itself enforce `EgressPolicy` or inject credentials.
+Deactivation closes active streams. Certificate expiry prevents new tunnels,
+and certificate renewal is attempted at 90 percent of the certificate lifetime.
+The configured actor certificate lifetime is one hour.
 
-### External authorization hook (opt-in)
+## `atunnel`
 
-With the Envoy dataplane and TLS interception enabled,
-`--experimental-additional-egress-extproc-service=<namespace>/<service>:<port>` splices a
-fail-closed external `ext_proc` filter into both inspectable HTTP chains, ahead of dynamic forward
-proxying. Envoy sends request headers plus the verified actor identity in filter state and reaches
-the service over pod-identity mTLS with service-DNS name verification. The hook does not affect
-opaque TCP, and Substrate does not ship the policy or credential-resolution service behind it.
+`atunnel` binds `0.0.0.0:15001` in the worker pod network namespace. In the
+normal transparent flow, the actor does not address that listener or use it as
+an explicit proxy. The actor connects to the original destination IP and port;
+after the packet crosses the sandbox boundary, the worker's nftables REDIRECT
+rule delivers it to local port 15001 while preserving the original destination
+in connection-tracking state.
 
-## Egress policy
+For each connection accepted through that redirect, `atunnel`:
 
-The control plane has an actor egress policy API. No built-in dataplane consumes it.
+1. recovers the socket's original destination;
+2. formats that destination as an IP address and port;
+3. establishes mTLS to `atenet-egress.ate-system.svc:443` using the actor
+   certificate;
+4. sends an HTTP/1.1 `CONNECT <IP>:<port>` request;
+5. relays bytes in both directions after a successful response.
 
-**What exists:**
+Both runtimes expose the same actor IP and gateway and converge on the same
+worker-side veth. Their sandbox-specific path to that veth differs:
 
-- `GetActorEgressPolicy`, `CreateActorEgressPolicy`, `UpdateActorEgressPolicy`,
-  `DeleteActorEgressPolicy` on the `Control` service, persisted in PostgreSQL, deleted with the
-  actor.
-- One `EgressPolicy` per actor, named `default`. `rules` are evaluated in order; the first
-  matching rule authorizes the request and only its effects apply; a request with no matching rule
-  is denied.
-- Each `EgressRule` has exactly one matcher: `hostnames` (lowercase DNS names, optionally a single
-  `*` replacing the leftmost label), `ip_blocks` (canonical IPv4/IPv6 CIDRs against the original
-  destination IP), or `all`.
-- Effects exist only on hostname rules: `inject_static_headers`, a list of
-  `{header, prefix, credential_uri}` where `credential_uri` is a
-  `substrate-secret://<provider-class>/<provider-name>/<tail>` reference to be interpreted by a
-  registered credential provider.
-- Validation is declarative and thorough (unique header names, well-formed names and CIDRs,
-  policy atespace matching the actor's).
+| Runtime | Path from the actor network stack to the veth |
+|---|---|
+| gVisor | gVisor `eth0` -> AF_PACKET endpoint -> interior `eth0` |
+| microVM | guest `eth0` -> virtio-net -> TAP -> traffic-control redirect -> interior `eth0` |
 
-**What does not exist:**
+The interior `eth0` is paired with worker-side `ateom0`:
 
-- No built-in enforcement point reads the policy: not the Envoy ext_proc handler, not agentgateway's
-  shipped configuration, not atunnel. The policy is not carried in the atelet or ateom protocols.
-- No credential provider registry and nothing that resolves a `substrate-secret://` URI into a
-  header value. The injection field is inert.
-- The `--egress-gateway-address` flag the policy API was meant to replace is still how tunneling
-  is enabled.
-
-**Open PRs, not on `main`:**
-[PR #1335](https://github.com/agent-substrate/substrate/pull/1335) adds a credential-provider gRPC
-service that resolves `substrate-secret://kubernetes.io/...` references to Kubernetes Secrets.
-[PR #1360](https://github.com/agent-substrate/substrate/pull/1360) adds a separate ext_proc for the
-gateway's decrypted TLS-interception leg; it fetches the actor's egress policy, matches the
-destination hostname, and sets the resolved credential as a request header. The generic
-external-processor hook described above is on `main`, but these concrete provider and enforcement
-implementations are not.
-
-Two structural notes for the MCP scenario. First, header injection attaches only to *hostname*
-rules, so it presupposes the gateway knows the hostname, which means TLS interception or an
-L7-aware dataplane, not the default opaque CONNECT path. Second, the non-TCP masquerade path
-described under [Interception](#interception) bypasses the gateway entirely, so any destination
-policy is only as strong as that hole is closed.
-
-## Trust bundles at the gateway
-
-| Bundle | Signs | Used by whom to verify whom | Rotation today |
-| --- | --- | --- | --- |
-| Actor-identity CA (`actor-id-ca-pool` Secret; signing key mounted only in ateapi) | actor certificates | gateway downstream `trusted_ca`; Envoy ext_proc re-verification | the gateway's copy is a cert-only Secret `actor-id-ca-certs`, derived at install by the installer and loaded from a static filename; nothing refreshes it, and SDS does not cover `trusted_ca`, so rotating the actor CA means re-deriving the Secret and restarting the gateway |
-| Pod identity | atelet, workers, router and control-plane pods | broker socket; router↔worker atunnel ingress; ateapi client auth | Kubernetes PodCertificateRequests and ClusterTrustBundles; projected volumes rotate |
-| Service DNS | in-cluster serving certificates | atunnel verifying the gateway's serving certificate | the gateway's serving cert is loaded via filesystem SDS, so `watched_directory` fires on kubelet rotation |
-| Interception CA (`egress-mitm-ca-pool`) | per-SNI leaves in interception mode | actors, via `systemInfo.trustBundle` | published as a ClusterTrustBundle by atecontroller |
-
-## Verification cookbook (`kind-substrate`)
-
-These commands exercise the actual deployed path and inspect the selected dataplane. Install the
-core system before the demo:
-
-```bash
-# Omit --atenet-router=agentgateway to use the default Envoy dataplane.
-hack/install-ate-kind.sh --atenet-router=agentgateway --deploy-ate-system
-hack/install-ate-kind.sh --deploy-demo-egress
+```text
+actor sandbox                  interior netns       ateom worker pod netns
+eth0: 169.254.17.2/30  ------> eth0  <--- veth ---> ateom0: 169.254.17.1/30
+                                                            |
+                                                 atunnel: 0.0.0.0:15001
 ```
 
-The checks require `kubectl`, `kubectl-ate`, `jq`, `openssl`, and `curl`. The demo test owns the
-default `ate-demo-egress/egress-demo` actor and `egress-target` namespace; do not repoint it at
-shared resources.
+The gVisor actor cannot inspect or administer the worker namespace, and the
+microVM guest cannot inspect or administer the host-side interior or worker
+namespaces. Both can still send IP traffic through their virtual network path to
+addresses exposed on the other side. Namespace and VM isolation protect network
+configuration and ownership; the virtual NIC, TAP, and veth deliberately
+provide network connectivity across those boundaries. For an external
+destination, `169.254.17.1` is the next-hop gateway while the packet's IP
+destination remains external. For a deliberate connection to
+`169.254.17.1:15001`, that gateway address is itself the IP destination. Both
+packets reach worker-side `ateom0`.
 
-```bash
-export CTX=kind-substrate
-export ATESPACE=ate-demo-egress
-export ACTOR=egress-demo
+There is a separate reachability detail: `169.254.17.1` is the actor's adjacent
+gateway address, `atunnel` uses a wildcard bind, and the worker rules do not
+include an input filter that hides port 15001. A deliberate actor connection to
+`169.254.17.1:15001` is therefore technically able to reach the listener. It is
+not a configured proxy interface: `atunnel` still derives the CONNECT authority
+from the kernel's original-destination state rather than accepting a
+caller-supplied target. If the intended security property is that actors cannot
+address the listener directly, the current bind and nftables rules do not
+provide that property.
+
+> [!CAUTION]
+> Track direct addressing of the egress listener as a hardening question and
+> test it for both gVisor and microVM workers. Because the PREROUTING rule sends
+> every selected actor TCP connection to port 15001 before the INPUT path, an
+> actor connection originally addressed to worker ports 443, 8443, or 8080 also
+> reaches the egress `atunnel`, not the worker service bound to that original
+> port. The concern is therefore limited to how `atunnel` handles worker-local
+> original destinations and adversarial connection patterns; the other
+> wildcard-bound TCP listeners are not directly exposed through this path while
+> the redirect is installed. If worker-local destinations have no valid egress
+> use, `atunnel` or the worker rules should reject them explicitly.
+
+`atunnel` does not add actor identity headers to CONNECT. Authentication comes
+from the client certificate. The relay supports TCP half-close so protocols that
+depend on an EOF in one direction can complete normally.
+
+The default install supplies the gateway address with:
+
+```text
+--egress-gateway-address=atenet-egress.ate-system.svc:443
 ```
 
-### Identify the installed dataplane and exact images
+## What agentgateway can observe
 
-```bash
-git fetch upstream main
+Visibility depends on the application protocol inside CONNECT.
 
-kubectl --context "$CTX" -n ate-system rollout status \
-  deployment/atenet-egress --timeout=120s
+| Traffic | Information visible to agentgateway | Information protected from agentgateway |
+|---|---|---|
+| Any tunneled TCP | Actor mTLS identity and CONNECT destination IP:port | None of the connection metadata listed at left |
+| Clear HTTP | Method, host, path, headers, and body | Nothing at the HTTP layer |
+| HTTPS passthrough | TLS ClientHello metadata, normally including SNI; connection sizes and timing | HTTP method, path, headers, body, and response content |
+| Other TCP | CONNECT destination plus connection sizes and timing | Application bytes, when the application encrypts them |
 
-kubectl --context "$CTX" get deployment -n ate-system \
-  ate-api-server atenet-router atenet-egress -o json |
-  jq -r '.items[] | .metadata.name as $deployment |
-    .spec.template.spec.containers[] |
-    [$deployment,.name,.image] | @tsv'
+The outer listener sees the CONNECT request. After CONNECT, it forwards the
+stream into an inner listener configured with `protocol: AUTO`. The inner
+listener selects an HTTP, TLS, or generic TCP route.
 
-kubectl ate --context "$CTX" get actor-template egress \
-  -a "$ATESPACE" -o json |
-  jq -r '.actorTemplates[0].containers[] | [.name,.image] | @tsv'
+For HTTPS passthrough, destination information can therefore appear in two
+places:
 
-kubectl --context "$CTX" exec -n ate-system deploy/ate-api-server -- \
-  /ko-app/ateapi --version
-kubectl --context "$CTX" exec -n "$ATESPACE" deploy/egress -- \
-  /ko-app/ateom-gvisor --version
+- CONNECT carries the resolved destination IP and port;
+- the TLS ClientHello commonly carries the hostname as SNI.
 
-API_VERSION="$(kubectl --context "$CTX" exec -n ate-system \
-  deploy/ate-api-server -- /ko-app/ateapi --version)"
-DEPLOYED_COMMIT="$(printf '%s\n' "$API_VERSION" |
-  sed -E 's/.*commit=([0-9a-f]{40}).*/\1/')"
+These values need not agree. The current configuration does not define a policy
+that compares them.
 
-if test "$DEPLOYED_COMMIT" = "$(git rev-parse upstream/main)"; then
-  echo 'ateapi commit exactly matches upstream/main'
-elif git diff --quiet "$DEPLOYED_COMMIT"..upstream/main -- . \
-  ':(exclude)docs/**'; then
-  echo 'deployed source matches; upstream differs only under docs/'
-else
-  echo 'deployment is missing upstream source changes' >&2
-  false
-fi
+## Shipped agentgateway deployment
+
+The `agentgateway-egress` installation overlay deploys one agentgateway
+container using:
+
+```text
+cr.agentgateway.dev/agentgateway:v1.5.0
 ```
 
-The first container name in `atenet-router` and `atenet-egress` is `envoy` or `agentgateway`.
-Every locally built image should have a digest, and the Substrate binaries should report the
-revision intended for the install. A `-dirty` suffix is expected for images built with local
-changes. The final check also accepts a newer docs-only upstream commit, since that does not
-change an image's executable source.
+The Kubernetes Service exposes port 443 and targets the container's named port,
+which listens on 8443. The egress pod does not contain an `atenet` sidecar.
 
-### Confirm tunneling is enabled and inspect the live gateway config
+The checked-in configuration lives in the
+`atenet-egress-agentgateway-substrate-config` ConfigMap. It defines two logical
+stages in the same process.
 
-```bash
-kubectl --context "$CTX" get deployment -n ate-system ate-api-server -o json |
-  jq -r '.spec.template.spec.containers[0].args[] |
-    select(startswith("--egress-gateway-address="))'
+### Outer listener
 
-DATAPLANE="$(kubectl --context "$CTX" -n ate-system \
-  get deployment/atenet-egress \
-  -o jsonpath='{.spec.template.spec.containers[0].name}')"
+The outer listener:
 
-case "$DATAPLANE" in
-  envoy)
-    kubectl --context "$CTX" -n ate-system get configmap atenet-egress \
-      -o go-template='{{index .data "envoy.yaml"}}'
-    ;;
-  agentgateway)
-    kubectl --context "$CTX" -n ate-system get configmap \
-      atenet-egress-agentgateway-substrate-config \
-      -o go-template='{{index .data "config.yaml"}}'
-    ;;
-  *)
-    printf 'unsupported dataplane: %s\n' "$DATAPLANE" >&2
-    exit 1
-    ;;
-esac
+- binds to port 8443;
+- terminates mTLS using the gateway serving certificate;
+- trusts the actor identity CA bundle mounted at
+  `/run/actor-id-ca-certs/ca.crt`;
+- accepts HTTP CONNECT;
+- sends the CONNECT stream to the inner listener;
+- preserves the authenticated peer identity for inner HTTP processing.
+
+A certificate from an unrelated CA fails during the TLS handshake. That is the
+principal fail-closed identity check currently exercised by the local demo.
+
+### Inner listener
+
+The inner listener uses automatic protocol detection:
+
+- the HTTP route applies the `substrateEgress` policy and forwards to the
+  CONNECT authority;
+- the TLS route passes encrypted TLS traffic to the CONNECT authority;
+- the TCP route passes all remaining streams to the CONNECT authority.
+
+The HTTP policy is not applied to the TLS or generic TCP routes in the pinned
+configuration.
+
+## Exact behavior of `substrateEgress` in v1.5.0
+
+The version pinned by this repository must be the reference point for security
+claims. In agentgateway v1.5.0, `substrateEgress`:
+
+1. reads the authenticated peer's SPIFFE URI SAN;
+2. extracts the Atespace and actor name from the expected URI path;
+3. validates the resource-name shape;
+4. adds the extracted values to request metadata used by logging.
+
+It does not:
+
+- parse the custom ActorIdentity certificate extension;
+- extract or validate the actor UID;
+- validate the certificate purpose as `atunnel`;
+- call `GetActor` on `ateapi`;
+- require the actor to exist;
+- compare the certificate UID with the current actor UID;
+- require the actor phase to be `RUNNING`;
+- evaluate an `EgressPolicy`;
+- decide whether the requested host, IP, or port is allowed.
+
+The configured `ateapi` client is consequently unused by this v1.5.0 policy
+implementation. The v1.5.0 test also describes egress authorization as not yet
+implemented and expects no control-plane calls.
+
+This has a direct security implication: a valid, unexpired actor certificate
+issued by the trusted actor CA is sufficient to establish the outer tunnel.
+The shipped gateway does not prove at CONNECT time that it belongs to the
+current incarnation of a running actor.
+
+### Later upstream implementation
+
+Upstream agentgateway merged
+[`substrate: authorize actor egress at CONNECT time`](https://github.com/agentgateway/agentgateway/pull/3237)
+after the v1.5.0 tag. That change moves authorization to the CONNECT frontend,
+parses the ActorIdentity extension, checks the `atunnel` purpose, calls
+`GetActor`, compares UIDs, and requires a running actor.
+
+Those checks are not present merely because the upstream change exists. Using
+them requires both a newer image and the corresponding frontend-policy
+configuration. The configuration in this repository still places
+`substrateEgress` on the inner HTTP route.
+
+## Identity and trust material
+
+The egress path uses two distinct certificate relationships.
+
+| Relationship | Presenter | Verifier | Purpose |
+|---|---|---|---|
+| Actor identity | `atunnel` | agentgateway outer listener | Authenticate the actor tunnel |
+| Gateway service identity | agentgateway | `atunnel` | Authenticate the gateway endpoint |
+
+The actor certificate contains a SPIFFE URI SAN and a custom ActorIdentity
+extension. The control plane produces certificates with an `atunnel` purpose.
+The pinned gateway validates the certificate chain and consumes the URI SAN, but
+does not enforce the custom extension fields described above.
+
+The actor CA bundle is projected into the gateway pod. The install path creates
+the derived trust secret when it does not already exist. Rotating that CA
+requires regenerating the derived material and ensuring the gateway consumes the
+new bundle.
+
+The gateway serving certificate and key are projected separately. `atunnel`
+uses its configured trust roots and expected server identity when establishing
+the outer TLS connection.
+
+## Optional TLS interception overlay
+
+The `agentgateway-egress-mitm` overlay changes the inner TLS route from
+passthrough to HTTPS interception with a dynamic certificate authority. It
+mounts the interception certificate and key at:
+
+```text
+/run/egress-mitm/tls.crt
+/run/egress-mitm/tls.key
 ```
 
-The ateapi flag should name `atenet-egress.ate-system.svc:443`. On Envoy, look for required
-client certificates, the actor CA, CONNECT, fail-closed `ext_proc`, and dynamic forward proxying.
-On agentgateway, the outer HTTPS listener should use the actor CA; the inner HTTP route should
-carry `substrateEgress`, while the TLS and TCP routes only forward to the CONNECT authority. That
-visible split is the reason the agentgateway caveat in this document is explicit.
+With this overlay, agentgateway can terminate destination TLS, observe and proxy
+HTTP, and establish a separate TLS connection to the destination. Actors must
+trust the interception CA for this to succeed without application TLS errors.
+The project distributes that trust through the cluster trust-bundle machinery.
 
-### Fingerprint the actor CA trusted by the gateway
+The overlay does not, by itself, add destination authorization or current-actor
+validation to v1.5.0. Generic non-TLS TCP remains passthrough.
 
-```bash
-kubectl --context "$CTX" get secret actor-id-ca-certs -n ate-system \
-  -o jsonpath='{.data.ca\.crt}' |
-  base64 -d |
-  openssl x509 -noout -subject -issuer -fingerprint -sha256
+## `EgressPolicy` API status
 
-kubectl --context "$CTX" get secret actor-id-ca-certs -n ate-system -o json |
-  jq -r '.data | keys[]'
-```
+Agent Substrate defines an `EgressPolicy` control-plane API with validation,
+CRUD operations, and persistence. That API is not wired into the shipped
+agentgateway routes or `atunnel`.
 
-The gateway copy should expose only `ca.crt`, never the actor CA signing key.
+As a result, creating an `EgressPolicy` does not currently cause this data plane
+to allow or deny a destination. Documentation and tests should avoid treating
+API storage as runtime enforcement.
 
-### Run the positive and negative end-to-end proof
+There is also no production credential-provider or credential-injection path in
+this egress flow. TLS interception provides protocol visibility; it does not
+imply that credentials are injected or managed.
 
-```bash
-KUBECTL_CONTEXT="$CTX" demos/egress/test-egress.sh
-```
+## Verification
 
-The script proves all of the following in one run:
+The following checks target only the agentgateway deployment.
 
-- a real RUNNING actor can make an ordinary HTTP request without proxy configuration;
-- the target sees the egress gateway pod IP as its client;
-- the selected gateway logs the CONNECT;
-- a pod with a valid pod-identity certificate, but no actor certificate, cannot open the tunnel;
-- the failed client-certificate handshake produces no successful CONNECT.
-
-The script cleans up its actor, target namespace, and probe by default. To retain them for
-the next inspection block, run with `KEEP=1`; remove them afterward:
+### Confirm the installed image
 
 ```bash
-KEEP=1 KUBECTL_CONTEXT="$CTX" demos/egress/test-egress.sh
-KUBECTL_CONTEXT="$CTX" demos/egress/test-egress.sh --cleanup
+kubectl -n ate-system get deployment atenet-egress \
+  -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
 ```
 
-### Inspect current actor placement and gateway evidence
+Expected container and image:
 
-This assumes the demo actor exists, either from the install or a `KEEP=1` test run.
+```text
+agentgateway    cr.agentgateway.dev/agentgateway:v1.5.0
+```
+
+The startup log should also report agentgateway version 1.5.0.
+
+### Inspect the active configuration
 
 ```bash
-kubectl ate --context "$CTX" get actors "$ACTOR" -a "$ATESPACE" -o json |
-  jq '.actors[0] | {
-    uid: .metadata.uid,
-    state: .status.state,
-    worker: .status.workerAssignment.worker.name,
-    workerPod: .status.workerAssignment.workerPod,
-    workerPodIP: .status.workerAssignment.workerPodIp
-  }'
-
-kubectl --context "$CTX" get pods -n "$ATESPACE" \
-  -l ate.dev/worker-pool=egress -o wide
-
-DATAPLANE="$(kubectl --context "$CTX" -n ate-system \
-  get deployment/atenet-egress \
-  -o jsonpath='{.spec.template.spec.containers[0].name}')"
-
-case "$DATAPLANE" in
-  envoy) ACCESS_LOG_PATTERN='\[egress\]' ;;
-  agentgateway) ACCESS_LOG_PATTERN='substrate.connect.authority' ;;
-esac
-
-kubectl --context "$CTX" -n ate-system logs deployment/atenet-egress \
-  -c "$DATAPLANE" --tail=-1 |
-  grep -E "$ACCESS_LOG_PATTERN" |
-  tail -n 10
+kubectl -n ate-system get configmap \
+  atenet-egress-agentgateway-substrate-config -o yaml
 ```
 
-Envoy entries carry the actor SPIFFE SAN and response code. agentgateway entries carry the
-CONNECT authority and, for its HTTP path, the resolved actor and atespace attributes.
+Confirm the outer CONNECT listener, the inner `protocol: AUTO` listener, and
+the HTTP/TLS/TCP routes described above. Configuration should be checked along
+with the image version because the location of `substrateEgress` determines
+which protocols it covers.
 
-### Confirm Kubernetes NetworkPolicy is not the egress enforcement point
+### Exercise the local demo
 
 ```bash
-kubectl --context "$CTX" get networkpolicy -n "$ATESPACE" -o json |
-  jq '.items[] | {
-    name: .metadata.name,
-    podSelector: .spec.podSelector,
-    policyTypes: .spec.policyTypes,
-    egress: .spec.egress
-  }'
+demos/egress/test-egress.sh
 ```
 
-The generated worker policy should list only `Ingress`, with `egress: null`. This confirms the
-current deployment does not use Kubernetes NetworkPolicy for outbound enforcement; it does not,
-by itself, prove the nftables rules inside the actor network namespace.
+The positive case sends clear HTTP through the actor tunnel and can demonstrate:
 
-### Check whether TLS interception is installed
+- actor TCP interception;
+- successful actor-CA authentication;
+- CONNECT through the agentgateway Service;
+- an HTTP request reaching the destination;
+- actor name and Atespace appearing in gateway logs.
+
+The negative case presents a certificate from the pod identity CA. A TLS
+`UnknownIssuer` failure demonstrates that the gateway rejects a client chain
+outside the configured actor CA.
+
+This demo does not demonstrate:
+
+- ActorIdentity UID or purpose validation;
+- a `GetActor` lookup;
+- rejection of a deleted, replaced, or non-running actor;
+- enforcement of `EgressPolicy` destinations;
+- TLS interception policy;
+- credential injection.
+
+### Probe direct addressing of worker-side `atunnel`
+
+With the demo actor running, forward the ingress router in one terminal:
 
 ```bash
-kubectl --context "$CTX" get clustertrustbundle \
-  'egress-mitm.ate.dev:mitm:primary-bundle' 2>/dev/null ||
-  echo 'TLS interception trust bundle is not installed'
+kubectl -n ate-system port-forward service/atenet-router 18101:80
 ```
 
-Absence is expected for the default install. When interception is enabled, inspect the
-ActorTemplate too: it must explicitly declare a `systemInfo.trustBundle` source for
-`egress-mitm.ate.dev`; the bundle is not injected automatically.
-
-### Audit the policy API versus shipped enforcement
+Ask the actor to connect to the worker-side gateway address and egress-listener
+port:
 
 ```bash
-rg -n 'rpc (Get|Create|Update|Delete)ActorEgressPolicy' \
-  pkg/proto/ateapipb/ateapi.proto
-
-if rg -n 'GetActorEgressPolicy|ActorEgressPolicy' \
-  cmd/atenet/internal/router/egress \
-  internal/atunnel \
-  manifests/ate-install/atenet-egress.yaml \
-  manifests/ate-install/components/agentgateway; then
-  echo 'unexpected built-in policy-consumer match' >&2
-  exit 1
-else
-  echo 'no built-in egress dataplane policy consumer found'
-fi
+curl -i -X POST http://127.0.0.1:18101/ \
+  -H 'Host: egress-demo.ate-demo-egress.actors.resources.substrate.ate.dev' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"http://169.254.17.1:15001/"}'
 ```
 
-The first command shows the CRUD surface. The second is a source-tree guardrail for the current
-claim that neither shipped dataplane nor atunnel consumes it. Because absence checks can become
-stale as files move, treat a new match as a prompt to review the implementation and this document,
-not automatically as a regression.
-
-### Run focused egress regressions
+Then inspect recent agentgateway logs:
 
 ```bash
-go test ./internal/atunnel \
-  ./cmd/atenet/internal/router/egress \
-  ./cmd/atenet/internal/router/extproc \
-  ./cmd/ateapi/internal/controlapi -count=1
+kubectl -n ate-system logs deployment/atenet-egress -c agentgateway \
+  --since=1m | grep 'substrate.connect.authority="169.254.17.1:15001"'
 ```
 
-These cover CONNECT exchange and rejection, activation ordering, renewal/expiry/deactivation,
-certificate verification, actor UID/RUNNING authorization, ext_proc direction hardening, and the
-egress-policy CRUD and validation API. The nftables package is Linux-only; run its tests on a
-Linux development host or in the repository's Linux CI environment:
+A matching log entry proves the following chain occurred:
+
+1. the actor addressed `169.254.17.1:15001`;
+2. the packet crossed the sandbox boundary and reached the worker's redirect;
+3. worker-side `atunnel` accepted the connection and recovered
+   `169.254.17.1:15001` as its original destination;
+4. `atunnel` authenticated to agentgateway and sent that value as the CONNECT
+   authority.
+
+The actor may receive `503 Service Unavailable` because agentgateway cannot
+connect to that worker-local address from the gateway pod. That status is not
+the reachability proof; the authenticated agentgateway log containing the exact
+CONNECT authority is. The standard `egress` demo actor uses gVisor. Repeat the
+same probe with the microVM demo template to verify the equivalent live path for
+that runtime.
+
+### Inspect logs
 
 ```bash
-go test ./internal/ateomnet -count=1
+kubectl -n ate-system logs deployment/atenet-egress -c agentgateway
 ```
 
-## What is real, and what is not
+For clear HTTP, logs can include the extracted actor metadata and request
+details. For passthrough TLS and opaque TCP, do not infer HTTP-layer visibility
+or control-plane authorization from a successful connection log.
 
-**Real and tested**
+### Run focused unit tests
 
-- Transparent nftables interception with original-destination recovery, and fail-closed
-  activation ordering.
-- Per-actor one-hour certificates with the `ActorIdentity` extension, brokered
-  ateom → atelet → ateapi: node name and node UID binding on the worker↔atelet hop, and node
-  name plus reciprocal worker↔actor assignment checks at ateapi; renewal at 90% of lifetime; in
-  memory only.
-- Envoy egress gateway: mTLS gate at the handshake, CONNECT termination, dynamic forward proxy,
-  ext_proc re-verification plus UID/RUNNING check, fail closed everywhere, zero Kubernetes access.
-- Direction dispatch hardened against client forgery.
-- agentgateway as a full alternative dataplane for ingress and egress, with native
-  `substrateIngress`/`substrateEgress` policies.
-- Opt-in TLS interception on both dataplanes, and the ClusterTrustBundle → `systemInfo.trustBundle`
-  pipeline to deliver the interception CA into sandboxes.
-- An Envoy-only install hook for a separately supplied, fail-closed ext_proc on the decrypted HTTP
-  legs.
-- The egress policy API in the control plane (CRUD, validation, persistence).
-- Arbitrary-port CONNECT **ingress** (HTTP(S) inside CONNECT).
-- Demo (`demos/egress/`, written to work on either dataplane) and e2e suites
-  (`internal/e2e/suites/{networking,egressauthz,egressmitm,identity}`).
+```bash
+go test ./internal/atunnel ./cmd/ateapi/internal/controlapi -count=1
+```
 
-**Demo readiness.** A full end-to-end demo of transparent egress plus actor-certificate identity
-runs today on either dataplane. Substrate's credential provider and injection implementation is
-not on `main`; the generic external ext_proc hook requires a separately supplied service.
+These cover tunnel and control-plane components, but they do not substitute for
+an integration test against the exact agentgateway image and configuration.
 
-**Not yet**
+## Current capabilities and gaps
 
-| Gap | Where it shows |
-| --- | --- |
-| No built-in destination enforcement: the policy API exists but no shipped PEP reads it | egress ext_proc handler; agentgateway egress config |
-| No built-in upstream credential or token injection: `credential_uri` has no provider registry or resolver | egress policy API |
-| Non-TCP actor egress bypasses the gateway via masquerade; `forward` chain is accept | `internal/ateomnet` nftables rules |
-| Actor networking and original-destination recovery are IPv4-only (the gateway side is not the blocker) | `internal/ateomnet`, `internal/atunnel` |
-| Envoy path does a control-plane `GetActor` on every CONNECT; a load concern | egress ext_proc handler |
-| agentgateway opaque TLS/TCP routes have only the outer CA gate, no extension/purpose or UID/RUNNING check | agentgateway egress config |
-| Kubernetes NetworkPolicy egress is deliberately unmanaged; the nftables redirect is the only enforcement, and an empty `--egress-gateway-address` puts actor TCP on the masquerade path | atecontroller NetworkPolicy controller |
-| Actor-identity trust bundle at the gateway is a hand-derived install-time Secret with no rotation path | installer; egress manifest `trusted_ca` |
-| Drain policy for long-lived CONNECT tunnels on gateway shutdown is undecided | egress manifest |
-| Actor JWT / OIDC federation: mint exists, uncalled; issuer not OIDC-compliant; no actor-database cross-check | `ActorIdentity.MintJWT` |
-| Raw TCP (non-HTTP) public ingress to arbitrary actor ports | both ingress dataplanes |
-| Automatic injection of the interception trust bundle into every actor | atelet / ateapi ([PR #1252](https://github.com/agent-substrate/substrate/pull/1252)) |
-| The egress redirect port `15001` collides with Istio's outbound listener on meshed clusters; [PR #1429](https://github.com/agent-substrate/substrate/pull/1429) proposes avoiding the collision | `internal/ateomnet`, WorkerPool controller |
-| Actor addressing on ingress by Host header is under debate; [PR #1333](https://github.com/agent-substrate/substrate/pull/1333) proposes explicit actor and atespace headers | ingress router |
+| Capability | Current status |
+|---|---|
+| Complete sandbox network-egress lockdown | Not implemented |
+| Transparent expected-source actor IPv4/TCP interception | Implemented |
+| Fail-closed path for redirected TCP before tunnel activation | Implemented |
+| Anti-bypass enforcement against a network-privileged actor | Not established; source-only match and permissive forwarding need hardening |
+| Non-TCP IPv4 enforcement through agentgateway | Not implemented; current rules forward and masquerade it |
+| Actor mTLS certificate required by the gateway | Implemented |
+| Clear HTTP parsing and proxying | Implemented |
+| TLS ClientHello/SNI inspection with payload passthrough | Implemented |
+| Optional HTTP visibility through TLS interception overlay | Implemented |
+| Actor name and Atespace extraction for HTTP metadata | Implemented in pinned v1.5.0 |
+| Actor UID and certificate-purpose validation at CONNECT | Not implemented in pinned v1.5.0 |
+| Current actor lookup and `RUNNING` check | Not implemented in pinned v1.5.0 |
+| Destination allow/deny enforcement from `EgressPolicy` | Not wired to the data plane |
+| DNS authorization through the gateway | Not implemented; DNS normally uses the non-TCP bypass |
+| Credential injection | Not implemented |
 
-## File map
+## Code and manifest map
 
-| Area | Files |
-| --- | --- |
-| Interception and actor network | `internal/ateomnet` |
-| Tunnel (ingress, CONNECT ingress, egress, credential) | `internal/atunnel` |
-| Sandbox supervisor wiring | `cmd/ateom-gvisor`, `cmd/ateom-microvm` |
-| Node credential broker | `cmd/atelet` (`credentialbroker.go`); client side `internal/ateletdial` |
-| Certificate and JWT minting | `cmd/ateapi/internal/actoridentity`, `cmd/ateapi/internal/ateletauth`, `internal/actoridjwt` |
-| X.509 extensions | `internal/substratex509` |
-| CA pools | `internal/localca`; `kubectl ate admin make-ca-pool`; `hack/install-ate.sh` |
-| Envoy egress ext_proc | `cmd/atenet/internal/router/egress`, `cmd/atenet/internal/router/extproc` |
-| TLS interception | `cmd/atenet/internal/sdsmint`; `manifests/ate-install/atenet-egress-with-sdsmint.yaml`; `manifests/ate-install/components/agentgateway-egress-mitm` |
-| Optional external egress processor | `hack/experimental-additional-egress-extproc.sh`; `hack/install-ate.sh` |
-| Gateway deployments | `manifests/ate-install/atenet-egress.yaml`; `manifests/ate-install/components/agentgateway` |
-| Control-plane opt-in | `cmd/ateapi` (`--egress-gateway-address`); `manifests/ate-install/ate-api-server.yaml` |
-| Egress policy API | `pkg/proto/ateapipb/ateapi.proto`; `cmd/ateapi/internal/controlapi/egress_policy.go` |
-| Interception trust pipeline | `cmd/atecontroller` (`EgressMITMTrustReconciler`); `cmd/atelet` (`trustbundle.go`, `systemInfo` projection) |
-| Demo and e2e | `demos/egress`; `internal/e2e/suites/{networking,egressauthz,egressmitm}` |
+| Area | Path |
+|---|---|
+| Actor network namespace and redirect | `internal/ateomnet/` |
+| Tunnel implementation | `internal/atunnel/` |
+| Actor certificate request and renewal | `internal/atunnel/` and `cmd/atelet/credentialbroker.go` |
+| Actor certificate issuance | `cmd/ateapi/internal/controlapi/` |
+| agentgateway base deployment | `manifests/ate-install/components/agentgateway/` |
+| agentgateway egress configuration | `manifests/ate-install/components/agentgateway/configmap.yaml` |
+| Standard agentgateway egress overlay | `manifests/ate-install/agentgateway-egress/` |
+| TLS interception overlay | `manifests/ate-install/components/agentgateway-egress-mitm/` |
+| Egress demo | `demos/egress/` |
+| Egress control-plane API | `pkg/proto/ateapipb/` and `cmd/ateapi/internal/controlapi/` |
