@@ -43,13 +43,13 @@ certificate carries a SPIFFE URI SAN, but there is no external federation yet.
 
 | Component | Role | Where |
 | --- | --- | --- |
-| `ActorIdentity` service | Issues actor credentials: `MintCert` (X.509) and `MintJWT` (JWT) | `cmd/ateapi/internal/actoridentity`, `pkg/proto/ateapipb` |
+| `Control` service (identity RPCs) | Issues actor credentials: `MintActorCertificate` (X.509) and `MintActorJWT` (JWT) | `cmd/ateapi/internal/controlapi/actor.go`, `pkg/proto/ateapipb` |
 | Actor-identity CA | Signs actor certificates; the cached, rotation-ready signing pool is mounted only into ateapi | `internal/localca`; Secret `actor-id-ca-pool` |
 | JWT authority pool | Signs actor JWTs; cached, with a selectable active signing key | `internal/localjwtauthority`, `internal/actoridjwt` |
 | X.509 extensions | `ActorIdentity` and `PodIdentity` custom extensions | `internal/substratex509` |
-| atelet caller authentication | Verifies that an ateapi caller is atelet, by SPIFFE ID and `PodIdentity` extension | `cmd/ateapi/internal/ateletauth` |
+| atelet caller authentication | Verifies that an ateapi caller is atelet, by SPIFFE ID and `PodIdentity` extension. Since #1315 it guards only `WorkerService` capacity reporting, **not** the minting RPCs | `cmd/ateapi/internal/ateletauth` |
 | atelet dialer | Shared client TLS configuration for reaching atelet's node socket, including the same-node check | `internal/ateletdial` |
-| Credential broker | atelet's node-local gRPC service that relays certificate requests from workers to ateapi | `cmd/atelet` (`credentialbroker`), `internal/proto/ateletpb` |
+| `AteomSupport` service | atelet's node-local gRPC service that relays certificate requests from workers to ateapi, and takes their capacity reports | `cmd/atelet` (`ateomsupport.go`), `internal/proto/ateletpb` |
 | atunnel | A library in the ateom process, outside the actor sandbox; holds the actor's private key and presents the actor certificate on egress | `internal/atunnel` |
 | Pod identity | SPIFFE certificates for control-plane pods, atelet, and workers via Kubernetes PodCertificateRequests | `cmd/podcertcontroller` |
 | ateapi authentication | mTLS client certs and configurable OIDC/JWT providers | `internal/ateapiauth`, `cmd/ateapi/internal/oidcjwt`, `docs/authentication.md` |
@@ -63,7 +63,7 @@ State (actors, workers, assignments, egress policies) lives in PostgreSQL.
 K8s node
 ├── 1 × atelet  (DaemonSet named atelet-<version>, nodes labeled ate.dev/substrate-version)
 │       holds a pod-identity certificate
-│       serves the credential broker on a host Unix socket (mode 0600)
+│       serves AteomSupport on a host Unix socket (mode 0600)
 └── M × worker pods  (ordinary Kubernetes Pods; cluster-default container runtime)
         └── ateom container/process  (trusted supervisor, outside the actor sandbox)
                 ├── atunnel library  (same process: ingress, egress, actor cert)
@@ -75,8 +75,8 @@ K8s node
                                 └── kata-agent → actor application container(s)
 
 cluster
-├── ateapi (ActorIdentity service, PostgreSQL-backed)
-└── egress gateway (Envoy + atenet ext_proc by default, or agentgateway) — verifies actor certs
+├── ateapi (`Control` and `WorkerService`, PostgreSQL-backed)
+└── egress gateway (Envoy + atenet ext_proc by default, or agentgateway) — authorizes actor certs
 ```
 
 atelet is per node, not per worker, and serves every actor on its node. This is the SPIRE Agent
@@ -100,9 +100,10 @@ launch the nested runtime.
 
 The runtimes serve one logical actor per worker at a time, although that actor can contain several
 application containers. The control-plane API already models more: workers report capacity and
-allocation, and a worker can carry several actor assignments. The certificate-minting path is
-written against that model (see below), but atunnel still has a single active identity and presents
-one certificate for every intercepted connection from the active actor.
+allocation, and a worker can carry several actor assignments. The current certificate-minting RPC
+does not consult those assignments: its request names one actor directly. atunnel still has a
+single active identity and presents one certificate for every intercepted connection from the
+active actor.
 
 ## The actor identity
 
@@ -112,14 +113,26 @@ one certificate for every intercepted connection from the active actor.
 spiffe://substrate-actor.local/atespace/<atespace>/actor/<actor-name>
 ```
 
-The trust domain `substrate-actor.local` is hard-coded. There is no template segment. This URI
-identifies the reusable actor reference, not one actor incarnation. The actor UID is carried only
-in the Substrate-specific certificate extension or JWT private claim.
+Since "Add the egresspolicy evaluator and share the actor SPIFFE ID format" (`e517df95`) this
+string has one constructor, `resources.ActorSPIFFEID` in `internal/resources/spiffe.go`, with an
+inverse parser `ActorRefFromSPIFFEID`. The trust domain `substrate-actor.local` is hard-coded, with a
+`TODO(identity)` to make it per-install, and a second `TODO(identity)` proposes prefixing the path
+with `atunnel` so a verifier cannot confuse an atunnel credential with an actor presenting its own.
+There is no template segment. This URI identifies the reusable actor reference, not one actor
+incarnation: the actor UID is carried only in the Substrate-specific certificate extension or JWT
+private claim.
 
-The shipped egress gateway compensates for this: it uses `(atespace, name)` to look up the actor,
-then authorizes only if the credential's UID equals the current actor record's UID. A generic
-SPIFFE verifier does not understand that extension and would see an actor deleted and recreated at
-the same name as the same subject.
+Both egress dataplanes compensate for that, differently. Envoy's ext_proc requires the
+certificate's single URI SAN to equal exactly what `ActorSPIFFEID` builds from the extension's
+`(atespace, name)`, then looks the actor up and authorizes only if the credential's UID equals the
+current record's UID and the actor is RUNNING (`cmd/atenet/internal/router/egress/egress.go`).
+agentgateway performs the same lookup, UID comparison and RUNNING check at CONNECT time, but reads
+the extension alone and ignores the URI SAN, so it never cross-checks the two. See
+[EGRESS.md](./EGRESS.md#what-the-gateway-policies-actually-do).
+
+A generic SPIFFE verifier understands neither the extension nor either dataplane's check, and would
+see an actor deleted and recreated at the same name as the same subject. That is the reason for the
+canonical ID below.
 
 ### Canonical actor-incarnation SPIFFE ID (recommended; not implemented)
 
@@ -149,7 +162,7 @@ private key.
 | --- | --- |
 | URI SAN | currently the name-based SPIFFE ID above; recommended target is the UID-bearing actor-incarnation ID |
 | Validity | one hour, with a five-minute backdated `NotBefore` |
-| Key usage | `DigitalSignature`; extended key usage `ClientAuth` only; not a CA |
+| Key usage | `DigitalSignature`; extended key usage `ClientAuth` **and** `ServerAuth` since #1315; not a CA. atunnel only requires `ClientAuth`, so the `ServerAuth` grant is currently unused and widens the credential beyond the client role the design intends |
 | Signer | the actor-identity CA (Ed25519 self-signed root in the default install) |
 | Custom extension | `ActorIdentity`, OID `1.3.6.1.4.1.11129.2.12.2` |
 
@@ -161,12 +174,21 @@ library:
 ```
 
 `Purpose` is a closed set. `atunnel` is the only value the signer will issue and the only value
-parsers accept. The purpose is chosen by atelet, never by the requester, so a compromised worker
-cannot widen its own credential's scope.
+parsers accept. The purpose is chosen by atelet's broker, never by the ateom that calls it, so a
+compromised worker cannot widen its own credential's scope by asking. Note this holds only for
+callers that go through the broker: ateapi itself takes `Purpose` from the request and rejects
+anything other than `ATUNNEL` only via the `switch` default, so the guarantee rests on the broker
+hop rather than on the signer.
 
 There is no revocation (no CRL, no OCSP). Freshness comes from the one-hour lifetime plus a live
-actor lookup on every CONNECT on the default Envoy egress dataplane. agentgateway also consults
-ateapi for its inner HTTP route, but its opaque TLS and TCP routes do not.
+actor lookup on every CONNECT, and **both** egress dataplanes now perform that lookup: Envoy in its
+Go ext_proc, agentgateway in its `substrateEgressActorResolution` frontend policy. Either one
+refuses the tunnel when the certified UID no longer matches the live actor, or when the actor is
+not RUNNING, and answers 503 rather than failing open if the control plane is unreachable. See
+[EGRESS.md](./EGRESS.md#what-the-gateway-policies-actually-do).
+
+An established tunnel is not re-checked. The lookup is per CONNECT, so an actor deleted while a
+tunnel is open keeps that tunnel until it closes or the certificate expires.
 
 The companion `PodIdentity` extension (OID `1.3.6.1.4.1.11129.2.12.1`) appears on atelet, worker,
 and control-plane pod certificates. It carries namespace, service-account name and UID, pod name
@@ -205,7 +227,7 @@ possible future proxy injection:
 actor request → gateway identifies actor from mTLS → mint audience JWT → inject header → service
 ```
 
-#### Why `MintJWT` exists but has no caller
+#### Why `MintActorJWT` exists but has no caller
 
 The RPC predates the current *interior gVisor* architecture. In the earlier model an actor was
 itself a Kubernetes Pod under a gVisor RuntimeClass, so the workload could present its Kubernetes
@@ -215,24 +237,38 @@ to `ActorIdentity`.
 
 [PR #670](https://github.com/agent-substrate/substrate/pull/670) moved the API to the current
 atespace/name model and added the actor X.509 path. It explicitly left the JWT path with TODOs.
-[PR #757](https://github.com/agent-substrate/substrate/pull/757) later restricted `MintJWT` to a
+[PR #757](https://github.com/agent-substrate/substrate/pull/757) later restricted the RPC to a
 configured JWT issuer, and the signing pool is now cached and rotation-ready, but neither change
 adapted delivery to interior gVisor. An actor inside the nested sandbox has neither its own
-Kubernetes Pod identity nor a route that calls `MintJWT`, so the RPC is presently stranded between
-the old and new architectures.
+Kubernetes Pod identity nor a route that calls the RPC, so it is presently stranded between the
+old and new architectures. #1315 renamed it `MintJWT` → `MintActorJWT` and moved it from the
+separate `ActorIdentity` service into `Control`; it still has no production caller.
 
-What `MintJWT` on `main` does today:
+What `MintActorJWT` on `main` does today:
 
-1. Requires the gRPC caller to authenticate with a JWT issued by the provider selected by
-   `actorIdentityJWTProvider`.
-2. Accepts the requested audience, atespace, actor name, and actor UID from that caller.
-3. Validates their shape and signs a 15-minute bearer token with the actor-JWT signing pool.
+1. Validates the request shape, and requires at least one audience.
+2. Looks the actor up in the store by `(atespace, name)` and rejects with `Aborted` if the stored
+   UID differs from the requested one — a cross-check the pre-#1315 version did **not** perform.
+3. Signs a 15-minute bearer token with the actor-JWT signing pool.
 
-What it does **not** do is the decisive authorization step: it does not derive or cross-check the
-requested actor against the actor database or the caller's current worker assignment. Any caller
-admitted through that one provider can choose the actor claims. The API comment saying the caller
-must be the Pod currently running the actor describes the intended contract, not the implemented
-authorization. The RPC therefore must not be exposed to actors as-is.
+Two authorization gaps remain, and #1315 widened one of them:
+
+- **No caller authorization.** There is only a `TODO(authz)` where the check belongs. Any caller
+  the authentication interceptor admits can request a token for any actor it can name.
+- **The issuer restriction is no longer enforced.** PR #757's rule — that the caller must present
+  a JWT from the provider named by `actorIdentityJWTProvider` — was dropped in the move. The
+  config field is still required by `internal/ateapiauth/config.go` and is still threaded into
+  `RPCService.actorIdentityJWTIssuer`, but nothing reads it any more, so it is now a vestigial
+  knob. Callers no longer need to come from that provider at all, and unlike
+  `MintActorCertificate` this RPC does not even require a client certificate.
+
+The API comment saying the caller must be the Pod currently running the actor describes the
+intended contract, not the implemented authorization. The RPC must not be exposed to actors as-is.
+
+The token's `sub` is `atespaces:<atespace>:actors:<name>` — not the SPIFFE ID, and carrying no
+UID — with a `TODO(identity)` in the code saying the format is likely to change. The issuer is
+hard-coded to `https://api.ate-system.svc`, also marked as needing to be per-install. Both are
+reasons the credential is not yet suitable for an external relying party.
 
 #### Claims currently minted
 
@@ -307,7 +343,7 @@ containers:
     mountPath: /run/ate
 ```
 
-This PR does **not** call the public `MintJWT` RPC. Ateapi already has the authoritative actor record
+This PR does **not** call the public `MintActorJWT` RPC. Ateapi already has the authoritative actor record
 while executing Run/Restore, so it signs a token directly from that record immediately before
 sending the workload spec to atelet. Atelet writes the already-minted bytes into the host-backed
 SystemInfo volume; it has no JWT signing key. The actor reads the file and decides how to present
@@ -316,9 +352,10 @@ because no requester supplies the identity claims.
 
 The projected-token design is opt-in per ActorTemplate and per audience. It mints a fresh token on
 every Run/Restore, but it does not yet refresh an expired token while an actor remains running.
-[PR #1231](https://github.com/agent-substrate/substrate/pull/1231) adds live refresh machinery for
-trust bundles specifically; it does not renew JWTs. Live token renewal still needs a design for
-having ateapi mint and deliver replacement bytes without putting its signing key on the node.
+[PR #1231](https://github.com/agent-substrate/substrate/pull/1231) is now on `main` and adds live
+refresh machinery for trust bundles specifically; it does not renew JWTs. Live token renewal still
+needs a design for having ateapi mint and deliver replacement bytes without putting its signing key
+on the node.
 Because the audience is fixed in the template, an actor needing several relying parties declares
 several token data sources. On-demand audiences would require a broker/Workload API instead.
 
@@ -337,21 +374,23 @@ that a relying party can enforce. A copied token therefore remains replayable an
 
 | Piece | Status |
 | --- | --- |
-| JWT claims and local signing | On `main`; `MintJWT` signs 15-minute tokens |
+| JWT claims and local signing | On `main`; `MintActorJWT` signs 15-minute tokens |
 | Actor-visible delivery | Draft PR #1114: SystemInfo file, minted on Run/Restore |
 | Live renewal | Not implemented for JWTs |
-| Actor authorization in the public `MintJWT` RPC | Not implemented |
+| Actor authorization in the public `MintActorJWT` RPC | Not implemented (`TODO(authz)`) |
 | JWT-SVID conformance (`sub` plus SPIFFE bundle keys with `use: jwt-svid`) | Not implemented |
 | Stable public issuer plus OIDC discovery/JWKS for OIDC consumers | Not implemented |
 | Cloud federation (GCP/AWS) | Intended by issue #124; no end-to-end implementation |
 | Automatic actor-JWT injection at egress | Not implemented |
 
-Open [PR #1315](https://github.com/agent-substrate/substrate/pull/1315) is related but is not the
-delivery continuation: it moves `MintJWT`/`MintCert` into the main Control service in anticipation
-of unified authorization. The current egress credential-injection stack in
-[PR #1335](https://github.com/agent-substrate/substrate/pull/1335) and
-[PR #1360](https://github.com/agent-substrate/substrate/pull/1360) also does not mint actor JWTs;
-it reads administrator-managed Kubernetes Secrets and injects those values into HTTP headers.
+[PR #1315](https://github.com/agent-substrate/substrate/pull/1315) has since merged. It is not the
+delivery continuation: it moved `MintJWT`/`MintCert` into the main `Control` service (as
+`MintActorJWT`/`MintActorCertificate`) in anticipation of unified authorization, but it landed the
+move without the authorization, leaving the `TODO(authz)` markers described above. The egress
+credential-injection stack from
+[PR #1360](https://github.com/agent-substrate/substrate/pull/1360) is now on `main`, and it does not
+mint actor JWTs either: the gateway calls an out-of-tree gRPC `CredentialProvider` with the actor's
+attested SPIFFE ID and injects whatever opaque bytes come back into an HTTP header.
 
 A future actor-JWT egress provider could combine the two designs: use the actor certificate already
 presented to the gateway to select the actor, ask ateapi for a token bound to the destination's
@@ -371,25 +410,24 @@ atunnel, inside the ateom process (worker pod, outside the actor sandbox)
    │  requires the peer to be atelet (SPIFFE ID spiffe://cluster.local/ns/ate-system/sa/atelet)
    │  AND to carry the same node name and node UID as the worker itself
    ▼
-atelet credential broker (node)
+atelet AteomSupport (node)
    │  requires a pod certificate for this node (same node name/UID); access to the host socket
    │  is normally limited to worker pods by its mount placement
-   │  names the prospective worker by the caller's pod UID taken from that certificate, not
-   │  from the request; ateapi then requires that UID to name a real Worker with the assignment
+   │  authenticates *which* ateom is calling, but no longer derives the actor from it: the
+   │    request now carries actor_atespace, actor_name and actor_uid, and the broker forwards
+   │    them as given (see the TODO(identity) in cmd/atelet/ateomsupport.go)
    │  sets Purpose=atunnel itself; relays the CSR to ateapi over mTLS
    ▼
-ateapi ActorIdentity.MintCert
-   │  requires the caller to be atelet, by SPIFFE ID on the mTLS peer certificate
-   │  looks up the named worker (worker resource names are worker pod UIDs); if the worker
-   │    cache is stale, reads through to the store before denying
-   │  selects the worker's assignment for the requested actor UID; if no exact assignment
-   │    exists, reads one other assignment to distinguish a stale activation from an
-   │    unassigned worker
-   │  checks: the worker is on the caller's node (node name); the selected assignment names this
-   │    actor incarnation (actor UID); the actor's own assignment names this worker (worker
-   │    name); the actor is not being deleted
-   │  rejects if the requested actor UID still differs from the resolved actor (fails closed
-   │    across an assignment change)
+ateapi Control.MintActorCertificate
+│  requires the peer to have authenticated with a client certificate, so a bearer credential
+│    cannot bootstrap a proof-of-possession credential; in the shipped deployment the TLS
+│    listener verifies presented client certificates against the pod-identity CA
+│  does not require the certificate to identify atelet or inspect its PodIdentity extension
+   │  looks the actor up by the (atespace, name) in the request; NotFound if absent
+   │  rejects with Aborted if the stored actor UID differs from actor_uid ("actor has been
+   │    deleted and recreated")
+   │  does NOT check that the caller is atelet, that the caller's node hosts the actor, or that
+   │    any worker assignment names this actor — that is an open TODO(authz)
    │  signs with the actor-identity CA pool
    ▼
 actor certificate chain returned to atunnel
@@ -402,23 +440,32 @@ actor application container(s), inside the gVisor sandbox or micro-VM
 
 Design properties of this chain:
 
-- **Actor identity is derived from control-plane state, never from an actor name supplied by the
-  worker.** The worker's request carries a CSR and an expected actor UID. The UID first selects
-  among assignments ateapi already holds for the authenticated worker; if no exact assignment
-  exists, the request is rejected. It cannot obtain an identity for an actor the worker is not
-  assigned. Atelet derives the worker from the caller's pod certificate rather than a worker name
-  in the request.
-- **Node-incarnation binding is enforced on the node-local hop, not by ateapi.** atunnel and
-  atelet each require the other's pod certificate to carry their own node name *and* node UID.
-  ateapi compares node name only, plus the worker name, which is the worker pod UID. A stale
-  node with a reused name cannot reach ateapi through a live atelet, but ateapi itself does not
-  re-check node UID.
-- **Denials are indistinguishable.** A caller not entitled to a worker cannot learn its
-  assignment.
+- **The caller now names the actor, and ateapi does not yet check that it may.** Before #1315,
+  ateapi derived the actor from the authenticated worker's assignment, so a worker could not
+  obtain an identity for an actor it was not running. That reciprocal lookup is gone: the request
+  carries `(atespace, name, uid)` and ateapi verifies only that such an actor exists with that
+  UID. In the shipped deployment, any workload holding a client certificate issued by the
+  pod-identity CA and able to reach ateapi can therefore mint an atunnel certificate for any actor
+  whose atespace, name and UID it knows; the RPC does not restrict that set to atelet. The
+  replacement check is declared but not wired: `internal/authz/model.fga` defines
+  `can_mint_ateom_actor_credential: host_node`, and no Go code imports that package yet. Treat
+  this as the largest open gap in the shipped identity path.
+- **The node-local broker hop authenticates infrastructure, but no longer binds it to the actor.**
+  atunnel and atelet each require the other's pod certificate to carry their own node name *and*
+  node UID, and the broker socket's mount placement normally limits broker callers to worker pods.
+  Those checks constrain use of the broker. They do not constrain a pod-identity client that calls
+  ateapi directly, and neither hop now proves that the authenticated workload hosts the requested
+  actor.
+- **Denials are no longer indistinguishable.** `NotFound` (no such actor) and `Aborted` (UID
+  mismatch) are distinct, so a caller that can reach the RPC can probe which actor names and
+  UIDs exist.
 - **A fresh connection per mint** means rotated worker credentials and atelet's current node
-  identity are re-verified every time.
+  identity are re-verified every time. `TODO(identity)` in `internal/atunnel/credential.go`
+  proposes replacing this with one long-lived connection at atunnel startup, which would trade
+  that re-verification for fewer handshakes.
 - **Mint time is not gated on the RUNNING state.** The mint happens during Run/Restore while the
-  actor is still RESUMING. The RUNNING check happens later, at the egress gateway.
+  actor is still RESUMING. Both dataplanes check for RUNNING later, at CONNECT time, so a
+  certificate minted for an actor that never reaches RUNNING opens no tunnel.
 
 ## Key placement and suspend/resume
 
@@ -428,8 +475,9 @@ credential is written to disk or captured in a snapshot.
 - Renewal starts at 90% of the certificate's remaining lifetime.
 - If the certificate expires before renewal succeeds, atunnel keeps retrying with jitter, refuses
   new egress connections, and lets established tunnels drain.
-- If the broker answers `FailedPrecondition` or `PermissionDenied` (the actor was reassigned or
-  deleted), renewal stops for that activation.
+- If the broker answers `Aborted`, `FailedPrecondition` or `PermissionDenied` (the actor was
+  reassigned or deleted), renewal stops for that activation. `Aborted` is what
+  `MintActorCertificate` now returns on a UID mismatch.
 - On checkpoint or suspend, deactivation cancels the activation context and force-closes every
   live tunnel.
 - On restore, possibly on another node, a new key is generated and a fresh certificate is minted.
@@ -446,13 +494,17 @@ unaware: no SDK, no environment variable, no Workload API socket. Draft PR #1114
 for templates that explicitly request an `actorIdentityToken` SystemInfo data source.
 
 What atelet does project into the sandbox, when a template asks for it, is a `systemInfo` volume:
-regular files regenerated on every Run/Restore, kept outside durable storage so they never enter a
+regular files populated on every Run/Restore and kept outside durable storage so they never enter a
 snapshot. Two data sources exist:
 
 - `actorMetadata`: any of the actor's `name`, `atespace`, `uid`, each to a caller-chosen path.
 - `trustBundle`: a PEM bundle resolved from a Kubernetes ClusterTrustBundle. The only allowlisted
   name is `egress-mitm.ate.dev`, the egress gateway's TLS-interception CA. Templates must declare
-  it; nothing injects it automatically.
+  it; nothing injects it automatically. Since #1231, atelet watches the backing
+  `egress-mitm.ate.dev:mitm:primary-bundle` object and atomically refreshes this file for registered
+  running actors, retaining the last good contents if the bundle is deleted or malformed. The
+  registration remains in memory, so an atelet restart stops live refresh for an already-running
+  actor until its next Run/Restore.
 
 `systemInfo` volumes work on both the gVisor and micro-VM runtimes (the micro-VM guest receives
 them over the shared virtio-fs tree).
@@ -468,7 +520,7 @@ applications. It is also the closest shape to the subject tokens accepted by OID
 federation, although those systems additionally need the public issuer/JWKS compatibility layer
 described above. Delivery could be a projected file (PR #1114) or a future node-local Workload API.
 
-Status: the minting primitive exists (`MintJWT`, with the authorization gaps above), and projected
+Status: the minting primitive exists (`MintActorJWT`, with the authorization gaps above), and projected
 file delivery is under review in PR #1114. No complete, externally verifiable or continuously
 renewed path exists. This is still the right credential shape for external federation and for
 per-actor snapshot storage access, because those relying parties never see the egress tunnel.
@@ -573,7 +625,7 @@ Costs:
 **Recommendation.** Keep Option C as the transport-identity foundation. Make Option A a conforming
 JWT-SVID before exposing it: use the UID-bearing actor-incarnation SPIFFE ID as `sub`, publish the
 signing keys as `use: jwt-svid` SPIFFE-bundle entries, default to one audience, and share claim
-construction across `MintJWT` and PR #1114. Add a public OIDC issuer/JWKS only as a separate adapter
+construction across `MintActorJWT` and PR #1114. Add a public OIDC issuer/JWKS only as a separate adapter
 for relying parties that require it. Do not gradually turn that bearer token into a WIT by adding a
 `cnf` claim; implement Option B separately, with `typ: wit+jwt`, distinct `use: wit-svid` keys, and
 a complete WPT or HTTP Message Signatures presentation flow. Adopt it only for a concrete relying
@@ -587,7 +639,7 @@ An issue for the near-term bearer path should stay narrowly scoped to JWT-SVID c
    expiry. Keep other fields as supplemental correlation data rather than identity repairs.
 3. Publish rotation-overlapped verification keys in the trust domain's SPIFFE bundle with unique
    `kid` values and `use: jwt-svid`; test tokens with a conforming SPIFFE validator.
-4. Make `MintJWT` and projected-token issuance share claim construction and derive identity from
+4. Make `MintActorJWT` and projected-token issuance share claim construction and derive identity from
    authoritative actor/assignment state.
 5. Track public OIDC discovery/JWKS and live token delivery/renewal as related but separable work.
 
@@ -598,35 +650,50 @@ Substrate to an application-layer signing architecture.
 
 ## The credential broker
 
-atelet's credential broker is an identity-issuance component, not an egress component. It exposes
-one RPC, `MintActorCertificate`, over a host Unix socket shared by every worker on the node. The
-same authenticated socket also carries the worker-capacity service, which each ateom uses to
-report its resource limits to atelet at startup. Because the socket is shared, file permissions
-cannot distinguish workers; mutual TLS with pod certificates does, and both sides additionally
-require the peer's node name and node UID to match their own. The client side of that check is
-shared code used by every ateom-to-atelet caller, so atunnel and the capacity reporter cannot
-drift apart.
+Since [#1501](https://github.com/agent-substrate/substrate/pull/1501) the separate
+`CredentialBroker` and `WorkerCapacity` services are one service, `AteomSupport`, defined in
+`internal/proto/ateletpb` and served from `cmd/atelet/ateomsupport.go`. It carries two RPCs,
+`MintActorCertificate` and `SetWorkerCapacity`, over a host Unix socket at
+`/var/lib/ateom-gvisor/ateom-support.sock` (the `ateompath.AteomSupportSocket` constant), chmodded
+to `0600` and requiring mutual TLS. The minting half is an identity-issuance component, not an
+egress component; some log strings still say "credential broker".
 
-The caller cannot supply an atespace or actor name and cannot choose a purpose. It does supply the
-expected actor UID as a stale-activation guard; ateapi resolves that UID through assignments owned
-by the authenticated worker rather than trusting it as identity. The broker identifies the worker
-to ateapi by the pod UID in the caller's certificate. The private key never crosses the socket.
+Because the socket is shared by every worker on the node, file permissions cannot distinguish
+workers; mutual TLS with pod certificates does, and both sides additionally require the peer's node
+name and node UID to match their own. The client side of that check is shared code used by every
+ateom-to-atelet caller, so atunnel and the capacity reporter cannot drift apart.
 
-Ateapi trusts authenticated atelet as the node attestor that reports that worker pod UID and sets
-the certificate purpose; the original worker certificate is not forwarded end to end. Ateapi does
-not trust atelet to choose the resulting actor identity: it verifies that the reported worker is on
-the calling atelet's node and resolves a reciprocal worker↔actor assignment from control-plane
-state. Consequently a compromised worker is confined to its own assignment, while a compromised
-atelet has the identity-minting authority of its node.
+> [!NOTE]
+> File permissions are not the boundary in a second sense either. The socket's base path is mounted
+> **writable** into worker pods, which `internal/ateompath` documents: a worker pod can unlink or
+> replace the socket. mTLS authenticates who is calling; it does not stop a compromised worker from
+> denying the node-local service to its neighbors.
 
-This is also why the broker has its own socket rather than sharing the per-pod ateom lifecycle
+The caller supplies the actor atespace, name, and UID as well as the CSR. It cannot choose the
+certificate purpose: atelet fixes that to `ATUNNEL` before relaying, so a compromised worker cannot
+widen its own credential by asking. atelet authenticates the caller's PodIdentity extension and
+then discards the result — the `TODO(identity)` in `ateomsupport.go` asks whether it should check
+that this ateom is in fact running the requested actor. It forwards the caller-supplied actor
+fields unchanged. The private key never crosses the socket.
+
+The original worker certificate is not forwarded end to end, so ateapi sees atelet's client
+certificate. Since #1315, ateapi does not require that certificate to identify atelet and does not
+resolve a reciprocal worker↔actor assignment. It verifies only that the requested actor exists and
+has the requested UID. A compromised worker that can use its node's broker is therefore no longer
+confined to its assignment, and any other pod-identity client able to reach ateapi can bypass the
+broker and call the mint RPC directly. Both hops have explicit authorization TODOs.
+
+This is also why `AteomSupport` has its own socket rather than sharing the per-pod ateom lifecycle
 socket (Run, Restore, Checkpoint): ateom is trusted infrastructure, the actor is untrusted
-workload, and the two trust boundaries should not share a channel.
+workload, and the two trust boundaries should not share a channel. Merging the capacity service in
+did not cross that line — both of its RPCs are ateom-to-atelet calls with the same peer
+authentication.
 
 The broker exposes only X.509 minting today. One possible JWT renewal design is a new broker RPC
 with explicit audience and delivery authorization, deriving the actor through the authenticated
-worker assignment just as certificate minting does. The existing `MintJWT` RPC must not simply be
-exposed through it until that RPC performs the actor-database cross-check described above.
+worker assignment as certificate minting did before #1315. The existing `MintActorJWT` RPC now
+cross-checks the requested actor and UID against the database, but must not simply be exposed
+through the broker until both hops authorize the authenticated caller for that actor.
 
 PR #1114 chooses a different bootstrap path: ateapi signs from the actor record already in hand
 during Run/Restore, then sends only the token bytes to atelet for projection. That is simpler and
@@ -658,12 +725,14 @@ providers. The system components (atelet, atenet, atecontroller) dial ateapi wit
 mTLS. Everything else, including `kubectl ate`, the setup tool, and the e2e harness, goes through
 the shared client library, which attaches a bearer JWT: a token file if one is supplied, otherwise
 a Kubernetes service-account token it mints for the `ate-client` service account in `ate-system`,
-usually over a port-forward. `actorIdentityJWTProvider`
-names the one provider allowed to call `MintJWT`. There is no general per-RPC authorization or
-RBAC layer beyond checks implemented by individual services: any other authenticated provider can
-call the general control-plane RPCs. Configure only providers whose users should control the whole
-control plane. A caller presenting a JWT from an issuer that is not configured is told so in the
-error, and the installer accepts an override for the issuer ateapi expects.
+usually over a port-forward. `actorIdentityJWTProvider` used to name the one provider allowed to
+call the actor-JWT RPC, but since #1315 nothing reads it (see above); the field is still required
+by config validation. There is no general per-RPC authorization or RBAC layer; only checks inside
+individual methods. Any configured JWT provider can call the general control-plane RPCs and
+`MintActorJWT`; `MintActorCertificate` additionally requires mTLS. Configure only providers whose
+users should control the whole control plane. A caller presenting a JWT from an issuer that is not
+configured is told so in the error, and the installer accepts an override for the issuer ateapi
+expects.
 
 atelet authenticates to ateapi with its pod certificate. Worker pods authenticate to atelet the
 same way. Network connections from ateapi to external CSI driver controllers can also use
@@ -675,10 +744,10 @@ Node-side CSI connections go over Unix sockets without TLS.
 
 | Trust material | Signs | Who verifies with it | Rotation |
 | --- | --- | --- | --- |
-| Actor-identity CA (`actor-id-ca-pool`; signing key mounted only in ateapi) | actor certificates | egress gateway (`trusted_ca`), Envoy ext_proc re-verification | signing side is pool-based and rotation-ready; the gateway's copy is a cert-only Secret `actor-id-ca-certs` derived at install and loaded from a static filename, so rotating the actor CA requires re-deriving the Secret and restarting the gateway |
+| Actor-identity CA (`actor-id-ca-pool`; signing key mounted only in ateapi) | actor certificates | Envoy or agentgateway TLS listener; atenet's Envoy ext_proc verifies the chain again, agentgateway trusts the TLS layer's result | signing side is pool-based and rotation-ready; the gateway's copy is a cert-only Secret `actor-id-ca-certs` derived at install and loaded from a static filename, so rotating the actor CA requires re-deriving the Secret and restarting or otherwise reloading the gateway |
 | Actor JWT pool (`actor-id-jwt-pool`; signing key mounted only in ateapi) | actor JWTs | nobody in the shipped data path; SPIFFE consumers need a JWT bundle with `use: jwt-svid`, while OIDC consumers may need discovery/JWKS | signing pool reloads and supports selecting an active key; administration and both publication paths are missing |
 | Pod identity (`podidentity.podcert.ate.dev/identity`) | atelet, workers, control-plane pods | broker socket, atunnel ingress, ateapi client auth | Kubernetes PodCertificateRequests + ClusterTrustBundles; projected volumes rotate |
-| Service DNS (`servicedns.podcert.ate.dev`) | serving certificates for in-cluster services | atunnel verifying the egress gateway | Envoy loads the serving cert via filesystem SDS, so kubelet rotation is picked up |
+| Service DNS (`servicedns.podcert.ate.dev/identity`) | serving certificates for in-cluster services | atunnel verifying the egress gateway | projected PodCertificate and ClusterTrustBundle volumes rotate; the default Envoy gateway watches its serving-credential directory through filesystem SDS |
 | Egress TLS-interception CA (`egress-mitm-ca-pool`) | per-SNI leaf certificates in TLS-interception mode | actors, via the `systemInfo.trustBundle` data source | published as ClusterTrustBundle `egress-mitm.ate.dev:mitm:primary-bundle` by atecontroller |
 
 ## Verification cookbook (`kind-substrate`)
@@ -692,8 +761,8 @@ it is not a substitute for a broader security review.
 The examples assume the core system was installed before the demo:
 
 ```bash
-# Omit --atenet-router=agentgateway to use the default Envoy dataplane.
-hack/install-ate-kind.sh --atenet-router=agentgateway --deploy-ate-system
+# Omit --atenet-dataplane=agentgateway to use the default Envoy dataplane.
+hack/install-ate-kind.sh --atenet-dataplane=agentgateway --deploy-ate-system
 hack/install-ate-kind.sh --deploy-demo-egress
 ```
 
@@ -768,12 +837,15 @@ DaemonSets according to the cluster's upgrade plan.
 
 ### Show the actor UID and reciprocal worker assignment
 
+Since #1627 a single named resource prints as a bare object rather than a
+one-element list, so these read `.metadata`, not `.actors[0].metadata`.
+
 ```bash
 ACTOR_JSON="$(kubectl ate --context "$CTX" get actors "$ACTOR" \
   -a "$ATESPACE" -o json)"
 
 printf '%s\n' "$ACTOR_JSON" |
-  jq '.actors[0] | {
+  jq '{
     actorUID: .metadata.uid,
     state: .status.state,
     worker: .status.workerAssignment.worker.name,
@@ -781,7 +853,7 @@ printf '%s\n' "$ACTOR_JSON" |
   }'
 
 WORKER="$(printf '%s\n' "$ACTOR_JSON" |
-  jq -r '.actors[0].status.workerAssignment.worker.name')"
+  jq -r '.status.workerAssignment.worker.name')"
 
 kubectl ate --context "$CTX" get workers -o json |
   jq --arg worker "$WORKER" '.workers[] |
@@ -796,7 +868,9 @@ kubectl ate --context "$CTX" get workers -o json |
 ```
 
 The actor's worker name must resolve to a real worker, and the namespace and pod in both records
-must agree. This is the public-state half of the reciprocal assignment check used by `MintCert`.
+must agree. This reciprocal assignment used to be what `MintCert` checked before signing; since
+#1315 `MintActorCertificate` no longer consults it, so this is now a consistency check on
+scheduler state rather than a view of an enforced authorization step.
 
 ### Prove the UID survives suspend/resume
 
@@ -806,13 +880,13 @@ suspend, run the resume command manually.
 
 ```bash
 ACTOR_UID_BEFORE="$(kubectl ate --context "$CTX" get actors "$ACTOR" \
-  -a "$ATESPACE" -o json | jq -r '.actors[0].metadata.uid')"
+  -a "$ATESPACE" -o json | jq -r '.metadata.uid')"
 
 kubectl ate --context "$CTX" suspend actor "$ACTOR" -a "$ATESPACE"
 kubectl ate --context "$CTX" resume actor "$ACTOR" -a "$ATESPACE"
 
 ACTOR_UID_AFTER="$(kubectl ate --context "$CTX" get actors "$ACTOR" \
-  -a "$ATESPACE" -o json | jq -r '.actors[0].metadata.uid')"
+  -a "$ATESPACE" -o json | jq -r '.metadata.uid')"
 
 test "$ACTOR_UID_BEFORE" = "$ACTOR_UID_AFTER" &&
   printf 'stable actor UID: %s\n' "$ACTOR_UID_AFTER"
@@ -872,27 +946,34 @@ Only ateapi pods should mount `actor-id-ca-pool`. The pool contains signing mate
 `actor-id-ca-certs` should contain only `ca.crt`; the final command fingerprints the public CA
 the gateway uses to authenticate actors.
 
-### Check the node-local broker socket
+### Check the node-local `AteomSupport` socket
 
 ```bash
 KIND_CLUSTER="${CTX#kind-}"
 KIND_NODE="$(kind get nodes --name "$KIND_CLUSTER" | head -n 1)"
 docker exec "$KIND_NODE" stat -c '%a %U:%G %F %n' \
-  /var/lib/ateom-gvisor/credential-broker.sock
+  /var/lib/ateom-gvisor/ateom-support.sock
 ```
 
-The first field should be `600` and the file type should be `socket`. Permissions alone do not
-distinguish worker pods because they share the host mount; the mTLS pod identity and node
-name/UID checks are the authorization boundary.
+The first field should be `600` and the file type should be `socket`. The path changed with #1501,
+which merged the credential broker and the worker-capacity service into one `AteomSupport` service
+on one socket. Permissions alone do not distinguish worker pods because they share the host mount;
+the mTLS pod identity and node name/UID checks are the authorization boundary — and the mount is
+writable, so a worker can replace the socket even though it cannot impersonate a caller on it.
 
 ### Run focused identity regressions
 
 ```bash
-go test ./cmd/ateapi/internal/actoridentity \
-  -run 'TestMintCert(Authorization|EmbedsActorIdentity|ActorUID|ActorState)$' \
-  -count=1
+# #1315 deleted cmd/ateapi/internal/actoridentity and its 13-case suite, including
+# every MintCert authorization test. What replaced it server-side is one case:
+go test ./cmd/ateapi/internal/controlapi/functionaltest \
+  -run '^TestMintActorJWT_Success$' -count=1
 
-go test ./cmd/atelet -run '^TestCredentialBroker' -count=1
+# #1315 also removed TestCredentialBrokerForwardsAuthenticatedWorkerIdentity, the test
+# that pinned the broker deriving the worker from its certificate rather than the request.
+# #1501 then renamed the file to ateomsupport_test.go. What remains of the minting
+# hop's own coverage is the same-node check; no test calls MintActorCertificate:
+go test ./cmd/atelet -run '^TestVerifyClientOnSameNode$' -count=1
 
 go test ./internal/atunnel \
   -run 'Test(BrokerCertificateSource|Egress)' -count=1
@@ -904,7 +985,7 @@ go test ./internal/substratex509 ./internal/localca \
 For the complete set of directly related packages:
 
 ```bash
-go test ./cmd/ateapi/internal/actoridentity ./cmd/atelet \
+go test ./cmd/ateapi/internal/controlapi/... ./cmd/atelet \
   ./internal/ateletdial ./internal/atunnel ./internal/substratex509 \
   ./internal/localca ./internal/localjwtauthority ./internal/actoridjwt
 ```
@@ -917,11 +998,23 @@ rg -n 'GenerateKey|CreateCertificateRequest|CertificateSigningRequest' \
   internal/atunnel/credential.go
 
 # Socket creation and the explicit 0600 chmod.
-rg -n 'CredentialBrokerSocket|Chmod.*0o600' cmd/atelet/main.go
+rg -n 'AteomSupportSocket|Chmod.*0o600' cmd/atelet/main.go
 
-# Production references show MintJWT's implementation, but no caller.
-rg -n 'MintJWT' --glob '*.go' --glob '!**/*_test.go' \
+# Production references show MintActorJWT's implementation, but no caller.
+rg -n 'MintActorJWT' --glob '*.go' --glob '!**/*_test.go' \
   --glob '!**/*.pb.go' --glob '!**/*_grpc.pb.go'
+
+# Both minting RPCs still carry their authorization TODOs.
+rg -n 'TODO\(authz\)' cmd/ateapi/internal/controlapi/actor.go
+
+# The intended replacement check is declared but not imported by any Go code,
+# and the module has no OpenFGA dependency at all.
+rg -n 'can_mint_ateom_actor_credential' internal/authz/model.fga
+rg -n 'internal/authz' --glob '*.go'
+rg -n 'openfga' go.mod
+
+# The shared SPIFFE ID constructor and everything that uses it.
+rg -n 'ActorSPIFFEID|ActorRefFromSPIFFEID' --glob '*.go' --glob '!**/*_test.go'
 ```
 
 ## Not built yet
@@ -934,8 +1027,22 @@ rg -n 'MintJWT' --glob '*.go' --glob '!**/*_test.go' \
   `iss` is not a resolvable URL. This is separate from SPIFFE-native JWT-SVID bundle distribution.
 - **Trust domain as configuration.** `substrate-actor.local` and the atelet SPIFFE identity are
   hard-coded.
-- **Actor-database cross-check in the public `MintJWT` RPC.** PR #1114 avoids this RPC at startup
-  by deriving claims inside the trusted Run/Restore workflow; any on-demand API still needs it.
+- **Server-side authorization tests for the minting RPCs.** #1315 deleted
+  `cmd/ateapi/internal/actoridentity` along with its 13-case suite — including
+  `TestMintCertAuthorization`, `TestMintCertAuthorizesBeforeSigning`,
+  `TestMintCertDeniesUnassignedActorWhateverItsState` and
+  `TestMintJWTRequiresConfiguredJWTProvider` — and added one replacement,
+  `TestMintActorJWT_Success`. It also removed
+  `TestCredentialBrokerForwardsAuthenticatedWorkerIdentity` from `cmd/atelet`. No test now
+  exercises `MintActorCertificate` on the server side at all. The behavior those tests pinned is the behavior that regressed, so restoring coverage and
+  closing the `TODO(authz)` are the same piece of work.
+- **Caller authorization in the public minting RPCs.** #1315 added the actor-database cross-check
+  that was previously missing from the JWT path, but neither `MintActorJWT` nor
+  `MintActorCertificate` checks that the *caller* is entitled to that actor; both carry a bare
+  `TODO(authz)`. `internal/authz/model.fga` already defines the intended relation
+  (`can_mint_ateom_actor_credential: host_node`) but no Go code imports it. PR #1114 sidesteps
+  this at startup by deriving claims inside the trusted Run/Restore workflow; any on-demand API
+  still needs it.
 - **Administrative rotation of the JWT signing pool.** The pool can already switch its active key
   without a restart; the commands to add, activate, and retire keys are not written.
 - **Per-actor credentials for snapshot storage.** atelet reads and writes every actor's snapshots
@@ -958,14 +1065,16 @@ rg -n 'MintJWT' --glob '*.go' --glob '!**/*_test.go' \
 - **Automatic injection of the egress trust bundle** into every actor
   ([PR #1252](https://github.com/agent-substrate/substrate/pull/1252)); today templates must declare
   it.
-- **Egress-side secret credential injection.** Open
-  [PR #1335](https://github.com/agent-substrate/substrate/pull/1335) adds a Kubernetes Secret
-  credential provider, and [PR #1360](https://github.com/agent-substrate/substrate/pull/1360) adds
-  an egress ext_proc that consumes it. Neither is on `main`, and neither mints actor JWTs. An
-  actor-JWT provider/injector remains unimplemented. See EGRESS.md.
-- **Live refresh of projected trust bundles** while an actor runs
-  ([PR #1231](https://github.com/agent-substrate/substrate/pull/1231)), and the atelet-restart
-  persistence it depends on (atelet keeps per-actor state only in memory today).
+- **An actor-JWT credential provider.** Generic egress credential injection *is* on `main` since
+  [PR #1360](https://github.com/agent-substrate/substrate/pull/1360), but it resolves an opaque
+  `ate-secret://` URI through a gRPC `CredentialProvider` whose only in-repo artifact is the proto;
+  no provider implementation ships here, and none of it mints actor JWTs. It is also Envoy-only,
+  on the TLS-interception leg. An actor-JWT provider/injector remains unimplemented. See
+  EGRESS.md.
+- **Persistence of live trust-bundle refresh across an atelet restart.**
+  [PR #1231](https://github.com/agent-substrate/substrate/pull/1231) is merged and refreshes bundles
+  for actors registered in memory, but an atelet restart loses that registry until each actor's
+  next Run/Restore.
 - **Per-actor node attestability.** High-density actors are invisible to standard workload
   attestation; no node-attestable per-actor property exists for tools like SPIRE selectors.
 
@@ -982,10 +1091,12 @@ rg -n 'MintJWT' --glob '*.go' --glob '!**/*_test.go' \
   JWT-SVID now. WIT-SVID/WPT should remain a separate, feature-gated path until a concrete relying
   party and key-custody model justify tracking the incubating SPIFFE profile and moving WIMSE
   drafts.
-- **Freshness versus load.** The Envoy egress path performs a control-plane lookup on every
-  CONNECT to compensate for the one-hour lifetime and lack of revocation. agentgateway performs
-  the lookup for inner HTTP, but opaque TLS and TCP receive only the outer CA-chain check. Shorter
-  certificates, or a push-based revocation signal, would let the paths converge.
+- **Freshness versus load.** Both egress paths perform a control-plane lookup on every CONNECT to
+  compensate for the one-hour lifetime and lack of revocation, which puts ateapi on the critical
+  path of every new actor connection and makes a control-plane outage a cluster-wide egress
+  outage — both dataplanes answer 503 rather than failing open. The lookup is per CONNECT, not per
+  request, so a long-lived tunnel is never re-authorized. Shorter certificates, a push-based
+  revocation signal, or a bounded re-check on open tunnels are the options.
 - **Node-local blast radius.** atelet is on the renewal path for live egress. An atelet outage
   longer than the remaining certificate lifetime blocks new egress for every actor on that node
   until atelet restarts; established tunnels drain rather than drop.
@@ -996,10 +1107,10 @@ rg -n 'MintJWT' --glob '*.go' --glob '!**/*_test.go' \
   atunnel connection with an actor presenting its own certificate. The motivating case is
   dropping a vendor gateway in place of Substrate's.
 - **Multiple actors per worker.** The API models per-worker capacity and several assignments,
-  and certificate minting already selects an assignment by actor UID. atunnel holds one key per
-  activation and presents one certificate on every intercepted connection. Serving several actors
-  from one worker would require atunnel to choose a key per connection based on which sandbox the
-  traffic came from.
+  but certificate minting no longer selects among them: the caller names the actor directly.
+  atunnel holds one key per activation and presents one certificate on every intercepted
+  connection. Serving several actors from one worker would require atunnel to choose a key per
+  connection based on which sandbox the traffic came from.
 - **Which client authentication should be the default for the control plane?** The
   port-forward plus Kubernetes-token path is convenient locally but assumes the caller has
   Kubernetes permissions on the install cluster; it is under discussion whether that should
