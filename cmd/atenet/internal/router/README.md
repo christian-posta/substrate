@@ -113,9 +113,19 @@ create, update or delete is visible to new requests within one TTL, and a
 deleted policy becomes a deny. Every policy denial answers a fixed
 `egress denied` body; the reason is in the sidecar's log.
 
-Credential injection (`inject_static_headers`) is not implemented yet: a
-matched rule that declares one is denied with 501 rather than forwarded
-without the credential the policy promised.
+Credential injection (`inject_static_headers`) is applied by `applyEffects` on
+the leg that can carry a secret safely, which is the TLS leg the sdsmint gateway
+terminated. The gateway does not read the secret itself: it calls the
+`CredentialProvider` at `--credential-provider-address` with the credential URI
+and the actor's SPIFFE ID, and sets the returned bytes as the named header,
+overwriting whatever the actor sent under that name.
+
+On a cleartext leg, or with no provider configured, injection is skipped and the
+request is forwarded without the credential — a secret does not go on a
+cleartext wire, and egress the policy allowed is not blocked for want of one.
+Once injection is attempted it fails closed: an unusable header name, a
+credential URI of an unserved provider class, or a fetch that returns nothing
+usable all deny rather than forward.
 
 ## adding a dataplane attribute
 

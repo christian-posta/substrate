@@ -9,21 +9,25 @@
 > The repository's local-development default is the kind cluster `kind-substrate`. Override it
 > with `KIND_CLUSTER_NAME` when a second local cluster is needed.
 >
-> Last verified 2026-09-08 against `main` at `353c21f2` on `kind-substrate`, using
-> `--atenet-router=agentgateway`. The locally built binaries report `060b0d88-dirty`; the only
-> later upstream commit in that range changes documentation, not image inputs.
+> Last run end-to-end on 2026-09-17 against `upstream/main` at `85ce8ed5` on `kind-substrate`,
+> using `--atenet-dataplane=agentgateway`.
 
 ## What the demo shows (and doesn't)
 
-**Shows:** transparent actor egress (nftables REDIRECT → atunnel → mTLS CONNECT to the gateway)
-and **actor identity**. Both dataplanes require a certificate chaining to the actor-identity CA.
-The default Envoy path additionally parses the `ActorIdentity` extension and requires a matching,
-RUNNING actor on every CONNECT; agentgateway applies its native `substrateEgress` check on the
-inner HTTP route. See EGRESS.md for the opaque TLS/TCP distinction.
+**Shows:** transparent actor egress (nftables REDIRECT → atunnel → mTLS CONNECT to the gateway),
+**actor identity**, and **egress policy**. Both dataplanes now do the same three things: refuse a
+certificate that does not chain to the actor-identity CA, authorize the actor at CONNECT time
+against the control plane (ActorIdentity extension, `atunnel` purpose, UID match, `RUNNING`
+state), and enforce the actor's `EgressPolicy`. They differ in where that happens and how much
+they cover; see
+[EGRESS.md](./EGRESS.md#where-each-dataplane-enforces-it).
 
-**Does not show:** enforcement of the control-plane `EgressPolicy` API or Substrate-provided
-credential injection. TLS interception exists behind `--experimental-use-sdsmint`, and an
-Envoy-only hook can call an operator-supplied external processor, but neither is enabled here.
+**The gateway denies by default.** An actor with no `EgressPolicy` gets no tunnel at all, so every
+walkthrough below creates one. `kubectl ate create egress-policy` is the verb.
+
+**Does not show:** credential injection (Envoy-only, and it needs an out-of-tree credential
+provider), or TLS interception, which exists behind `--experimental-use-sdsmint` but is not
+enabled here.
 
 ## Prerequisites
 
@@ -37,9 +41,9 @@ Envoy-only hook can call an operator-supplied external processor, but neither is
 ```bash
 hack/create-kind-cluster.sh                       # kind-substrate + local registry :5001
 
-# Pick ONE dataplane. Envoy is the default; agentgateway serves BOTH ingress and egress:
-hack/install-ate-kind.sh --deploy-ate-system                                # Envoy
-hack/install-ate-kind.sh --deploy-ate-system --atenet-router=agentgateway   # agentgateway
+# Pick ONE dataplane. Envoy is the default; the flag selects BOTH ingress and egress:
+hack/install-ate-kind.sh --deploy-ate-system                                   # Envoy
+hack/install-ate-kind.sh --deploy-ate-system --atenet-dataplane=agentgateway   # agentgateway
 
 hack/install-ate-kind.sh --deploy-demo-egress     # egress demo template + golden snapshot
 go install ./cmd/kubectl-ate
@@ -47,6 +51,34 @@ go install ./cmd/kubectl-ate
 
 Gotcha: `--deploy-ate-system`'s rollout wait can time out on cold image pulls while pods are
 still ContainerCreating — that is not a failure; wait for pods and re-run or continue.
+
+## Many actors, one worker
+
+`demos/egress/multi-actor-identity.sh` is the multiplexing story in one command: five actors, one
+worker pod, one identity each. It needs `--atenet-dataplane=agentgateway`.
+
+```bash
+demos/egress/multi-actor-identity.sh
+demos/egress/multi-actor-identity.sh --cleanup
+```
+
+Last run on 2026-09-17, all checks passed:
+
+```text
+PASS alpha: HTTP 200 through worker pod egress-b48b9765c-trx2v
+     the target saw the gateway (10.244.0.19) as its client, not the actor
+...
+PASS all 5 actors were served by the same worker pod
+ate.actor.name=alpha   ate.actor.uid=2653b02a-... ate.atespace=ate-demo-egress
+ate.actor.name=bravo   ate.actor.uid=8390faa7-... ate.atespace=ate-demo-egress
+ate.actor.name=charlie ate.actor.uid=d274909e-... ate.atespace=ate-demo-egress
+ate.actor.name=delta   ate.actor.uid=27bf7824-... ate.atespace=ate-demo-egress
+ate.actor.name=echo    ate.actor.uid=0d43574f-... ate.atespace=ate-demo-egress
+PASS the gateway named every actor: alpha bravo charlie delta echo
+```
+
+It leaves the WorkerPool at one replica. Scale it back with
+`kubectl -n ate-demo-egress scale workerpool/egress --replicas=2`.
 
 ## Scripted verification (easiest)
 
@@ -56,6 +88,13 @@ hack/verify-egress-demo.sh
 
 This lightweight smoke test creates an actor, drives an external HTTP fetch through it, and checks
 the selected dataplane's access log for the CONNECT. Exit 0 plus `== PASS ==` is the win condition.
+
+Neither this script nor `demos/egress/test-egress.sh` creates an `EgressPolicy`, so give the actor
+one first or its fetch is denied with 403:
+
+```bash
+kubectl ate --context kind-substrate create egress-policy egress-demo -a ate-demo-egress --all
+```
 
 The richer upstream script is `demos/egress/test-egress.sh` (in-cluster target, positive +
 negative identity tests, `--cleanup`).
@@ -68,25 +107,42 @@ router, inspect gateway logs, negative test from a non-actor pod) lives in
 dataplane. Condensed:
 
 ```bash
-# create + resume the actor
-kubectl ate --context kind-substrate create atespace demo
-kubectl ate --context kind-substrate create actor egress-demo -a demo --template ate-demo-egress/egress
-kubectl ate --context kind-substrate resume actor egress-demo -a demo    # wait: ACTOR_STATE_RUNNING
+# an in-cluster target; the actors dial it by ClusterIP
+kubectl --context kind-substrate create namespace egress-target
+kubectl --context kind-substrate -n egress-target create deployment whoami --image=traefik/whoami
+kubectl --context kind-substrate -n egress-target expose deployment whoami --port=80
+TARGET_IP=$(kubectl --context kind-substrate -n egress-target get svc whoami \
+  -o jsonpath='{.spec.clusterIP}')
 
-# drive egress through the actor (any external URL; the actor fetches it)
+# create the actor, then its policy, then resume: the policy must exist before
+# the actor's first outbound connection
+kubectl ate --context kind-substrate create actor egress-demo -a ate-demo-egress --template egress
+kubectl ate --context kind-substrate create egress-policy egress-demo -a ate-demo-egress --all
+kubectl ate --context kind-substrate resume actor egress-demo -a ate-demo-egress  # ACTOR_STATE_RUNNING
+
+# drive egress through the actor. ate-target-actor picks the actor; the URL in
+# the body is that actor's egress destination and is unrelated to routing.
 kubectl --context kind-substrate -n ate-system port-forward svc/atenet-router 18000:80 &
 curl -s -X POST http://localhost:18000/ \
-  -H "Host: egress-demo.demo.actors.resources.substrate.ate.dev" \
-  -d '{"url":"http://example.com/"}'          # expect HTTP 200 + page body
-
-# Envoy: proof of the authenticated actor identity on CONNECT
-kubectl --context kind-substrate -n ate-system logs deploy/atenet-egress -c ext-proc --tail=20 \
-  | grep 'egress identity authenticated'
+  -H "ate-target-actor: ate-demo-egress/egress-demo" \
+  -H 'Content-Type: application/json' \
+  -d "{\"url\":\"http://${TARGET_IP}:80/\"}"        # expect HTTP 200
 ```
 
-What to look for in the identity log line: `atespace`, `actor`, **`actorUid`** (the
-incarnation binding — delete/recreate the actor and it changes), and `destination` as resolved
-`IP:port` (DNS happens in the clear before the tunnel; the gateway never sees hostnames).
+The response body is `whoami`'s, and its `RemoteAddr` is the **gateway pod's** IP, not the
+actor's — proof the request egressed through the gateway rather than directly.
+
+### Envoy-specific checks
+
+```bash
+kubectl --context kind-substrate -n ate-system logs deploy/atenet-egress -c ext-proc --tail=20 \
+  | grep 'egress tunnel opened\|egress denied'
+```
+
+What to look for: `actor`, **`actorUid`** (the incarnation binding — delete and recreate the actor
+at the same name and it changes), `rule` (which policy rule matched), and `destination` as a
+resolved `IP:port`. DNS happens in the clear before the tunnel, so the CONNECT never carries a
+hostname.
 
 ### agentgateway-specific checks
 
@@ -95,15 +151,20 @@ incarnation binding — delete/recreate the actor and it changes), and `destinat
 kubectl --context kind-substrate -n ate-system get pod -l app=atenet-egress \
   -o jsonpath='{.items[0].spec.containers[*].name}'
 
-# Its structured access log records the CONNECT authority.
+# Its access log names the actor it authorized at CONNECT, plus the authority.
 kubectl --context kind-substrate -n ate-system logs deploy/atenet-egress -c agentgateway \
-  | grep 'substrate.connect.authority'
+  | grep -o 'ate\.actor\.name=[^ ]* ate\.actor\.uid=[^ ]* ate\.atespace=[^ ]*'
 ```
+
+Those `ate.*` fields come from the inner HTTP route, so a TLS-passthrough or opaque-TCP tunnel
+logs `substrate.connect.authority` and no actor fields. That is a logging gap, not an
+unauthenticated connection: the CONNECT was authorized either way.
 
 ## Switching dataplanes on a running cluster
 
-Re-run `--deploy-ate-system` with the other `--atenet-router=` value; it rewrites the router
-and egress Deployments in place. The demo fixture and actors are unaffected.
+Re-run `--deploy-atenet` with the other `--atenet-dataplane=` value; it rewrites the router and
+egress Deployments in place without touching the rest of the control plane. The demo fixture,
+actors and their egress policies are unaffected.
 
 ## Upgrade gotchas (learned the hard way)
 
