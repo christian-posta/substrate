@@ -203,6 +203,44 @@ kubectl -n ate-system logs deploy/atenet-egress -c agentgateway \
 The `whoami` body shows `RemoteAddr: <atenet-egress pod IP>` — proof the request egressed
 *through* the gateway rather than directly.
 
+## Many actors, one worker
+
+The point of Substrate is that a large set of actors rides a small set of ready
+workers. `multi-actor-identity.sh` makes that visible at the egress gateway:
+
+```bash
+demos/egress/multi-actor-identity.sh              # requires --atenet-dataplane=agentgateway
+demos/egress/multi-actor-identity.sh --cleanup
+```
+
+It scales the demo's WorkerPool to a **single** worker, creates five Actors on
+it, gives each its own `EgressPolicy`, and has each one fetch the same target in
+turn. Every fetch crosses the same worker pod and the same tunnel machinery, but
+presents its own actor certificate, so the gateway's access log names a
+different actor each time:
+
+```text
+ate.actor.name=alpha   ate.actor.uid=5120df7c-... ate.atespace=ate-demo-egress
+ate.actor.name=bravo   ate.actor.uid=9a1c04e2-... ate.atespace=ate-demo-egress
+ate.actor.name=charlie ate.actor.uid=c73b18d5-... ate.atespace=ate-demo-egress
+```
+
+Two mechanics are worth knowing before reading the output:
+
+- **A worker hosts one actor at a time.** `internal/ateomcapacity` reports
+  `actorsPerAteom = 1`, and the scheduler refuses a worker that is already at
+  its limit however small the next actor is. So this is time-slicing, not
+  concurrency: at most one Actor is `RUNNING` and the rest are `SUSPENDED`.
+- **Nothing suspends an idle actor yet.** The script suspends each Actor after
+  its turn to free the worker. Without that, the next request parks in the
+  router (`docs/request-parking.md`) and then fails when the park budget runs
+  out — 504 on agentgateway, 503 on Envoy.
+
+The Actors dial the target by ClusterIP, so the script writes a `--cidrs` rule
+rather than a `--hostnames` one: a hostname rule cannot match at the CONNECT,
+where the gateway has only an address. See
+[EGRESS.md](../../EGRESS.md#egresspolicy-enforcement).
+
 ## gRPC over the same tunnel
 
 `POST /grpc` with `{"target":"<ip>:<port>","message":"hello","streamCount":2,"bidiCount":2}` makes
