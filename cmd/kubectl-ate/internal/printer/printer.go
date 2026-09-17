@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -404,6 +405,64 @@ func PrintAtespaceTo(out io.Writer, atespace *ateapipb.Atespace, format string) 
 	}
 	// table has no singular/plural distinction, so reuse the list renderer.
 	return PrintAtespacesTo(out, []*ateapipb.Atespace{atespace}, format)
+}
+
+// egressRuleSummary renders one rule as the matcher it carries and the values
+// it matches on. The table shows rules by index because the policy is
+// first-match-wins: the position is what decides.
+func egressRuleSummary(rule *ateapipb.EgressRule) (string, string) {
+	switch {
+	case rule.GetHostnames() != nil:
+		return "hostnames", strings.Join(rule.GetHostnames().GetPatterns(), ",")
+	case rule.GetCidrs() != nil:
+		return "cidrs", strings.Join(rule.GetCidrs().GetCidrs(), ",")
+	case rule.GetAll() != nil:
+		return "all", "*"
+	default:
+		return "unknown", ""
+	}
+}
+
+// egressRuleEffects renders a rule's effects, so a policy that injects a
+// credential does not read like one that only allows traffic.
+func egressRuleEffects(rule *ateapipb.EgressRule) string {
+	injections := rule.GetHostnames().GetEffects().GetInjectStaticHeaders()
+	if len(injections) == 0 {
+		return "-"
+	}
+	headers := make([]string, 0, len(injections))
+	for _, injection := range injections {
+		headers = append(headers, injection.GetHeader())
+	}
+	return "inject:" + strings.Join(headers, ",")
+}
+
+// PrintEgressPolicyTo prints a single egress policy to the provided writer.
+func PrintEgressPolicyTo(out io.Writer, policy *ateapipb.EgressPolicy, format string) error {
+	switch format {
+	case "json", "yaml":
+		return printProto(out, policy, format)
+	case "table":
+		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "ATESPACE\tNAME\tRULE\tMATCH\tVALUES\tEFFECTS\tAGE")
+		atespace := policy.GetMetadata().GetAtespace()
+		name := policy.GetMetadata().GetName()
+		age := formatAge(policy.GetMetadata().GetCreateTime())
+		if len(policy.GetRules()) == 0 {
+			// A policy with no rules denies everything, exactly as no policy
+			// does. Say so rather than printing a bare header.
+			fmt.Fprintf(w, "%s\t%s\t-\t(none)\t-\t-\t%s\n", atespace, name, age)
+			return w.Flush()
+		}
+		for i, rule := range policy.GetRules() {
+			match, values := egressRuleSummary(rule)
+			fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+				atespace, name, i, match, values, egressRuleEffects(rule), age)
+		}
+		return w.Flush()
+	default:
+		return fmt.Errorf("unsupported format %q", format)
+	}
 }
 
 func printProto(out io.Writer, msg proto.Message, format string) error {
