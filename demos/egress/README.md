@@ -68,9 +68,10 @@ ActorTemplate, worker pool, test, and manual walkthrough are otherwise the same.
 | --- | --- | --- |
 | Select with | `--atenet-dataplane=envoy` (default) | `--atenet-dataplane=agentgateway` |
 | Egress routing | Dynamic forward proxy | Dynamic backend from CONNECT authority |
-| Actor authentication | Co-located atenet `ext_proc` | Built-in `substrateEgress` policy |
+| Actor authorization at CONNECT | Co-located atenet `ext_proc` | Built-in `substrateEgressActorResolution` policy |
 | Configuration | Envoy bootstrap in `atenet-egress.yaml` | Static agentgateway ConfigMap overlay |
-| Access log | Text beginning with `[egress]`, including actor SAN | Structured log including `substrate.connect.authority` |
+| `EgressPolicy` enforcement | Co-located atenet `ext_proc`, on every leg | Built-in `substrateEgress` policy, on the HTTP leg only |
+| Access log | Text beginning with `[egress]`, including actor SAN | Structured log with `substrate.connect.authority`, plus `ate.actor.name`/`ate.actor.uid`/`ate.atespace` on HTTP |
 | MITM mode | Supported with `--experimental-use-sdsmint` | Supported with `--experimental-use-sdsmint` |
 
 The experimental additional egress `ext_proc` service currently requires Envoy; the installer
@@ -81,15 +82,17 @@ rejects that option with agentgateway rather than silently omitting it.
 - **Egress app (`main.go`)** — the Actor: `POST /` with `{"url":"..."}` → fetches it → returns
   status + body. It also serves `POST /grpc`, described below.
 - **Egress gateway** — the `atenet-egress` Deployment. Envoy uses a co-located atenet `ext_proc`
-  container started with `--mode=egress`; agentgateway uses its built-in `substrateEgress` policy
-  and does not need that sidecar. The installer renders the matching configuration and container.
+  container started with `--mode=egress`; agentgateway uses its built-in
+  `substrateEgressActorResolution` and `substrateEgress` policies and does not need that sidecar.
+  The installer renders the matching configuration and container.
 - **Egress opt-in** — `ate-api-server --egress-gateway-address=atenet-egress.ate-system.svc:443`
   (set in `manifests/ate-install/ate-api-server.yaml`). ateapi stamps the address onto every
   atelet `Run`/`Restore`, which turns on tunneled egress cluster-wide.
 - **Egress policy** — the gateway denies by default, so the demo Actor needs an `EgressPolicy`
-  (created through the `CreateActorEgressPolicy` API against the Actor) before its fetches
-  succeed. `kubectl ate` has no verb for it yet; the e2e suites create theirs with
-  `e2e.EnsureEgressPolicy`, and an `all` rule reproduces the pre-policy behavior.
+  before its fetches succeed. Create one with
+  `kubectl ate create egress-policy <actor> -a <atespace> --all`; `--all` reproduces the
+  pre-policy behavior, and `--hostnames`/`--cidrs` narrow it. The e2e suites build theirs
+  in-process with `e2e.EnsureEgressPolicy`.
 - **Actor-identity trust** — the gateway mounts the `actor-id-ca-certs` Secret, a cert-only copy of
   the actor-identity CA root that `hack/install-ate.sh` derives from `actor-id-ca-pool` (which also
   holds the CA signing key and is deliberately *not* mounted here).
@@ -126,7 +129,8 @@ then asserts:
 
 - **positive** — a real Actor's egress reaches the target (`HTTP 200`) *through the gateway*
   (the target sees the gateway's IP as its client), and the gateway logs the CONNECT. Envoy's log
-  includes the actor certificate SAN; agentgateway's structured log includes the authority;
+  includes the actor certificate SAN; agentgateway's structured log includes the authority and,
+  for the HTTP leg, the actor it authorized;
 - **negative** — a pod holding a valid *pod* identity but no actor certificate cannot open a
   tunnel at all: the gateway trusts the actor-identity CA, so the mTLS handshake is
   refused before any CONNECT is answered.
@@ -145,6 +149,11 @@ TARGET_IP=$(kubectl -n egress-target get svc whoami -o jsonpath='{.spec.clusterI
 # 2. Create and resume an Actor in the demo's atespace: --template
 #    resolves the template by name within the actor's own atespace.
 kubectl ate create actor egress-demo -a ate-demo-egress --template egress
+
+# 2b. Give it an EgressPolicy. The gateway denies by default, and the policy
+#     must exist before the Actor's first outbound connection.
+kubectl ate create egress-policy egress-demo -a ate-demo-egress --all
+
 kubectl ate resume actor egress-demo -a ate-demo-egress   # wait for ACTOR_STATE_RUNNING
 
 # 3. Drive the Actor's egress through the ingress gateway.
@@ -184,6 +193,44 @@ kubectl -n ate-system logs deploy/atenet-egress -c agentgateway \
 The `whoami` body shows `RemoteAddr: <atenet-egress pod IP>` — proof the request egressed
 *through* the gateway rather than directly.
 
+## Many actors, one worker
+
+The point of Substrate is that a large set of actors rides a small set of ready
+workers. `multi-actor-identity.sh` makes that visible at the egress gateway:
+
+```bash
+demos/egress/multi-actor-identity.sh              # requires --atenet-dataplane=agentgateway
+demos/egress/multi-actor-identity.sh --cleanup
+```
+
+It scales the demo's WorkerPool to a **single** worker, creates five Actors on
+it, gives each its own `EgressPolicy`, and has each one fetch the same target in
+turn. Every fetch crosses the same worker pod and the same tunnel machinery, but
+presents its own actor certificate, so the gateway's access log names a
+different actor each time:
+
+```text
+ate.actor.name=alpha   ate.actor.uid=5120df7c-... ate.atespace=ate-demo-egress
+ate.actor.name=bravo   ate.actor.uid=9a1c04e2-... ate.atespace=ate-demo-egress
+ate.actor.name=charlie ate.actor.uid=c73b18d5-... ate.atespace=ate-demo-egress
+```
+
+Two mechanics are worth knowing before reading the output:
+
+- **A worker hosts one actor at a time.** `internal/ateomcapacity` reports
+  `actorsPerAteom = 1`, and the scheduler refuses a worker that is already at
+  its limit however small the next actor is. So this is time-slicing, not
+  concurrency: at most one Actor is `RUNNING` and the rest are `SUSPENDED`.
+- **Nothing suspends an idle actor yet.** The script suspends each Actor after
+  its turn to free the worker. Without that, the next request parks in the
+  router (`docs/request-parking.md`) and then fails when the park budget runs
+  out — 504 on agentgateway, 503 on Envoy.
+
+The Actors dial the target by ClusterIP, so the script writes a `--cidrs` rule
+rather than a `--hostnames` one: a hostname rule cannot match at the CONNECT,
+where the gateway has only an address. See
+[EGRESS.md](../../EGRESS.md#egresspolicy-enforcement).
+
 ## gRPC over the same tunnel
 
 `POST /grpc` with `{"target":"<ip>:<port>","message":"hello","streamCount":2,"bidiCount":2}` makes
@@ -221,11 +268,14 @@ from the cluster, works for a manual run.
 ## Notes / limitations
 
 - The gateway **authenticates** identity (is this a real, running actor?) and **authorizes**
-  destinations against the Actor's `EgressPolicy`. Injecting upstream credentials/tokens is a
-  follow-up in the same `ext_proc`; a policy rule that declares an injection is denied (501)
-  until it lands.
-- `test-egress.sh` creates and resumes the Actor but cannot create its `EgressPolicy` (no CLI
-  verb yet), so its positive fetch needs the policy created out of band first.
+  destinations against the Actor's `EgressPolicy`. Injecting upstream credentials into a matched
+  rule's requests is implemented on the Envoy TLS-interception leg, and needs a credential
+  provider that is not part of this repository; see
+  [EGRESS.md](../../EGRESS.md#credential-injection). agentgateway does not implement injection at
+  the pinned commit.
+- `test-egress.sh` creates and resumes the Actor but does not create its `EgressPolicy`, so give
+  the Actor one first:
+  `kubectl ate create egress-policy egress-demo -a ate-demo-egress --all`.
 - Identity comes entirely from the actor certificate: the atespace, actor name, and UID are read
   out of the `ActorIdentity` extension and the UID is matched against the live actor, so a
   certificate cannot survive its actor being deleted and recreated under the same name. Nothing
