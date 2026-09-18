@@ -80,14 +80,14 @@ demo-egress-microvm-mitm_cmdline() {
 demo-egress_deploy() {
   deploy_substrate_demo render_demo_manifest \
     demos/egress/egress.yaml.tmpl \
-    ate-demo-egress egress 300 \
+    ate-demo-egress worker 300 \
     demos/egress/egress-template.yaml.tmpl egress
 }
 
 demo-egress_delete() {
   delete_substrate_demo render_demo_manifest \
     demos/egress/egress.yaml.tmpl \
-    ate-demo-egress egress
+    ate-demo-egress worker
 }
 
 demo-egress-microvm_usage() {

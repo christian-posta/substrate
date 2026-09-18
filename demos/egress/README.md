@@ -49,7 +49,9 @@ intercepted and carried over mTLS to a gateway that verifies who is making the r
   terminates) is decided per request: the rules in order, over its `Host` and the address the
   Actor dialed, first match wins, and the request is sent to what that rule checked. TLS the
   plain gateway does not terminate, and opaque TCP, are allowed by address only, at the
-  `CONNECT`. An Actor with no policy gets no tunnel at all.
+  `CONNECT`. An Actor with no policy is denied on every leg the gateway evaluates — which is the
+  whole tunnel on Envoy, but only the HTTP leg on agentgateway, where TLS passthrough and opaque
+  TCP are not policy-evaluated at all (see [EGRESS.md](../../EGRESS.md#default-deny-is-not-uniform)).
 
 ## Choose a dataplane
 
@@ -207,7 +209,10 @@ It scales the demo's WorkerPool to a **single** worker, creates five Actors on
 it, gives each its own `EgressPolicy`, and has each one fetch the same target in
 turn. Every fetch crosses the same worker pod and the same tunnel machinery, but
 presents its own actor certificate, so the gateway's access log names a
-different actor each time:
+different actor each time. The script asserts the whole triple — name, the UID
+the control plane actually assigned, and the atespace — rather than the name
+alone, so a wrong incarnation or a same-named Actor from another atespace fails
+rather than passes:
 
 ```text
 ate.actor.name=alpha   ate.actor.uid=5120df7c-... ate.atespace=ate-demo-egress
@@ -230,6 +235,14 @@ The Actors dial the target by ClusterIP, so the script writes a `--cidrs` rule
 rather than a `--hostnames` one: a hostname rule cannot match at the CONNECT,
 where the gateway has only an address. See
 [EGRESS.md](../../EGRESS.md#egresspolicy-enforcement).
+
+What this does and does not prove about SPIFFE: the actor certificate carries a
+SPIFFE URI SAN, but **agentgateway authorizes from the `ActorIdentity` X.509
+extension and never reads that SAN**, and the `ate.*` log fields come from the
+extension too. So the demo proves per-incarnation ActorIdentity attribution on
+this dataplane, not SPIFFE SAN verification. Envoy is the dataplane that
+additionally requires the SAN to equal `resources.ActorSPIFFEID(ref)`; run the
+same actor there to exercise that check.
 
 ## gRPC over the same tunnel
 

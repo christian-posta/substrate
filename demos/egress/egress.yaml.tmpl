@@ -26,7 +26,12 @@ metadata:
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
 metadata:
-  name: egress
+  # Named for what it holds, not for the demo: the demo's point is that a pool
+  # of workers carries many actors, and "one worker pod" reads better in its
+  # output than "one egress pod". The `workload` label below is the demo
+  # identifier, and is what the ActorTemplate's workerSelector matches on, so
+  # this name is free to describe the resource instead.
+  name: worker
   namespace: ate-demo-egress
   labels:
     workload: egress

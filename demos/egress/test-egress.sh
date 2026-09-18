@@ -96,6 +96,12 @@ info "target = ${TARGET_IP}:${TARGET_PORT}"
 log "create + resume Actor ${ATESPACE}/${ACTOR}"
 ${KATE} create atespace "${ATESPACE}" >/dev/null 2>&1 || true
 ${KATE} create actor "${ACTOR}" -a "${ATESPACE}" --template "${TEMPLATE}" >/dev/null 2>&1 || true
+# The gateway denies by default, so the Actor needs a policy before its first
+# outbound connection. It cannot be created any earlier: the API refuses a
+# policy whose parent Actor does not exist yet. An `all` rule reproduces the
+# pre-policy behavior, which is what this test wants -- the EgressPolicy suites
+# are where narrow rules are exercised.
+${KATE} create egress-policy "${ACTOR}" -a "${ATESPACE}" --all >/dev/null
 ${KATE} resume actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
 for _ in $(seq 1 30); do
   ${KATE} get actors -a "${ATESPACE}" 2>/dev/null | grep -q "ACTOR_STATE_RUNNING" && break

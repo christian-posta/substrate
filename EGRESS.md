@@ -125,10 +125,13 @@ Four facts are central to the current implementation:
    CONNECT upgrade: it parses the `ActorIdentity` certificate extension, calls
    `GetActor` on `ateapi`, compares the certified UID with the live one, and
    requires the actor to be `RUNNING`.
-4. The actor's `EgressPolicy` is enforced, and the gateway denies by default: an
-   actor with no policy gets no tunnel. On agentgateway that enforcement is
-   attached to the inner HTTP listener only, so TLS passthrough and opaque TCP
-   are authorized by the CONNECT check alone.
+4. The actor's `EgressPolicy` is enforced, but **how completely depends on the
+   dataplane**. Envoy evaluates it at the CONNECT itself, so an actor with no
+   policy gets no tunnel of any kind. agentgateway attaches `substrateEgress` to
+   the inner HTTP listener only, and its CONNECT frontend policy does not fetch
+   the policy at all, so on agentgateway an actor with no policy is still
+   refused cleartext HTTP but **can open TLS-passthrough and opaque-TCP egress
+   to any address**. See [the default-deny caveat](#default-deny-is-not-uniform).
 
 ## Actor network namespace
 
@@ -490,8 +493,45 @@ injection on Substrate today is an Envoy-only feature; see below.
 ## `EgressPolicy` enforcement
 
 `EgressPolicy` is no longer an unwired API. Both dataplanes read it from the
-control plane and enforce it, and **the gateway denies by default: an actor
-with no policy gets no tunnel at all**.
+control plane and enforce it. How completely they do so differs, and the
+difference is security-relevant — see the caveat immediately below before
+relying on default-deny.
+
+### Default-deny is not uniform
+
+On **Envoy**, "an actor with no policy gets no tunnel" is literally true: the
+CONNECT leg itself calls `lookupPolicy`, and `errNoPolicy` answers 403 before
+any byte is relayed.
+
+On **agentgateway** it is true only of the routes `substrateEgress` is attached
+to, which is the inner HTTP listener alone. `substrateEgressActorResolution`,
+the CONNECT frontend policy, authorizes the *actor* and never fetches the
+policy. So an authenticated actor with **no `EgressPolicy` at all** is refused
+cleartext HTTP and still gets TLS-passthrough and opaque-TCP egress to any
+address it can name.
+
+Observed on a kind cluster, same actor, no policy, both legs:
+
+```text
+# cleartext HTTP -> denied
+error request ... route=default/route0 http.status=403 protocol=http
+  ate.actor.name=alpha ate.actor.uid=a731bf64-...
+  error="actor egress policy denied: ... \"EgressPolicy not found\"" reason=Authorization
+
+# TLS passthrough, same actor, still no policy -> relayed
+info request ... route=default/tcproute0 endpoint=10.96.0.1:443 tls.sni= protocol=tcp
+  duration=39ms substrate.connect.authority="10.96.0.1:443"
+```
+
+The second request reached the destination: the actor's own error was
+`x509: certificate signed by unknown authority`, which it could only produce
+after the origin presented a certificate.
+
+Treat agentgateway's default-deny as covering policy-evaluated routes, not the
+tunnel. An actor whose egress must be confined has to be on Envoy, or on the
+sdsmint gateway where TLS is terminated and therefore policy-evaluated. The
+repository tracks the gap as
+`agentGatewayAtenetDataplane.SupportsTLSPassthroughEgressPolicy` returning false.
 
 ### What a rule can match
 
@@ -547,9 +587,12 @@ kubectl ate create egress-policy egress-demo -a ate-demo-egress \
 kubectl ate get egress-policy egress-demo -a ate-demo-egress
 ```
 
-Rules are created in flag order, and `--all` is appended last so a narrower
-rule given alongside it still decides first. Each actor has at most one policy,
-named `default`; deleting the actor deletes it.
+Rules are created `--hostnames` first, then `--cidrs`, then `--all`, whatever
+order the flags appear in: the CLI receives them grouped by flag, not
+interleaved, so it cannot reconstruct a mixed ordering. That puts the
+catch-all last, which is usually what you want, but a policy whose rules must
+interleave has to be written as a manifest and passed with `-f`. Each actor has
+at most one policy, named `default`; deleting the actor deletes it.
 
 ## Credential injection
 
@@ -581,9 +624,10 @@ The installer hard-errors on `--experimental-egress-credential-injection` with
 `--atenet-dataplane=agentgateway`, and it implies `--experimental-use-sdsmint`.
 
 > [!NOTE]
-> Two in-repo documents still describe injection as unimplemented and answering
-> 501: `cmd/atenet/internal/router/README.md` and `demos/egress/README.md`.
-> Neither was updated when injection landed. The code is the reference.
+> `cmd/atenet/internal/router/README.md` and `demos/egress/README.md` both
+> described injection as unimplemented and answering 501, because neither was
+> updated when it landed. Both are corrected on this branch; the code remains
+> the reference.
 
 ## Identity and trust material
 

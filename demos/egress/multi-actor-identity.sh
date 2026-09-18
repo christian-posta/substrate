@@ -44,7 +44,7 @@ CTX="${KUBECTL_CONTEXT:-kind-substrate}"
 ATESPACE="${ATESPACE:-ate-demo-egress}"
 TEMPLATE="${TEMPLATE:-egress}"
 POOL_NS="${POOL_NS:-ate-demo-egress}"
-POOL="${POOL:-egress}"
+POOL="${POOL:-worker}"
 ACTORS="${ACTORS:-alpha bravo charlie delta echo}"
 # As an array, so nothing downstream has to re-split it.
 read -r -a ACTOR_LIST <<<"${ACTORS}"
@@ -170,10 +170,16 @@ log "create the actors, each with its own egress policy"
 # The gateway denies by default, and the policy must exist before the actor's
 # first outbound connection. The actors dial the target by address, so a
 # hostname rule would not match at the CONNECT: --cidrs names the target's /32.
+# The UID the control plane assigned each actor. This is the incarnation
+# identity the gateway must echo back: a run that only matched actor names
+# would still pass if the gateway authorized the wrong incarnation, or an
+# actor of the same name in another atespace.
+declare -A ACTOR_UID
 for actor in "${ACTOR_LIST[@]}"; do
   ${KATE} create actor "${actor}" -a "${ATESPACE}" --template "${TEMPLATE}" >/dev/null 2>&1 || true
   retry "${KATE_CMD[@]}" create egress-policy "${actor}" -a "${ATESPACE}" --cidrs "${TARGET_IP}/32" >/dev/null
-  info "${ATESPACE}/${actor}: actor + egress policy allowing ${TARGET_IP}/32"
+  ACTOR_UID["${actor}"]=$(${KATE} get actors "${actor}" -a "${ATESPACE}" -o json | jq -r '.metadata.uid')
+  info "${ATESPACE}/${actor}: uid=${ACTOR_UID[${actor}]}, egress policy allowing ${TARGET_IP}/32"
 done
 retry "${KATE_CMD[@]}" get actors -a "${ATESPACE}"
 
@@ -233,19 +239,34 @@ fi
 log "each fetch carried its own actor identity"
 ##############################################################################
 # agentgateway's substrateEgress policy stamps the actor it authorized at
-# CONNECT onto the access-log line for every request inside the tunnel.
+# CONNECT onto the access-log line for every request inside the tunnel. The
+# fields come from the ActorIdentity X.509 extension, which is also what the
+# gateway authorized on -- it does not read the certificate's SPIFFE URI SAN.
+# So this proves per-actor ActorIdentity attribution; see EGRESS.md.
 LOG=$(${K} -n ate-system logs deployment/atenet-egress -c agentgateway --since-time="${SINCE}" 2>/dev/null || true)
-printf '%s\n' "${LOG}" | grep -o 'ate\.actor\.name=[^ ]* ate\.actor\.uid=[^ ]* ate\.atespace=[^ ]*' | sort -u || true
+TRIPLES=$(printf '%s\n' "${LOG}" \
+  | grep -o 'ate\.actor\.name=[^ ]* ate\.actor\.uid=[^ ]* ate\.atespace=[^ ]*' | sort -u || true)
+printf '%s\n' "${TRIPLES}" | sed 's/^/     /'
 
-SEEN=$(printf '%s\n' "${LOG}" | grep -o 'ate\.actor\.name=[^ ]*' | sed 's/.*=//' | sort -u)
-MISSING=""
+# Match the whole triple, not just the name: the UID must be the incarnation
+# the control plane actually created, and the atespace must be ours.
 for actor in "${ACTOR_LIST[@]}"; do
-  printf '%s\n' "${SEEN}" | grep -qx "${actor}" || MISSING="${MISSING} ${actor}"
+  want="ate.actor.name=${actor} ate.actor.uid=${ACTOR_UID[${actor}]} ate.atespace=${ATESPACE}"
+  if printf '%s\n' "${TRIPLES}" | grep -qxF "${want}"; then
+    pass "${actor}: gateway authorized uid ${ACTOR_UID[${actor}]} in ${ATESPACE}"
+  else
+    fail "${actor}: no gateway line matching ${want}"
+    printf '%s\n' "${TRIPLES}" | grep -F "ate.actor.name=${actor} " | sed 's/^/     got: /' || true
+  fi
 done
-if [[ -z "${MISSING}" ]]; then
-  pass "the gateway named every actor: ${SEEN//$'\n'/ }"
+
+# Each actor must be distinct from the others, or "five identities" is a
+# claim one shared credential could satisfy.
+DISTINCT=$(printf '%s\n' "${TRIPLES}" | grep -c 'ate\.actor\.uid=' || true)
+if [[ "${DISTINCT}" == "${#ACTOR_LIST[@]}" ]]; then
+  pass "${DISTINCT} distinct identities over one worker pod"
 else
-  fail "no gateway log line for:${MISSING}"
+  fail "expected ${#ACTOR_LIST[@]} distinct identity triples, saw ${DISTINCT}"
   info "recent gateway lines, for diagnosis:"
   printf '%s\n' "${LOG}" | tail -20
 fi

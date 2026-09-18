@@ -601,8 +601,11 @@ Costs:
   IP:port and nothing else. Hostname visibility requires the opt-in TLS-interception mode.
 - Anything the actor must present *inside* an application protocol (an `Authorization` header
   to an MCP server, a signed cloud API request) is out of reach. This is what keeps Option A on
-  the roadmap. The egress policy API's header-injection effect is the intended place to close
-  that gap on the gateway side, but it is not enforced yet (see EGRESS.md).
+  the roadmap. The egress policy API's header-injection effect closes part of that gap on the
+  gateway side and is enforced on Envoy's TLS-interception leg, but it injects opaque bytes
+  fetched from a credential provider, not an actor-scoped token: nothing in it mints or presents
+  the actor's own identity to the destination (see
+  [EGRESS.md](./EGRESS.md#credential-injection)).
 
 ### Trade-offs
 

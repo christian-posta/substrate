@@ -44,9 +44,15 @@ var createEgressPolicyCmd = &cobra.Command{
 	Short: "Create or replace an actor's egress policy",
 	Long: `Create the egress policy for an actor.
 
-The egress gateway denies by default: an actor with no policy gets no tunnel at
-all. Rules are evaluated in the order given and the first match decides, so
-order the flags the way the policy should be read.
+The egress gateway denies by default, so an actor without a policy is refused.
+How completely depends on the dataplane: Envoy denies at the CONNECT, so such an
+actor gets no tunnel at all, while agentgateway evaluates policy only on routes
+it is attached to and still permits TLS-passthrough and opaque-TCP egress.
+
+Rules are evaluated in order and the first match decides. They are built
+--hostnames rules first, then --cidrs, then --all, regardless of the order the
+flags appear on the command line, because the shell hands them over grouped by
+flag rather than interleaved. Use -f when a different order matters.
 
 Each --hostnames or --cidrs occurrence becomes one rule, and --all appends a
 match-everything rule. --hostnames takes DNS names, optionally with a "*" in
