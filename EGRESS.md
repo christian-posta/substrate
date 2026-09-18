@@ -69,10 +69,12 @@ destination
 > [!WARNING]
 > **The shipped data path is not a complete sandbox egress-control boundary.**
 > `atunnel` intercepts IPv4 TCP sourced from the configured actor address.
-> Actor UDP is now dropped for every destination port but 53, which closes the
-> QUIC/HTTP-3 and custom-UDP paths, but DNS to *any* host is still forwarded,
+> Forwarded actor UDP is dropped for every destination port but 53, which closes
+> external QUIC/HTTP-3 and custom-UDP paths, but DNS to *any* host is still forwarded,
 > and ICMP, SCTP, and every other IPv4 protocol still reach the compatibility
-> masquerade. There are no IPv6 rules at all. Those flows carry no actor mTLS
+> masquerade. Traffic addressed to the worker network namespace traverses `INPUT`,
+> for which this table has no filter chain, and there are no IPv6 rules at all.
+> Those flows carry no actor mTLS
 > identity to the gateway and receive none of the gateway's authorization,
 > logging, TLS interception, or destination policy. Deployments must not
 > describe this configuration alone as locking down all sandbox egress.
@@ -155,7 +157,11 @@ records that the actor network is IPv4-only for now. The table has three chains:
 | `postrouting` (NAT) | everything from `169.254.17.2` that was still forwarded is masqueraded. The rule matches on source address only, with no protocol condition |
 
 Rule order in the forward chain matters: the accept is a catch-all, so the drop
-precedes it.
+precedes it. The table has no `input` chain. Packets addressed to the worker
+network namespace itself, including `169.254.17.1` and other local worker-pod
+addresses, therefore do not traverse the UDP drop rule. No worker-local UDP
+service is intentionally part of the egress path, but the nftables rules do not
+make a blanket claim that all non-DNS actor UDP is blocked.
 
 The redirect is transparent to the actor application. The application opens a
 normal socket and does not need proxy environment variables or CONNECT support.
@@ -167,13 +173,15 @@ normal socket and does not need proxy environment variables or CONNECT support.
 | Traffic from `169.254.17.2` | Result |
 |---|---|
 | TCP, any destination port | redirected into `atunnel`, tunneled, authorized |
-| UDP to port 53, **any** destination host | accepted and masqueraded |
-| UDP to any other port | counted and dropped |
-| ICMP, SCTP, GRE, ESP, any other IPv4 protocol | accepted and masqueraded |
+| Forwarded UDP to port 53, **any** destination host | accepted and masqueraded |
+| Forwarded UDP to any other port | counted and dropped |
+| UDP and non-TCP traffic addressed to the worker namespace | not covered by the `forward` rule; reaches local `INPUT` if a service is listening |
+| Forwarded ICMP, SCTP, GRE, ESP, any other IPv4 protocol | accepted and masqueraded |
 | Anything over IPv6 | no rules; outside this table entirely |
 
-Dropping non-DNS UDP closed the largest hole: QUIC and HTTP/3 on UDP 443, and
-custom UDP or DTLS command-and-control channels, no longer leave the worker.
+Dropping forwarded non-DNS UDP closed the largest external hole: QUIC and HTTP/3
+on UDP 443, and custom UDP or DTLS command-and-control channels, no longer leave
+the worker through the forwarding path.
 The drop rule carries a counter deliberately, so a workload that legitimately
 needs UDP shows up as a rising counter rather than as an unexplained timeout.
 Reading it takes a host with `nft` that can enter the worker pod's network
@@ -200,12 +208,12 @@ that still buys it:
   The worker rule selects on destination port alone, not on the resolver
   address. Agentgateway does not receive the queries and cannot associate them
   with the actor's mTLS identity.
-- **QUIC or HTTP/3 over UDP port 443.** Closed. The forward chain drops actor
+- **QUIC or HTTP/3 over UDP port 443.** Closed for external destinations. The forward chain drops actor
   UDP to every port but 53, so an actor can no longer reach an external QUIC
   endpoint outside agentgateway's CONNECT, TLS, or HTTP processing.
-- **Custom UDP or DTLS channels.** Closed for the same reason, on any port but
-  53. An attacker-controlled UDP protocol has to masquerade as DNS to leave the
-  worker at all.
+- **Custom UDP or DTLS channels.** Closed on the external forwarding path for
+  the same reason, on any port but 53. A worker-local listener remains outside
+  that forward-chain rule.
 - **Other IPv4 protocols.** Still open. The forward chain's catch-all accept
   passes ICMP, SCTP, GRE, ESP, and anything else the actor's stack can emit.
   Crafted raw-packet channels additionally require an ActorTemplate that grants
@@ -604,8 +612,16 @@ This is implemented on Envoy only.
 
 - The gateway does not read Kubernetes Secrets. It calls a pluggable gRPC
   `CredentialProvider` (`pkg/proto/credproviderpb`) with the credential URI and
-  the actor's attested SPIFFE ID; the provider authenticates the gateway over
-  mTLS and resolves the secret itself.
+  the actor's attested SPIFFE ID and resolves the secret itself. The normal dial
+  uses mutual TLS; an explicit `--credential-provider-insecure` development
+  option permits plaintext and logs a warning.
+- The SPIFFE ID sent to the provider is the current name-based value,
+  `spiffe://substrate-actor.local/atespace/<atespace>/actor/<name>`. It omits the
+  actor UID. The gateway verified the certificate's UID against the live actor
+  at CONNECT, but the provider request cannot independently distinguish an
+  actor deleted and recreated at the same name. The provider is therefore
+  trusting the authenticated gateway's assertion for this request, not
+  receiving an incarnation-bound subject of its own.
 - **No provider implementation ships in this repository** — only the proto. The
   default URI class is `ate-secret://kubernetes.io` and the default address is
   `credprovider.ate-system.svc:50051`, but the workload behind that address is
@@ -889,7 +905,7 @@ Worker-side, which is the same on both dataplanes:
 | Transparent expected-source actor IPv4/TCP interception | Implemented |
 | Fail-closed path for redirected TCP before tunnel activation | Implemented |
 | Anti-bypass enforcement against a network-privileged actor | Not established; source-only match and an `accept` forward policy need hardening |
-| Actor UDP confined to DNS | Implemented, but to any host on port 53, not the configured resolver |
+| Forwarded actor UDP confined to DNS | Implemented, but to any host on port 53, not the configured resolver; worker-local `INPUT` is not covered |
 | ICMP and other IPv4 protocols | Not enforced; the catch-all accept passes them |
 | IPv6 | No rules at all |
 

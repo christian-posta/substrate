@@ -105,6 +105,11 @@ does not consult those assignments: its request names one actor directly. atunne
 single active identity and presents one certificate for every intercepted connection from the
 active actor.
 
+The active-workload statistics RPC now returns a list as groundwork for multi-actor workers, and
+atelet folds every entry it receives. That wire-shape change does not make the runtimes multi-actor:
+both implementations still cap the list at one active workload, and the singleton atunnel identity
+and worker-side network state remain unchanged.
+
 ## The actor identity
 
 ### Current SPIFFE ID (shipped)
@@ -390,7 +395,11 @@ move without the authorization, leaving the `TODO(authz)` markers described abov
 credential-injection stack from
 [PR #1360](https://github.com/agent-substrate/substrate/pull/1360) is now on `main`, and it does not
 mint actor JWTs either: the gateway calls an out-of-tree gRPC `CredentialProvider` with the actor's
-attested SPIFFE ID and injects whatever opaque bytes come back into an HTTP header.
+attested SPIFFE ID and injects whatever opaque bytes come back into an HTTP header. That provider
+request contains today's reusable, name-based SPIFFE ID, not the actor UID. The gateway has already
+validated the certificate's UID against the live actor before making the request, but the provider
+cannot independently distinguish a deleted-and-recreated actor incarnation from this field alone;
+it is trusting the authenticated gateway's assertion for the current request.
 
 A future actor-JWT egress provider could combine the two designs: use the actor certificate already
 presented to the gateway to select the actor, ask ateapi for a token bound to the destination's
@@ -503,8 +512,10 @@ snapshot. Two data sources exist:
   it; nothing injects it automatically. Since #1231, atelet watches the backing
   `egress-mitm.ate.dev:mitm:primary-bundle` object and atomically refreshes this file for registered
   running actors, retaining the last good contents if the bundle is deleted or malformed. The
-  registration remains in memory, so an atelet restart stops live refresh for an already-running
-  actor until its next Run/Restore.
+  registration remains in memory. If a worker crash leaves a stale registration and the same actor
+  UID later starts again on that node, the new registration supersedes the stale one; it no longer
+  panics. An atelet restart still loses the whole registry, so live refresh stops for an
+  already-running actor until its next Run/Restore.
 
 `systemInfo` volumes work on both the gVisor and micro-VM runtimes (the micro-VM guest receives
 them over the shared virtio-fs tree).
@@ -1072,8 +1083,9 @@ rg -n 'ActorSPIFFEID|ActorRefFromSPIFFEID' --glob '*.go' --glob '!**/*_test.go'
   [PR #1360](https://github.com/agent-substrate/substrate/pull/1360), but it resolves an opaque
   `ate-secret://` URI through a gRPC `CredentialProvider` whose only in-repo artifact is the proto;
   no provider implementation ships here, and none of it mints actor JWTs. It is also Envoy-only,
-  on the TLS-interception leg. An actor-JWT provider/injector remains unimplemented. See
-  EGRESS.md.
+  on the TLS-interception leg. The provider receives the current name-based actor SPIFFE ID without
+  the incarnation UID, so a provider that needs incarnation-level authorization also needs that
+  protocol gap closed. An actor-JWT provider/injector remains unimplemented. See EGRESS.md.
 - **Persistence of live trust-bundle refresh across an atelet restart.**
   [PR #1231](https://github.com/agent-substrate/substrate/pull/1231) is merged and refreshes bundles
   for actors registered in memory, but an atelet restart loses that registry until each actor's
