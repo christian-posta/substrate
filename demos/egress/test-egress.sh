@@ -96,6 +96,12 @@ info "target = ${TARGET_IP}:${TARGET_PORT}"
 log "create + resume Actor ${ATESPACE}/${ACTOR}, allow all its egress"
 ${KATE} create atespace "${ATESPACE}" >/dev/null 2>&1 || true
 ${KATE} create actor "${ACTOR}" -a "${ATESPACE}" --template "${TEMPLATE}" >/dev/null 2>&1 || true
+# The gateway denies by default, so the Actor needs a policy before its first
+# outbound connection. It cannot be created any earlier: the API refuses a
+# policy whose parent Actor does not exist yet. An `all` rule reproduces the
+# pre-policy behavior, which is what this test wants -- the EgressPolicy suites
+# are where narrow rules are exercised.
+${KATE} create egress-policy "${ACTOR}" -a "${ATESPACE}" --all >/dev/null
 ${KATE} resume actor "${ACTOR}" -a "${ATESPACE}" >/dev/null 2>&1 || true
 printf 'rules:\n- http: {hostnames: ["*"], ports: {all: {}}}\n- https: {hostnames: ["*"]}\n' | ${KATE} create egress-policy "${ACTOR}" -a "${ATESPACE}" -f - >/dev/null 2>&1 || true
 # Avoid 'grep -q': its early exit triggers SIGPIPE (exit 141) under pipefail while kubectl writes.

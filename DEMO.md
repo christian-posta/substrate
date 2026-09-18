@@ -22,8 +22,12 @@ state), and enforce the actor's `EgressPolicy`. They differ in where that happen
 they cover; see
 [EGRESS.md](./EGRESS.md#where-each-dataplane-enforces-it).
 
-**The gateway denies by default.** An actor with no `EgressPolicy` gets no tunnel at all, so every
-walkthrough below creates one. `kubectl ate create egress-policy` is the verb.
+**The gateway denies by default — with a caveat on agentgateway.** Every walkthrough below creates
+an `EgressPolicy`, because without one the actor's HTTP fetches are refused. `kubectl ate create
+egress-policy` is the verb. On Envoy that default-deny covers the whole tunnel. On agentgateway it
+covers only the routes policy is attached to, so a policy-less actor is still refused cleartext
+HTTP but can open TLS-passthrough and opaque-TCP egress; see
+[EGRESS.md](./EGRESS.md#default-deny-is-not-uniform).
 
 **Does not show:** credential injection (Envoy-only, and it needs an out-of-tree credential
 provider), or TLS interception, which exists behind `--experimental-use-sdsmint` but is not
@@ -78,7 +82,7 @@ PASS the gateway named every actor: alpha bravo charlie delta echo
 ```
 
 It leaves the WorkerPool at one replica. Scale it back with
-`kubectl -n ate-demo-egress scale workerpool/egress --replicas=2`.
+`kubectl -n ate-demo-egress scale workerpool/worker --replicas=2`.
 
 ## Scripted verification (easiest)
 

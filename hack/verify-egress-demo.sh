@@ -54,10 +54,15 @@ case "${DATAPLANE}" in
 esac
 echo "   dataplane=${DATAPLANE}"
 
-echo "== create atespace + actor =="
+echo "== create atespace + actor + egress policy =="
 kubectl-ate --context "${CTX}" create atespace "${ATESPACE}" 2>/dev/null || true
 kubectl-ate --context "${CTX}" create actor "${ACTOR}" \
   --atespace "${ATESPACE}" --template egress 2>/dev/null || true
+# The gateway denies by default. The policy cannot be created before the actor
+# -- the API refuses one whose parent does not exist -- so it goes here, before
+# any traffic. Without it the fetch below is a 403 and no CONNECT is logged.
+kubectl-ate --context "${CTX}" create egress-policy "${ACTOR}" \
+  --atespace "${ATESPACE}" --all >/dev/null
 # The router resumes the actor on demand; give the control plane a beat to
 # register it before driving traffic.
 sleep 10
