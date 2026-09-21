@@ -35,7 +35,8 @@ intercepted and carried over mTLS to a gateway that verifies who is making the r
 1. **Guide 1 - gateway accepts CONNECT + mTLS.** `atenet-egress` terminates the actor's mTLS `CONNECT` and
   tunnels to the requested destination.
 2. **Guide 2 — transparent interception.** `nftables` REDIRECTs actor TCP egress into `atunnel`,
-   which wraps it in mTLS + `CONNECT`.
+   which wraps it in mTLS + `CONNECT`. The redirect excludes destination port 53, which leaves
+   this demo's port-80 traffic unaffected; see [EGRESS.md](../../EGRESS.md#what-each-kind-of-traffic-gets).
 3. **Guide 3 — HTTP-only actors, identity carried by the certificate.** The Actor only dials plain
    HTTP. atunnel presents the actor's own certificate — minted per actor by ateapi off the
    actor-identity CA, carrying an `ActorIdentity` X.509 extension — and sends a bare `CONNECT`

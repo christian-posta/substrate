@@ -132,7 +132,10 @@ certificate's single URI SAN to equal exactly what `ActorSPIFFEID` builds from t
 `(atespace, name)`, then looks the actor up and authorizes only if the credential's UID equals the
 current record's UID and the actor is RUNNING (`cmd/atenet/internal/router/egress/egress.go`).
 agentgateway performs the same lookup, UID comparison and RUNNING check at CONNECT time, but reads
-the extension alone and ignores the URI SAN, so it never cross-checks the two. See
+the extension alone and ignores the URI SAN, so it never cross-checks the two. Since
+`docs/network-egress.md` landed, that is a contract deviation and not just a difference between
+dataplanes: the contract says a PEP MUST require the certificate's actor URI SAN to identify the
+same actor as the extension. See
 [EGRESS.md](./EGRESS.md#what-the-gateway-policies-actually-do).
 
 A generic SPIFFE verifier understands neither the extension nor either dataplane's check, and would
@@ -146,9 +149,12 @@ spiffe://substrate-actor.local/atespace/<atespace>/actor/<actor-name>/uid/<actor
 ```
 
 Substrate's current authorization and storage model already treats the UID as the incarnation
-boundary, so the canonical SPIFFE ID should include it. Atespace and name remain in the path for
-tenancy, policy readability, and lookup; the UID prevents identity and permissions from silently
-crossing delete-and-recreate. Suspend, resume, migration, and ordinary updates preserve the UID,
+boundary, so the canonical SPIFFE ID should include it.
+[Issue #1594](https://github.com/agent-substrate/substrate/issues/1594) closed with that model
+confirmed — user-provided `metadata.name` plus a server-generated `metadata.uid` — and with
+explicit guidance that a system baking a resource into a token must carry *both*, which is what
+this identity does. Atespace and name remain in the path for tenancy, policy readability, and
+lookup; the UID prevents identity and permissions from silently crossing delete-and-recreate. Suspend, resume, migration, and ordinary updates preserve the UID,
 so this identity remains stable for the actor's intended lifetime.
 
 The X.509 URI SAN, JWT-SVID `sub`, and any future WIT-SVID `sub` should use this exact same value.
@@ -169,7 +175,7 @@ private key.
 | Validity | one hour, with a five-minute backdated `NotBefore` |
 | Key usage | `DigitalSignature`; extended key usage `ClientAuth` **and** `ServerAuth` since #1315; not a CA. atunnel only requires `ClientAuth`, so the `ServerAuth` grant is currently unused and widens the credential beyond the client role the design intends |
 | Signer | the actor-identity CA (Ed25519 self-signed root in the default install) |
-| Custom extension | `ActorIdentity`, OID `1.3.6.1.4.1.11129.2.12.2` |
+| Custom extension | `ActorIdentity`, OID `1.3.6.1.4.1.11129.2.12.2`; allocated under Google's enterprise number and slated to change after the CNCF donation, per `docs/network-egress.md` |
 
 The `ActorIdentity` extension payload is plain JSON, not ASN.1, so non-Go verifiers need no ASN.1
 library:
@@ -192,8 +198,14 @@ refuses the tunnel when the certified UID no longer matches the live actor, or w
 not RUNNING, and answers 503 rather than failing open if the control plane is unreachable. See
 [EGRESS.md](./EGRESS.md#what-the-gateway-policies-actually-do).
 
-An established tunnel is not re-checked. The lookup is per CONNECT, so an actor deleted while a
-tunnel is open keeps that tunnel until it closes or the certificate expires.
+An established tunnel is not re-checked. The lookup is per CONNECT, so the gateway never revokes a
+tunnel it has already accepted, and certificate expiry does not close one either: expiry blocks new
+tunnels and deliberately lets admitted connections drain (`internal/atunnel/egress.go`). What does
+close them is the worker. Normal lifecycle teardown calls `atunnel`'s `Deactivate`, which cancels
+active streams and waits for their forwarding goroutines to exit. The `RevertActor` RPC adds one
+more route into that teardown — it moves the actor through `REVERTING` to `SUSPENDED` on its last
+external snapshot — so new tunnels are refused by the gateway and open ones are closed from the
+worker side.
 
 The companion `PodIdentity` extension (OID `1.3.6.1.4.1.11129.2.12.1`) appears on atelet, worker,
 and control-plane pod certificates. It carries namespace, service-account name and UID, pod name
@@ -384,7 +396,7 @@ that a relying party can enforce. A copied token therefore remains replayable an
 | Live renewal | Not implemented for JWTs |
 | Actor authorization in the public `MintActorJWT` RPC | Not implemented (`TODO(authz)`) |
 | JWT-SVID conformance (`sub` plus SPIFFE bundle keys with `use: jwt-svid`) | Not implemented |
-| Stable public issuer plus OIDC discovery/JWKS for OIDC consumers | Not implemented |
+| Stable public issuer plus OIDC discovery/JWKS for OIDC consumers | Not implemented; [issue #1756](https://github.com/agent-substrate/substrate/issues/1756) is the P0 proposal |
 | Cloud federation (GCP/AWS) | Intended by issue #124; no end-to-end implementation |
 | Automatic actor-JWT injection at egress | Not implemented |
 
@@ -474,7 +486,8 @@ Design properties of this chain:
   that re-verification for fewer handshakes.
 - **Mint time is not gated on the RUNNING state.** The mint happens during Run/Restore while the
   actor is still RESUMING. Both dataplanes check for RUNNING later, at CONNECT time, so a
-  certificate minted for an actor that never reaches RUNNING opens no tunnel.
+  certificate minted for an actor that never reaches RUNNING opens no tunnel, and one whose actor
+  leaves RUNNING — including through `RevertActor`'s `REVERTING` transition — opens no further one.
 
 ## Key placement and suspend/resume
 
@@ -1021,8 +1034,8 @@ rg -n 'MintActorJWT' --glob '*.go' --glob '!**/*_test.go' \
 # Both minting RPCs still carry their authorization TODOs.
 rg -n 'TODO\(authz\)' cmd/ateapi/internal/controlapi/actor.go
 
-# The intended replacement check is declared but not imported by any Go code,
-# and the module has no OpenFGA dependency at all.
+# The intended check is declared, and OpenFGA is now a real dependency wired
+# into ateapi's bootstrap, but no minting path consults either.
 rg -n 'can_mint_ateom_actor_credential' internal/authz/model.fga
 rg -n 'internal/authz' --glob '*.go'
 rg -n 'openfga' go.mod
@@ -1039,6 +1052,12 @@ rg -n 'ActorSPIFFEID|ActorRefFromSPIFFEID' --glob '*.go' --glob '!**/*_test.go'
   ID, and JWT verification keys should be published in a SPIFFE bundle with `use: jwt-svid`.
 - **JWKS / OIDC discovery compatibility** for OIDC-based actor federation. Nothing serves it, and
   `iss` is not a resolvable URL. This is separate from SPIFFE-native JWT-SVID bundle distribution.
+  [Issue #1756](https://github.com/agent-substrate/substrate/issues/1756) is the upstream proposal
+  and is scoped ahead of the M3 cutoff: a read-only `ate-oidc-server` serving discovery and JWKS,
+  an `--actor-jwt-issuer` flag for the public issuer, RS256 signing and RFC 7638 thumbprint key
+  ids, and a rotation story. Egress-side JWT injection
+  ([#1660](https://github.com/agent-substrate/substrate/issues/1660)) and RFC 8693 token exchange
+  ([#1661](https://github.com/agent-substrate/substrate/issues/1661)) both block on it.
 - **Trust domain as configuration.** `substrate-actor.local` and the atelet SPIFFE identity are
   hard-coded.
 - **Server-side authorization tests for the minting RPCs.** #1315 deleted
@@ -1054,9 +1073,14 @@ rg -n 'ActorSPIFFEID|ActorRefFromSPIFFEID' --glob '*.go' --glob '!**/*_test.go'
   that was previously missing from the JWT path, but neither `MintActorJWT` nor
   `MintActorCertificate` checks that the *caller* is entitled to that actor; both carry a bare
   `TODO(authz)`. `internal/authz/model.fga` already defines the intended relation
-  (`can_mint_ateom_actor_credential: host_node`) but no Go code imports it. PR #1114 sidesteps
-  this at startup by deriving claims inside the trusted Run/Restore workflow; any on-demand API
-  still needs it.
+  (`can_mint_ateom_actor_credential: host_node`), and since
+  [PR #1670](https://github.com/agent-substrate/substrate/pull/1670) that model is no longer
+  inert: `ateapi` boots an embedded, PostgreSQL-backed OpenFGA server, compiles the model into it
+  and serializes startup with an advisory lock, `cmd/ateapi/main.go` imports `internal/authz`, and
+  the top-level scope was renamed `cluster` to `global`. What is still missing is the call site —
+  no minting path performs a check, so the relation grants nothing yet. PR #1114 sidesteps this at
+  startup by deriving claims inside the trusted Run/Restore workflow; any on-demand API still
+  needs it.
 - **Administrative rotation of the JWT signing pool.** The pool can already switch its active key
   without a restart; the commands to add, activate, and retire keys are not written.
 - **Per-actor credentials for snapshot storage.** atelet reads and writes every actor's snapshots
@@ -1081,10 +1105,12 @@ rg -n 'ActorSPIFFEID|ActorRefFromSPIFFEID' --glob '*.go' --glob '!**/*_test.go'
   it.
 - **An actor-JWT credential provider.** Generic egress credential injection *is* on `main` since
   [PR #1360](https://github.com/agent-substrate/substrate/pull/1360), but it resolves an opaque
-  `ate-secret://` URI through a gRPC `CredentialProvider` whose only in-repo artifact is the proto;
-  no provider implementation ships here, and none of it mints actor JWTs. It is also Envoy-only,
-  on the TLS-interception leg. The provider receives the current name-based actor SPIFFE ID without
-  the incarnation UID, so a provider that needs incarnation-level authorization also needs that
+  `ate-secret://` URI through a gRPC `CredentialProvider` whose only in-repo artifact is the proto.
+  No provider implementation ships here — [PR #1335](https://github.com/agent-substrate/substrate/pull/1335)
+  proposes an example Kubernetes-Secret one and is still open, and the `kagent-dev/substrate` fork
+  ships `cmd/credential-provider` on its `main` for the agentgateway path — and none of them mints
+  actor JWTs. It is also Envoy-only, on the TLS-interception leg. The provider receives the current
+  name-based actor SPIFFE ID without the incarnation UID, so a provider that needs incarnation-level authorization also needs that
   protocol gap closed. An actor-JWT provider/injector remains unimplemented. See EGRESS.md.
 - **Persistence of live trust-bundle refresh across an atelet restart.**
   [PR #1231](https://github.com/agent-substrate/substrate/pull/1231) is merged and refreshes bundles
