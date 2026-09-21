@@ -13,6 +13,15 @@ sidecar written in Go, while agentgateway implements the checks natively in
 Rust. Where they diverge, this document says so; `cmd/atenet/internal/router/README.md`
 is the reference for the Envoy legs.
 
+`docs/network-egress.md` is the normative contract between `atunnel` and any
+egress policy enforcement point: what a PEP must require of a tunnel, and what
+it may never trust. This document is the agentgateway-specific companion to it
+and records, in place, the three points where the shipped path does not meet
+it: agentgateway ignores the certificate's URI SAN; its cleartext HTTP path can
+authorize an actor-provided hostname while still connecting to the IP address
+from the original CONNECT; and the worker forwards protocols the contract
+describes as blocked.
+
 ## Data path
 
 ```text
@@ -34,10 +43,11 @@ trusted ateom worker pod network namespace
 | ateom0: 169.254.17.1/30                                       |
 |     |                                                         |
 |     | nftables PREROUTING in the worker namespace             |
-|     | matches source 169.254.17.2 + IPv4 TCP                  |
+|     | matches source 169.254.17.2 + IPv4 TCP,                 |
+|     | destination port other than 53                          |
 |     | REDIRECT to local port 15001                            |
 |     v                                                         |
-| atunnel: 0.0.0.0:15001                                       |
+| atunnel: 0.0.0.0:15001                                        |
 +---------------------------------------------------------------+
                           |
                           | mTLS + HTTP/1.1
@@ -68,7 +78,12 @@ destination
 
 > [!WARNING]
 > **The shipped data path is not a complete sandbox egress-control boundary.**
-> `atunnel` intercepts IPv4 TCP sourced from the configured actor address.
+> `atunnel` intercepts IPv4 TCP sourced from the configured actor address,
+> *except* traffic to destination port 53. The redirect rule excludes that port
+> so DNS over TCP keeps working, but it selects on the port alone: **any TCP
+> payload an actor sends to port 53 on any destination it can route to leaves
+> the worker on the masquerade path**, with no CONNECT, no actor certificate, no
+> `EgressPolicy` and no gateway log line.
 > Forwarded actor UDP is dropped for every destination port but 53, which closes
 > external QUIC/HTTP-3 and custom-UDP paths, but DNS to *any* host is still forwarded,
 > and ICMP, SCTP, and every other IPv4 protocol still reach the compatibility
@@ -102,14 +117,18 @@ packets, and the current worker rules are not sufficient to claim robust
 anti-bypass enforcement against that actor. Non-TCP traffic other than UDP also
 bypasses `atunnel` through the compatibility masquerade described below. The
 strong statement supported by the code is therefore: ordinary IPv4 TCP emitted
-with the configured actor address is redirected outside the sandbox and cannot
-bypass `atunnel` by editing actor-local nftables.
+with the configured actor address, to a destination port other than 53, is
+redirected outside the sandbox and cannot bypass `atunnel` by editing
+actor-local nftables.
 
 The worker installs the redirect only when its Run or Restore request contains
 an egress gateway. With no gateway, `ateom` passes redirect port zero, installs
 no TCP redirect, and actor TCP remains on the masquerade path. The UDP drop rule
 is installed either way. The standard installation configures a gateway, but the
 data-path guarantee is conditional on that configuration reaching the worker.
+[PR #1717](https://github.com/agent-substrate/substrate/pull/1717) proposes
+closing that case at the source, by making `ate-api-server` refuse to start
+with an empty `--egress-gateway-address` instead of silently sending no gateway.
 
 A stronger anti-bypass boundary would match traffic arriving on `ateom0`, drop
 spoofed actor source addresses, default-deny forwarded actor traffic with narrow
@@ -152,9 +171,9 @@ records that the actor network is IPv4-only for now. The table has three chains:
 
 | Chain | Rule |
 |---|---|
-| `prerouting` (NAT) | IPv4 TCP from `169.254.17.2` is redirected to local port 15001. No destination or destination-port exclusions |
+| `prerouting` (NAT) | IPv4 TCP from `169.254.17.2` to any destination port **other than 53** is redirected to local port 15001. No destination-address exclusions |
 | `forward` (filter, policy `accept`) | UDP from `169.254.17.2` to any destination port **other than 53** is counted and dropped; everything else is accepted |
-| `postrouting` (NAT) | everything from `169.254.17.2` that was still forwarded is masqueraded. The rule matches on source address only, with no protocol condition |
+| `postrouting` (NAT) | everything from `169.254.17.2` that was still forwarded is masqueraded, notably TCP and UDP to port 53. The rule matches on source address only, with no protocol condition |
 
 Rule order in the forward chain matters: the accept is a catch-all, so the drop
 precedes it. The table has no `input` chain. Packets addressed to the worker
@@ -166,13 +185,14 @@ make a blanket claim that all non-DNS actor UDP is blocked.
 The redirect is transparent to the actor application. The application opens a
 normal socket and does not need proxy environment variables or CONNECT support.
 
-### TCP and non-TCP traffic differ
+### What each kind of traffic gets
 
-`atunnel` handles TCP only. What happens to everything else:
+`atunnel` handles TCP only, and not all of it. What happens to the rest:
 
 | Traffic from `169.254.17.2` | Result |
 |---|---|
-| TCP, any destination port | redirected into `atunnel`, tunneled, authorized |
+| TCP to any destination port other than 53 | redirected into `atunnel`, tunneled, authorized |
+| TCP to port 53, **any** reachable forwarded destination and **any** payload | not redirected; accepted and masqueraded |
 | Forwarded UDP to port 53, **any** destination host | accepted and masqueraded |
 | Forwarded UDP to any other port | counted and dropped |
 | UDP and non-TCP traffic addressed to the worker namespace | not covered by the `forward` rule; reaches local `INPUT` if a service is listening |
@@ -182,32 +202,44 @@ normal socket and does not need proxy environment variables or CONNECT support.
 Dropping forwarded non-DNS UDP closed the largest external hole: QUIC and HTTP/3
 on UDP 443, and custom UDP or DTLS command-and-control channels, no longer leave
 the worker through the forwarding path.
+The TCP exclusion for port 53 arrived later, with the contract document in
+[PR #1726](https://github.com/agent-substrate/substrate/pull/1726), and opened
+a smaller hole of its own: `TestActorEgressRedirectRuleExcludesDNS` pins the
+rule, and the rule compares the destination port and nothing else.
 The drop rule carries a counter deliberately, so a workload that legitimately
 needs UDP shows up as a rising counter rather than as an unexplained timeout.
 Reading it takes a host with `nft` that can enter the worker pod's network
 namespace — the worker image itself ships no `nft` binary, so
 `kubectl exec … -- nft list table ip ateom_actor` does not work.
 
-Two gaps remain in the same place. The DNS exception is still *any* destination
+Three gaps remain in the same place. The DNS exception is still *any* destination
 on port 53, not the configured cluster resolver, so an actor can reach an
-attacker-controlled resolver. And the catch-all accept still passes every
-non-TCP, non-UDP IPv4 protocol. Neither is covered by the gateway: the
-configured agentgateway path does not authorize or observe DNS queries, and it
-never sees the other protocols at all.
+attacker-controlled resolver. On TCP that exception is not limited to DNS at
+all: the rule selects on the port, so port 53 carries whatever the actor puts
+on it. And the catch-all accept still passes every non-TCP, non-UDP IPv4
+protocol. None of the three is covered by the gateway: the configured
+agentgateway path does not authorize or observe DNS queries, and it never sees
+the other traffic at all.
 
 NOTE: We should keep a close eye on this implementation and how it evolves.
 
-### Example non-TCP bypasses
+### Example bypasses
 
-An actor does not need special Linux capabilities to open a UDP socket. What
-that still buys it:
+An actor does not need special Linux capabilities to open a UDP socket, or a
+TCP socket to port 53. What that still buys it:
 
-- **DNS tunneling or exfiltration.** Still open. An actor can encode data in
-  queries for an attacker-controlled domain, either through the configured
-  resolver or by sending UDP port 53 traffic to any other reachable resolver.
-  The worker rule selects on destination port alone, not on the resolver
-  address. Agentgateway does not receive the queries and cannot associate them
-  with the actor's mTLS identity.
+- **DNS tunneling or exfiltration.** Still open, on both transports. An actor
+  can encode data in queries for an attacker-controlled domain, either through
+  the configured resolver or by sending port 53 traffic to any other reachable
+  resolver. The worker rules select on destination port alone, not on the
+  resolver address. Agentgateway does not receive the queries and cannot
+  associate them with the actor's mTLS identity.
+- **Arbitrary TCP to port 53.** Open, and not limited to DNS. The prerouting
+  rule excludes destination port 53 from the redirect, so an actor that dials
+  port 53 on a host it controls gets an unmediated TCP stream — TLS, SSH, a
+  plain reverse shell, anything — outside the tunnel, the certificate check and
+  `EgressPolicy`. This is the one bypass that costs an attacker nothing at all:
+  no capability, no protocol trick, one port number.
 - **QUIC or HTTP/3 over UDP port 443.** Closed for external destinations. The forward chain drops actor
   UDP to every port but 53, so an actor can no longer reach an external QUIC
   endpoint outside agentgateway's CONNECT, TLS, or HTTP processing.
@@ -221,6 +253,14 @@ that still buys it:
   not.
 - **IPv6.** Untouched. The table is IPv4-only, so nothing in this document
   applies to an actor with IPv6 connectivity.
+
+`docs/network-egress.md` states that traffic other than TCP or UDP port 53
+must reach a PEP and that "all other protocols are blocked". The worker blocks
+only forwarded non-DNS UDP, so ICMP, SCTP, GRE, ESP and every other forwarded
+IPv4 protocol are contract deviations, not merely documented gaps. IPv6 is not
+one today: the same contract scopes itself to an IPv4-only actor network, and
+the worker provisions only IPv4 addressing and forwarding. It becomes a
+deviation the moment IPv6 connectivity is enabled without equivalent rules.
 
 These bypasses are independent of `EgressPolicy`. Policy enforcement at the
 gateway covers only traffic that reaches the gateway; the worker must
@@ -244,15 +284,20 @@ reveals it later.
 > interception sees a resolved destination IP rather than the hostname the
 > application originally used.
 >
-> `EgressPolicy` addresses the second one directly, and the shape of the
-> solution is worth understanding before writing a policy. A `hostnames` rule
-> can only match where a hostname exists, which is inside the tunnel — the
-> `Host` of a cleartext request, or an intercepted TLS request on the sdsmint
-> gateway. At the CONNECT itself there is only an `IP:port`, so a `hostnames`
-> rule never matches there and only `cidrs` and `all` rules can. An actor that
-> dials its destination by address therefore needs a `cidrs` or `all` rule even
-> when a `hostnames` rule names the same server; this is what
-> `TestActorEgressPolicyDeniesUnlistedHost` pins.
+> `EgressPolicy` can recover a hostname from an application request inside the
+> tunnel, but the security result depends on the dataplane. Envoy routes a
+> hostname-authorized request to that hostname. agentgateway's intercepted
+> HTTPS route does the same, but its cleartext HTTP route does not: it uses the
+> request's `Host` for authorization and still connects to the IP address from
+> the original CONNECT. An actor can therefore connect to one address, present
+> an allowed hostname, and have agentgateway send the request to that original
+> address. On this route, a hostname rule is not destination confinement and
+> does not satisfy the contract's hostname-routing requirement.
+>
+> At the CONNECT itself there is only an `IP:port`, so a `hostnames` rule never
+> matches there and only `cidrs` and `all` rules can. Traffic whose application
+> protocol reveals no hostname therefore needs one of those address-based
+> rules.
 >
 > The first failure mode is still a worker-side problem, not a policy one. See
 > the table above for what leaves the worker without reaching the gateway.
@@ -260,7 +305,12 @@ reveals it later.
 ## Fail-closed behavior of intercepted TCP
 
 The fail-closed property in this section is limited to IPv4 TCP selected by the
-worker's redirect rule. It does not cover the non-TCP compatibility masquerade.
+worker's redirect rule, which excludes destination port 53. Certificate
+issuance still gates the actor's start for every kind of traffic: the mint
+happens before the workload runs and a failure aborts activation. What port 53
+and the non-TCP masquerade escape is everything after that — once an actor is
+running, neither waits for tunnel activation nor stops when the certificate
+expires.
 
 The worker runtime sets up egress in this order:
 
@@ -445,6 +495,15 @@ design choice — `agentGatewayAtenetDataplane.SupportsTLSPassthroughEgressPolic
 returns false with a TODO, and `TestActorEgressPolicyDeniesUnlistedHost`'s
 passthrough case is skipped on this dataplane.
 
+The cleartext HTTP route also separates the destination it authorizes from the
+destination it reaches. Policy evaluates the request's actor-provided `Host`,
+but a successful request is forwarded to the IP address and port from the
+original CONNECT. A hostname allowlist can therefore authorize traffic to a
+different address. The normative contract permits an actor-provided hostname
+as policy input only when the gateway routes the request to that authorized
+hostname, so the shipped agentgateway cleartext path does not meet that
+requirement.
+
 ## What the gateway policies actually do
 
 The image pinned by this repository must be the reference point for security
@@ -472,10 +531,26 @@ matters operationally: a denial answers **403**, while a control-plane
 `Unavailable` or `DeadlineExceeded` answers **503**. A control-plane outage
 therefore blocks every new tunnel rather than failing open.
 
+The `RUNNING` check is per CONNECT, not per request, so anything that moves the
+actor out of that state stops *new* tunnels. The gateway never revokes a
+CONNECT it already accepted, but that rarely leaves a stream running for long:
+normal worker-side teardown calls `atunnel`'s `Deactivate`, which cancels
+active streams and waits for their forwarding goroutines to exit. Suspend,
+pause and crash all take that path, and so does the `RevertActor` RPC, which
+passes through `REVERTING` and leaves the actor `SUSPENDED` on its last
+external snapshot.
+
 Note what it does *not* read: the SPIFFE URI SAN. agentgateway authorizes from
 the `ActorIdentity` extension alone. The Envoy path does both — it
 cross-checks the URI SAN against the extension and refuses a certificate whose
 single URI SAN is not exactly `resources.ActorSPIFFEID(ref)`.
+
+`docs/network-egress.md` requires the cross-check: a PEP "MUST" require that
+the certificate's actor URI SAN identify the same actor as the extension. The
+agentgateway path does not, so it does not meet the contract on this point. The
+same section records that the extension OID is allocated under Google's
+enterprise number and will change after the CNCF donation completes, which will
+break any verifier that hard-codes `1.3.6.1.4.1.11129.2.12.2`.
 
 ### `substrateEgress` (inner HTTP route)
 
@@ -559,6 +634,17 @@ never matched.
 Because a `hostnames` rule needs a hostname, it can only match inside the
 tunnel. See the caution above for what that means when an actor dials by IP.
 
+> [!IMPORTANT]
+> This matcher set is being replaced before GA.
+> [PR #1751](https://github.com/agent-substrate/substrate/pull/1751) makes
+> `EgressRule` a union of three protocol handlers — `http`, `https`
+> (intercepted) and `tls_passthrough` — still one ordered first-match list that
+> denies by default. `hostnames`, `cidrs` and `all` are removed, names move to
+> `host_patterns` and `sni_patterns`, each handler gains a `ports` field, and
+> CIDR rules leave v1 entirely pending a future `tcp` handler. **No field
+> numbers or names are reserved: existing policies must be recreated.** The PR
+> is proto-only; the gateways, the store contract and the e2e helpers follow.
+
 ### Where each dataplane enforces it
 
 | | Envoy | agentgateway |
@@ -574,6 +660,13 @@ tunnel. See the caution above for what that means when an actor dials by IP.
 On Envoy the TTL is exactly how stale a decision can be: a create, update or
 delete becomes visible to new requests within one TTL, and a deleted policy
 becomes a deny.
+
+How the Envoy leg hands the peer certificate to its ext_proc sidecar is under
+revision: [issue #1740](https://github.com/agent-substrate/substrate/issues/1740)
+wants to stop forwarding the client certificate through a header, and
+[PR #1758](https://github.com/agent-substrate/substrate/pull/1758) passes the
+chain through private Envoy metadata instead. The authorization decisions
+described here do not change; where the sidecar reads the certificate from does.
 
 One Envoy behavior is worth knowing because it looks like a hole and is not. A
 CONNECT that no address rule allows still opens when the policy has `hostnames`
@@ -626,7 +719,11 @@ This is implemented on Envoy only.
   default URI class is `ate-secret://kubernetes.io` and the default address is
   `credprovider.ate-system.svc:50051`, but the workload behind that address is
   deployed separately. `hack/install-ate.sh` splices the client flags into the
-  egress sidecar; it deploys no provider.
+  egress sidecar; it deploys no provider. Two exist elsewhere:
+  [PR #1335](https://github.com/agent-substrate/substrate/pull/1335) proposes an
+  example Kubernetes-Secret provider upstream and is still open, while the
+  `kagent-dev/substrate` fork ships one on `main` as `cmd/credential-provider`
+  and publishes it in releases, aimed at the agentgateway egress path.
 - Injection happens on the `egress_tls_mitm` leg only. On a cleartext leg, or
   with no provider configured, it is **skipped and the request is allowed
   through without the credential** — the reasoning being not to put a secret on
@@ -634,7 +731,12 @@ This is implemented on Envoy only.
 - Once attempted it fails closed: an unusable header name, an unparseable URI,
   a URI naming a different provider class, or a fetch failure all deny.
 - The injected header is set with overwrite semantics, so a value the actor
-  pre-seeded does not survive.
+  pre-seeded does not survive. [PR #1751](https://github.com/agent-substrate/substrate/pull/1751)
+  inverts that: injection becomes *replacement*, applied only when the actor's
+  request already carries the header with some placeholder value, and a request
+  without it passes through unchanged. The names `inject_static_headers` and
+  `CredentialHeaderInjection` are under discussion in the same PR for the same
+  reason.
 
 The installer hard-errors on `--experimental-egress-credential-injection` with
 `--atenet-dataplane=agentgateway`, and it implies `--experimental-use-sdsmint`.
@@ -703,6 +805,12 @@ that dataplane — `agentgateway-egress-mitm` is referenced only by
 `hack/install-ate.sh` — and `EnsureEgressMITMCAPoolSecret` returns early when
 the dataplane is agentgateway. Until those paths converge, use the shell
 installer or apply and provision the MITM overlay explicitly.
+
+[PR #1764](https://github.com/agent-substrate/substrate/pull/1764) reports a
+correctness bug in the Envoy interception path that applies to any MITM
+deployment: the gateway shares one upstream TLS context across hostnames and
+Envoy's session cache is not scoped by SNI, so a session established for one
+hostname can be offered to another and fail SAN validation with a 503.
 
 Interception widens what the policy can see, not what it enforces: a TLS
 request the gateway terminates is decided per request like a cleartext one,
@@ -902,7 +1010,8 @@ Worker-side, which is the same on both dataplanes:
 | Capability | Status |
 |---|---|
 | Complete sandbox network-egress lockdown | Not implemented |
-| Transparent expected-source actor IPv4/TCP interception | Implemented |
+| Transparent expected-source actor IPv4/TCP interception | Implemented, except destination port 53 |
+| Actor TCP to destination port 53 | Not enforced; excluded from the redirect and masqueraded, whatever the payload |
 | Fail-closed path for redirected TCP before tunnel activation | Implemented |
 | Anti-bypass enforcement against a network-privileged actor | Not established; source-only match and an `accept` forward policy need hardening |
 | Forwarded actor UDP confined to DNS | Implemented, but to any host on port 53, not the configured resolver; worker-local `INPUT` is not covered |
@@ -915,10 +1024,11 @@ Gateway-side:
 |---|---|---|
 | Actor mTLS certificate required | Implemented | Implemented |
 | ActorIdentity extension and `atunnel` purpose checked at CONNECT | Implemented | Implemented |
-| URI SAN cross-checked against the extension | Implemented | Not done; the SAN is ignored |
+| URI SAN cross-checked against the extension | Implemented | Not done; the SAN is ignored, against the contract's `MUST` |
 | `GetActor` lookup, UID match and `RUNNING` check at CONNECT | Implemented | Implemented |
 | Control-plane outage fails closed | Implemented (503) | Implemented (503) |
 | `EgressPolicy` on cleartext HTTP | Implemented | Implemented |
+| Hostname authorization is bound to the routed destination | Implemented | **Not implemented for cleartext HTTP**; an allowed `Host` can authorize the original CONNECT address |
 | `EgressPolicy` on TLS passthrough and opaque TCP | Implemented, by address at the CONNECT | **Not implemented** |
 | `EgressPolicy` on intercepted TLS | Implemented (sdsmint) | Implemented (MITM overlay) |
 | Port or method matching in a policy | Not in the API | Not in the API |
@@ -933,6 +1043,7 @@ Gateway-side:
 
 | Area | Path |
 |---|---|
+| Normative atunnel-to-PEP contract | `docs/network-egress.md` |
 | Actor network namespace and redirect | `internal/ateomnet/` |
 | Tunnel implementation | `internal/atunnel/` |
 | Actor certificate request and renewal | `internal/atunnel/` and `cmd/atelet/ateomsupport.go` |
