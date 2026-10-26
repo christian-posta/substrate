@@ -1,174 +1,171 @@
 ---
 title: Worker lifecycle
-description: The state machine on the worker side. Workers are pre-warmed pods that flip between Idle and Assigned. Plus what happens when a pod dies.
+description: The state machine on the worker side. Workers register as UNAVAILABLE, take actors while ACTIVE, and drain when their pod terminates. Plus epochs, worker restarts, and what happens when a pod dies.
 ---
 
-A **worker** in Substrate is a pre-warmed sandbox pod - a member of a
-`WorkerPool` Deployment, sitting around with the ateom runtime
-(`ateom-gvisor` or `ateom-microvm`) running, waiting for an actor to be
-restored into it.
+A worker in Substrate is a pre-warmed pod (a member of a `WorkerPool`
+Deployment running `ateworker-gvisor` or `ateworker-microvm`) that hosts many
+actors at once. Its lifecycle tracks whether the scheduler may place actors on
+it. How busy a worker is doesn't change its state, so a worker with ten actors
+and a worker with none are both simply `ACTIVE`.
 
-Workers are simpler than actors: just two states (plus "gone").
+Two parties drive that lifecycle. atecontroller's worker syncer watches the
+pod and moves the record between states, and the worker process reports what
+only it can know (its epoch, IPs, capacity, and sandbox runtimes) through
+atelet.
 
 ## States
 
-Idle vs. assigned is expressed by a single `Assignment` message on the
-worker record: **no assignment = idle**; an assignment = hosting one actor.
-
 ```mermaid
 stateDiagram-v2
-  [*] --> Idle: pod gets a PodIP<br/>(create worker record)
-  Idle --> Assigned: ResumeActor:<br/>assign worker
-  Assigned --> Idle: SuspendActor:<br/>Finalize → SUSPENDED
-  Assigned --> [*]: pod deleted<br/>(syncer cleanup)
-  Idle --> [*]: pod deleted<br/>(syncer cleanup)
+  [*] --> UNAVAILABLE: pod scheduled<br/>(CreateWorker)
+  UNAVAILABLE --> ACTIVE: pod Ready<br/>(MarkWorkerAvailable)
+  ACTIVE --> UNAVAILABLE: pod not Ready<br/>(MarkWorkerUnavailable)
+  UNAVAILABLE --> DRAINING: pod terminating<br/>(DrainWorker)
+  ACTIVE --> DRAINING: pod terminating<br/>(DrainWorker)
+  DRAINING --> [*]: pod gone<br/>(DeleteWorker)
+  UNAVAILABLE --> [*]: pod gone<br/>(DeleteWorker)
 
-  note right of Idle
-    assignment == nil
-    Eligible for any actor whose
-    sandbox class + selectors
-    this worker satisfies.
+  note right of ACTIVE
+    Schedulable, once the worker
+    process has registered and
+    reported its runtimes.
+    Hosts actors up to its capacity.
   end note
 
-  note right of Assigned
-    assignment = { actor_template, actor }
-    Hosting one actor,
-    scoped by (atespace, name).
-    Released back to Idle on suspend.
+  note right of DRAINING
+    Final. Takes no new actors;
+    actors already on it are
+    left alone until the pod is gone.
   end note
 ```
 
-## Worker record in Redis
-
-A worker is just a JSON proto at key `worker:<ns>:<pool>:<pod>` (unchanged):
-
-| Field | Idle worker | Assigned worker |
+| State | Meaning | Schedulable |
 |---|---|---|
-| `worker_namespace`, `worker_pool`, `worker_pod` | always set | always set |
-| `ip`, `worker_pod_uid`, `version` | always set | always set |
-| `node_name` | always set | always set |
-| `sandbox_class` | cached from the pool (`gvisor` \| `microvm`) | same |
-| `labels{}` | cached from the pool's labels | same |
-| `assignment` | **unset** (idle) | `{ actor_template, actor }` |
+| `UNAVAILABLE` | Registered but its pod is not Ready (starting, or the worker process restarting) | No |
+| `ACTIVE` | Pod Ready with an IP | Yes, if registered with runtimes |
+| `DRAINING` | Pod is terminating; never leaves this state | No |
 
-The old flat `actor_id` / `actor_namespace` / `actor_template` fields are
-gone. `assignment.actor_template` is a `KubeNamespacedObjectRef{namespace,
-name}` and `assignment.actor` is an `ObjectRef{atespace, name}` - so the
-assignment is scoped by the actor's `(atespace, name)` identity, not a bare
-id. The cached `sandbox_class` and `labels` are what the scheduler matches
-eligibility against without re-reading the `WorkerPool`.
+Leaving `ACTIVE` never evicts anything, and actors already on an
+`UNAVAILABLE` or `DRAINING` worker stay bound to it.
 
-## The worker-pool syncer keeps this fresh
+## Registration
 
 ```mermaid
 flowchart LR
-  K[K8s pod informer] -- Add/Update<br/>(PodIP assigned) --> C[Create worker record<br/>assignment=nil<br/>+ cache node_name,<br/>sandbox_class, labels]
-  K -- pod gone<br/>(delete/soft-delete) --> R[dead-worker recovery<br/>if assignment set:<br/>actor → SUSPENDED]
-  R --> D[Delete worker record]
-  C -.-> RED[(Redis)]
-  D -.-> RED
-  R -.-> RED
+  K[Pod informer] -- "pod scheduled" --> C["CreateWorker<br/>name = pod UID<br/>state UNAVAILABLE"]
+  W[ateworker starts] --> E["AcquireWorkerEpoch"]
+  E --> R["RegisterWorker<br/>epoch, IPs, capacity"]
+  R --> RT["SetWorkerSandboxRuntimes<br/>(from sandbox-runtimes.json)"]
+  RT --> RD["readiness probe passes"]
+  RD --> K2[Pod Ready] --> A["MarkWorkerAvailable<br/>state ACTIVE"]
+  C -.-> DB[(control-plane store)]
+  A -.-> DB
 ```
 
-On Add/Update the syncer reads the pod's `WorkerPool` to cache the pool's
-`sandboxClass` and labels onto the worker record (and refreshes them if they
-change). The release-on-death handler runs **before** the worker record is
-deleted, and only acts when the worker has an `assignment` (and the actor still
-points back at this pod), so the actor is restored to `SUSPENDED` while the
-worker record is still readable. A `CRASHED` actor is left `CRASHED`, not forced
-back to `SUSPENDED`. Eligibility to create a worker is keyed on the pod having a
-`PodIP`, not on the Ready condition.
+The syncer creates the record as soon as the pod has a node, copying the
+WorkerPool's labels onto it, and updates them if the pool's labels change. The
+worker process registers through the node-local atelet, which only accepts
+worker pods on its own node and forwards to ate-api-server. Because the
+worker's readiness probe fails until registration succeeds, a pod can't
+become Ready (and the worker can't become `ACTIVE`) before the control plane
+has its IPs and capacity. And because the scheduler also requires
+reported runtimes, an `ACTIVE` worker takes nothing until it has said which
+sandbox runtimes it can run.
 
-## How workers get *assigned*
+## Epochs: when the worker process restarts
 
-When `ResumeActor` runs, the assign-worker step reads the in-memory
-[worker cache](/components/ateapi/), filters to **eligible idle workers**,
-and does a randomized shuffle to pick one. If none are available it retries
-a few times with exponential backoff (10ms initial). After that it fails with
-a "no free workers" precondition error, which the router maps to a 503.
+The worker process can restart while its pod lives on (a container restart,
+or a recreated pod sandbox). Its sandboxes die with it, so the control plane
+has to tell old actors from new ones. It does that with epochs, and every
+worker process goes through the same three steps.
 
-There is no `WorkerPoolRef` anymore - eligibility is **selector-based**.
-A worker is eligible for an actor when **all** of these hold:
+1. It acquires an epoch, a number ate-api-server hands out per worker.
+2. It registers once with that epoch, which must be higher than the worker's
+   `registered_epoch`. A process whose epoch has been superseded is refused
+   and stops serving.
+3. It stamps each actor it starts with its epoch.
 
-1. **Sandbox class matches** - the worker's cached `sandbox_class` equals
-   the template's `sandboxClass` (snapshots are not portable across
-   classes).
-2. **Template gate** - the worker's `labels` satisfy the template's
-   `workerSelector`.
-3. **Actor selector** - the worker's `labels` also satisfy the actor's own
-   `worker_selector`.
+When `registered_epoch` rises, a reconciler in ate-api-server crashes every
+actor that ran under an earlier epoch and releases its assignment, then
+advances `observed_epoch`. The worker's previously reported runtimes are
+cleared on the new registration, so it takes no actors until it reports them
+again.
 
-Both selectors are AND'd. If the actor's `latest_snapshot_info` is a
-**local** snapshot pinned to specific node VMs, the candidate set is further
-restricted to workers on one of those nodes.
+## How actors get placed and released
 
-This is the bypass-the-K8s-scheduler trick: pod allocation is just a filter
-plus a shuffle over the cached worker set, not a scheduler decision.
-
-## How workers get *released*
-
-When `SuspendActor` finishes, the finalize step clears the worker's
-`assignment` (sets it to nil) and writes it back to Redis, and clears the
-actor's `worker_pool_name` and `ateom_pod_namespace`/`ateom_pod_name`/`ateom_pod_ip`
-pointers. The worker is
-immediately idle again and eligible to host a different actor.
+Placement adds an `ActorAssignment` under the worker and adds the actor's
+declared limits to the worker's `allocated` resources, and suspend, delete,
+and crash remove it and give them back. The scheduler picks among eligible
+`ACTIVE` workers with room using power-of-two-choices on load, and the bind
+re-checks room under the worker's row lock. We cover the eligibility rules
+(sandbox class, runtime, selectors, node pinning) on the
+[Workers](/components/workers/#how-an-actor-is-placed) page.
 
 ## What happens when a worker pod dies
 
-The syncer's pod-delete handler fires on pod removal. If the worker had an
-`assignment`, the syncer **forces the actor back to `SUSPENDED`** without
-producing a snapshot (the actor's existing `latest_snapshot_info`, if any,
-is still valid) and clears its pod pointers and `worker_pool_name`. A
-`CRASHED` actor keeps its status. Then the worker record is deleted.
+When the pod starts terminating, the syncer marks the worker `DRAINING`, and
+the worker process gets `SIGTERM`. It cancels any
+in-flight run or restore, lets checkpoints already running finish, and stops
+the remaining containers within the pod's grace period (one hour).
+Actors suspended during that window are released normally.
 
-This is a recovery path, not a planned transition. It is best-effort: the
-optimistic version check means a concurrent `SuspendActor`/`ResumeActor`
-can win and this attempt is dropped.
+When the pod object is deleted (or replaced by a same-named pod with a new
+UID), the syncer calls `DeleteWorker`, which releases every actor still bound
+to the worker before removing the record. What happens to each actor depends
+on where it is in its own lifecycle.
 
-:::caution[Known race]
-If a worker pod dies **and** a concurrent `SuspendActor` is in flight, the
-release-on-death and the suspend workflow can both touch the actor. Today
-this is best-effort - the worse outcome is a benign double-write, not data
-loss.
-:::
+- An actor that already reached `SUSPENDED` is left untouched and stays
+  resumable.
+- An actor still running is moved to `CRASHED`, and its node state is
+  reclaimed best-effort through atelet. A crashed actor can be reverted to its
+  last durable snapshot and resumed.
+
+If a release fails or another operation holds the actor, the record stays and
+the delete is retried. The syncer also cleans up in a few other cases.
+
+- A pod in a terminal phase is never Ready again, so the syncer deletes it.
+- A pod whose WorkerPool is gone is left to garbage collection, or deleted
+  gracefully if it was orphaned.
+- At startup the syncer re-reads every Worker record, so records whose pods
+  vanished while it was down are cleaned up.
 
 ## Pre-warming: where workers come from
-
-The `WorkerPool` CRD owns a Deployment of N replicas. atecontroller
-reconciles changes to that CRD into Deployment spec changes. Pods come up,
-start the pool's ateom runtime (ateom-gvisor or ateom-microvm), get a
-PodIP, and the syncer registers them as **Idle** workers - caching the
-pool's `sandboxClass` and labels onto each record.
 
 ```mermaid
 flowchart LR
   WP["WorkerPool CRD<br/>(replicas: 10)"] --> CTR[atecontroller]
   CTR --> DEP[K8s Deployment<br/>10 worker pods]
-  DEP --> P1[Pod 1: ateom runtime]
-  DEP --> P2[Pod 2: ateom runtime]
+  DEP --> P1[Pod 1: ateworker]
+  DEP --> P2[Pod 2: ateworker]
   DEP --> PN[...]
-  P1 -- has PodIP --> SYNC[worker-pool syncer]
-  P2 -- has PodIP --> SYNC
-  PN -- has PodIP --> SYNC
-  SYNC -- create worker record --> RED[(Redis: Idle worker)]
+  P1 -- "register via atelet" --> API[ate-api-server]
+  P2 -- "register via atelet" --> API
+  PN -- "register via atelet" --> API
+  CTR -. "worker syncer:<br/>create / mark / drain / delete" .-> API
 ```
 
-## Worker pools are isolation boundaries
+As the diagram above shows, the `WorkerPool` owns a Deployment of N replicas.
+Pods come up, start the pool's worker, register their capacity and runtimes,
+and become `ACTIVE` once they're Ready. Rollouts replace at most 10% of a pool's pods at a time with no
+surge, so capacity drains gradually.
 
-A `WorkerPool` is no longer named directly by an `ActorTemplate`. Instead an
-actor lands on a pool whose `sandboxClass` matches the template's **and**
-whose labels satisfy both the template's `workerSelector` and the actor's
-own `worker_selector`. This selector-based eligibility is the unit at which:
+## Worker pools as placement boundaries
 
-- You separate sandbox runtimes: a `gvisor` pool and a `microvm` pool never
-  share workers (snapshots are not portable across classes).
-- You have different worker base images / node placement per pool.
-- You scale capacity independently per workload class, and target templates
-  at a pool with labels.
+A `WorkerPool` is never named by an `ActorTemplate`. An actor can land on any
+pool whose labels satisfy both the template's `workerSelector` and the
+actor's own `worker_selector`, subject to its snapshot's sandbox class and
+runtime. That makes pools the unit at which you do each of the following.
+
+- Separate sandbox runtimes, since a `gvisor` pool and a `microvm` pool never
+  share workers and a snapshot restores only on its own class.
+- Choose worker size, node placement, and sandbox binaries.
+- Scale capacity independently per workload class, and target templates at a
+  pool with labels.
 
 ## Related
 
-- [Actor lifecycle](/flows/actor-lifecycle/) - the dual state machine on
-  the actor side.
+- [Actor lifecycle](/flows/actor-lifecycle/) - the state machine on the actor
+  side.
 - [Resume actor](/flows/resume-actor/) · [Suspend actor](/flows/suspend-actor/)
 - [WorkerPool](/concepts/workerpool/) · [Workers](/components/workers/)

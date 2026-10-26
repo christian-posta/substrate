@@ -1,189 +1,195 @@
 ---
 title: Golden snapshot bootstrap
-description: How atecontroller turns an ActorTemplate CRD into a reusable "golden" checkpoint that new actors can boot from in milliseconds.
+description: How ateapi's template reconciler turns a new ActorTemplate into a reusable "golden" snapshot by booting a real actor, suspending it, and tagging the result, so new actors restore instead of cold-booting.
 ---
 
 import goldenLifecycle from '../../../assets/golden-snapshot-lifecycle.svg?raw';
 
-An `ActorTemplate` says *"this is what an actor of this kind looks like"* -
-container image(s), entrypoint, env vars, sandbox class, and a
-`workerSelector`. By itself that's just a manifest. (The template no longer
-names a worker pool: placement is selector-based, so an `ActorTemplate` and
-a `WorkerPool` are decoupled - see [WorkerPool](/concepts/workerpool/).)
+An [`ActorTemplate`](/concepts/actortemplate/) says what an actor of this
+kind looks like (container image(s), entrypoint, env, volumes, compute size,
+and a `workerSelector`), and by itself that's just a record in ateapi's
+database. So how does Substrate get from that record to a _golden snapshot_
+that lets later actors of this template skip their cold boot? Substrate boots
+the workload for real on a worker, lets it initialize, and then captures
+whatever state the running workload ended up with.
 
-The interesting part is how Substrate produces the **golden snapshot** that
-later lets actors of this template come up in milliseconds. It does *not*
-build the snapshot statically from the image. Instead:
+:::caution[How the golden snapshot is made]
+ateapi's template reconciler creates a throwaway "golden" actor from the
+template in the template's own atespace, resumes it, and lets the workload
+actually boot on a real worker (same sandbox class, same pulled OCI image,
+real CPU and RAM). Once the workload has initialized, it suspends the actor
+synchronously, which checkpoints the running sandbox and uploads the snapshot
+to object storage. It then copies that snapshot into a
+[tag](/concepts/snapshot/#tags), deletes the golden actor, and records the
+tag on the template as `status.goldenSnapshotStatus.goldenTag`.
 
-:::caution[The snapshot is recorded, not built]
-`atecontroller` reacts to the new template by ensuring the reserved
-**`ate-golden`** atespace exists (`CreateAtespace`), creating a **throwaway
-"golden" actor** into it (`CreateActor`), calling `ResumeActor` on it, and
-letting the workload **actually boot on a real worker pod** - same sandbox
-(gVisor or micro-VM), same pulled OCI image, real CPU and RAM. Once the
-workload has had time to initialize it issues `SuspendActor`, which
-checkpoints the running sandbox. atelet uploads the resulting snapshot
-files to external storage (GCS/S3), and the URI prefix gets stamped back
-onto `ActorTemplate.Status.GoldenSnapshot`.
-
-So the "golden" image is a **live memory snapshot of a freshly-booted
-workload**, not a precomputed artifact. New actors get the side effects of
-all that initialization work - heap state, JIT caches, opened FDs, parsed
-config - without paying for it again.
+**The "golden" image is a live snapshot of a freshly booted workload rather
+than a precomputed artifact.** At the default `MEMORY` fidelity, new actors
+get the side effects of all that initialization work (heap state, JIT caches,
+parsed config, etc) without paying for it again.
 :::
+
+In the diagram below, we can follow the whole lifecycle, from the golden
+actor's warmup on a worker to the tag that later actors restore from.
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={goldenLifecycle} />
   <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
-    The bootstrap really does occupy a worker pod for the warmup window - that pod is
-    the one a regular actor would have gotten. After Ready, every later actor of this
-    template skips ①–④ entirely and restores from the external snapshot.
+    The bootstrap occupies room on a worker for the warmup window, and once
+    the golden tag is recorded, every later actor of this template skips the
+    boot and restores from the tagged snapshot.
   </figcaption>
 </figure>
 
-## Phase machine
+## Who drives it?
 
-The reconciler drives the template through four phases, tracked in
-`Status.Phase`. `PhaseInitial` is the empty-string zero value, so a freshly
-applied template starts there.
+The reconciler is a loop inside ate-api-server rather than a Kubernetes
+controller, and there is no watch on templates. Every resync interval
+(`--template-resync-interval`, 20 s by default) it lists all templates and
+queues each one whose golden build is neither finished nor failed, skipping
+templates with `goldenSnapshotConfig.mode: DISABLED`, and a small pool of
+workers drains the queue. Each pass over a template holds a PostgreSQL lease
+on that template, so several ateapi replicas never interleave its
+transitions.
 
-```mermaid
-stateDiagram-v2
-  [*] --> PhaseInitial
-  PhaseInitial --> PhaseResumeGoldenActor: CreateAtespace(ate-golden) +<br/>CreateActor()<br/>(throwaway "golden" actor)
-  PhaseResumeGoldenActor --> PhaseWaitGoldenActor: ResumeActor()<br/>(cold boot, stamp<br/>TakeGoldenSnapshotAt = now + warmup)
-  PhaseWaitGoldenActor --> PhaseReady: requeue fires,<br/>SuspendActor()
-  PhaseReady --> [*]: template usable
-```
+It drives the golden actor through the same Control RPCs a client would call
+(`CreateActor`, `ResumeActor`, `SuspendActor`, `CreateTag`, `DeleteActor`),
+in process, acting as the system.
 
-`PhaseFailed` is declared in the CRD type but the reconciler never assigns
-it - errors return up and trigger a normal requeue.
+## The golden actor
+
+| Property | Value |
+|---|---|
+| Atespace | The template's own atespace, under the same access policies and storage location as ordinary actors |
+| Name | The template's UID, so a template recreated under the same name never collides with an old golden actor |
+| Source snapshot | None, so it always cold-boots |
+| Egress policy | The template's `goldenEgressPolicy`, if set (preview) |
 
 ## Sequence
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant K as ActorTemplate CRD
-  participant CT as atecontroller
+  participant U as Client<br/>(kubectl ate)
   participant A as ateapi
-  participant W as Worker (golden actor)
-  participant G as GCS / S3
+  participant TR as template reconciler<br/>(inside ateapi)
+  participant W as Worker<br/>(golden actor)
+  participant OS as Object storage
 
-  K-->>CT: ActorTemplate created (PhaseInitial)
+  U->>A: CreateActorTemplate
+  A-->>U: template stored, status empty
 
-  rect rgb(235,245,235)
-    Note over CT: PhaseInitial → PhaseResumeGoldenActor
-    CT->>A: CreateAtespace(ate-golden)<br/>(idempotent; ignores AlreadyExists)
-    CT->>A: CreateActor(golden actor into ate-golden, template=this)
+  Note over TR: next resync picks it up,<br/>takes the template lease
+  TR->>A: CreateActor(atespace=template's,<br/>name=template UID)
+  A-->>TR: SUSPENDED, no snapshot
+  opt goldenEgressPolicy set
+    TR->>A: CreateActorEgressPolicy
   end
+  TR->>A: ResumeActor
+  A->>W: Run - cold boot from the template spec
+  W-->>A: up (after every wakeup probe answers 200)
+  A-->>TR: RUNNING
+  TR->>A: status.snapshotTime = now + warmup
 
-  rect rgb(235,245,235)
-    Note over CT: PhaseResumeGoldenActor → PhaseWaitGoldenActor
-    CT->>A: ResumeActor(golden)
-    A->>W: boot from scratch (no snapshot, no GoldenSnapshot yet)
-    A-->>CT: RUNNING (ResumeActor waits on readyz)
-    CT->>CT: stamp Status.TakeGoldenSnapshotAt = now + warmup<br/>(warmup = 0 if every container has a readyz probe)
-  end
+  Note over TR: requeue until snapshotTime<br/>(not a blocking sleep)
 
-  rect rgb(245,245,235)
-    Note over CT: PhaseWaitGoldenActor
-    CT->>CT: if now < TakeGoldenSnapshotAt:<br/>return ctrl.Result{RequeueAfter: remaining}<br/>(controller-runtime requeues - not a blocking sleep)
-  end
-
-  rect rgb(235,235,245)
-    Note over CT: PhaseWaitGoldenActor → PhaseReady
-    CT->>A: SuspendActor(golden)
-    A->>W: checkpoint
-    W->>G: upload snapshot files (parallel)
-    A-->>CT: SUSPENDED, latest_snapshot_info.external.snapshot_uri_prefix
-    CT->>K: Status.GoldenSnapshot = URI prefix<br/>Status.Phase = PhaseReady<br/>Ready condition = True
-  end
+  TR->>A: SuspendActor(mode=SYNCHRONOUS)
+  A->>W: Checkpoint
+  W->>OS: upload snapshot
+  A-->>TR: SUSPENDED, durable snapshot COMPLETED
+  TR->>A: CreateTag(name=template UID,<br/>scope=PUBLISHED)
+  A->>OS: copy snapshot under the tag's prefix
+  TR->>A: DeleteActor(golden actor)
+  A->>OS: delete the actor's own snapshot prefix
+  TR->>A: status.goldenTag = tag
 ```
 
-## What "Ready" means
+## The warmup wait
 
-Once `ActorTemplate.Status.GoldenSnapshot` is set:
+After the golden actor is running, the reconciler stamps
+`status.goldenSnapshotStatus.snapshotTime = now + warmup` and requeues the
+template for the remaining time. The work queue holds the item, so no
+goroutine is blocked. How long is the warmup? It depends on whether the
+containers declare wakeup probes.
 
-- Any subsequent `CreateActor + ResumeActor` for an actor of this template
-  will be **restored from the golden snapshot** - unless the actor has its
-  own newer snapshot. The resume workflow picks the restore strategy in this
-  order: the actor's own `latest_snapshot_info` (local or external) if set,
-  else the template's `GoldenSnapshot` (when `ResumeActor` was not called
-  with `boot=true`), else a cold boot from the template spec.
-- The result: new actors of this template come up in **lazy-page-restore
-  time**, not cold-boot time.
-
-## The warmup wait - why?
-
-The reconciler stamps `Status.TakeGoldenSnapshotAt = now + warmup` after
-resuming and defers the suspend until that time. It's not a blocking sleep:
-`PhaseWaitGoldenActor` returns `ctrl.Result{RequeueAfter: remaining}`, so
-controller-runtime re-fires reconcile later.
-
-The warmup is now a **fallback**, not a fixed 20 seconds for everyone:
-
-- If **every** container in the template declares a `readyz` HTTP probe, the
-  warmup is **0**. `ResumeActor` already blocks until each container's `readyz`
-  reports 200 (both runtimes wait for every readiness probe before `Run` /
-  `Restore` returns), so the workload is already initialized by the time the
-  controller gets `RUNNING` back - no extra wait is needed.
-- Otherwise (any container lacks a probe, or the template declares no
-  containers), it falls back to a default **20 s** warmup as a coarse "give the
-  workload time to initialize" budget.
+- If every container declares a `wakeupProbe`, the warmup is 0.
+  `ResumeActor` only returns once every probe answers 200, so the workload is
+  already serving by the time the reconciler sees `RUNNING`.
+- Otherwise it falls back to a 20 s warmup as a coarse "give the workload
+  time to initialize" budget.
 
 If you rely on the fallback and your workload needs longer (e.g. downloading
-a model), the resulting golden snapshot will be of a partially-initialized
-process - and that's what every actor of this template will restore from.
-Declaring a `readyz` probe (or baking the heavy initialization into your
-container image) is the way to make this deterministic.
+a model), the golden snapshot captures a partially initialized process, and
+that is what every actor of this template will restore from. Declaring a
+`wakeupProbe` on every container makes the snapshot point deterministic. Keep
+in mind that the golden actor holds a real slot on a worker for the whole
+window, so if the eligible pools are tightly sized, the bootstrap competes
+with regular actors for room.
 
-## What about the workload running during the wait?
+## Why a tag, and why delete the actor?
 
-Yes - the golden actor is occupying a real worker pod, eating real
-resources, for the whole warmup window (see the callout at the top of the
-page). The reconcile goroutine is *not* blocked during the wait; the
-work-queue holds the item until `RequeueAfter` elapses, so atecontroller
-is free to handle other reconciles in the meantime.
+A tag is an atespace-owned, immutable name for its own copy of one external
+snapshot. Copying the golden actor's snapshot into a tag means the golden
+snapshot outlives the actor that produced it, which lets the reconciler delete
+the golden actor (and the actor's own snapshot prefix with it) once the copy
+is complete. The tag is created with `PUBLISHED` scope, and it is only usable
+by actors of the template it was taken under, since `CreateActor` checks that
+a source tag's template UID matches.
 
-If an eligible `WorkerPool` is sized tightly, this matters: bootstrap
-consumes a slot. Operationally you'll want to either provision an extra
-worker for the bootstrap window, or accept that during warmup one fewer
-worker is available for traffic. (Which pool the golden actor lands on is
-selector-based, like any other actor of the template.)
+## What does "ready" mean?
 
-## After Ready
+Once `status.goldenSnapshotStatus.goldenTag` is set, the template's actors
+start from the golden snapshot.
 
-The golden actor record stays in Redis (in the `ate-golden` atespace) with
-`status=SUSPENDED`. Once a template reaches `PhaseReady` the reconciler is a
-no-op for it: the `ActorTemplate` spec is **immutable** after creation, so
-there is no in-place "refresh" - you create a new template (with a new
-image) to get a new golden snapshot.
+- `CreateActor` for this template, with no explicit source tag, freezes the
+  golden tag into the new actor, so the actor is born `SUSPENDED` holding a
+  borrowed snapshot (generation 1, owned by the tag). See
+  [Create actor](/flows/create-actor/).
+- The actor's first resume restores that snapshot instead of running the
+  container from scratch. Because the snapshot is tag-owned and shared by many
+  actors, atelet can serve it from a node-local snapshot cache after the first
+  download on that node.
+- The actor's first suspend writes a snapshot under its own prefix and stops
+  borrowing.
+
+An actor created before the golden tag exists has no snapshot and cold-boots
+on its first resume, and it does not pick up the golden snapshot later. Once
+a template has a golden tag, the reconciler skips it. Templates are
+immutable, so there is no in-place refresh, and to get a new golden snapshot
+you create a new template.
 
 ## Failure paths
 
-The reconciler does **not** transition to `PhaseFailed` on errors - it
-simply returns the error up to controller-runtime, which requeues with
-backoff. The phase stays at whatever it was (`PhaseInitial` /
-`PhaseResumeGoldenActor` / `PhaseWaitGoldenActor`), and the next reconcile
-retries the same step.
+Each pass is level-triggered, which means it observes the golden actor (and
+any tag already named after it), takes the one action that state demands,
+and re-observes. Every action is reentrant, so a pass that dies midway (e.g.
+a lost ateapi replica, a failed RPC) is picked up by the next one. Ordinary
+errors (no worker with room, an object-storage blip, etc) are requeued with
+exponential backoff.
 
-- **CreateAtespace / CreateActor fails** → stays in `PhaseInitial`,
-  requeued (`AlreadyExists` on the atespace is ignored, not an error).
-- **ResumeActor fails** (no eligible workers, image pull error) → stays in
-  `PhaseResumeGoldenActor`, requeued.
-- **SuspendActor fails** (checkpoint or upload error), or the suspended
-  actor comes back without an external snapshot → stays in
-  `PhaseWaitGoldenActor`, requeued.
+A few outcomes are terminal. For those, the reconciler writes
+`status.goldenSnapshotStatus.errorMessage` as `<Reason>: <detail>` and stops
+retrying.
 
-The golden actor record may be left dangling on a worker if a reconcile
-errored mid-flow - cleanup is the operator's responsibility for now.
+| Reason | When |
+|---|---|
+| `GoldenActorCrashed` | The golden actor reached `CRASHED` before its snapshot was taken, e.g. because a wakeup probe never answered 200. |
+| `GoldenActorInvalid` | `CreateActor` rejected the golden actor as invalid. |
+| `GoldenTagConflict` | A tag with the golden name exists but belongs to another actor or template. |
+| `GoldenEgressPolicyConflict` | The golden actor already has an egress policy that differs from the template's. |
+| `GoldenActorUnexpectedState` | Something else moved the golden actor to `DELETING` or `REVERTING`. |
+
+A failed build still leaves the template usable, and actors created from it
+simply cold-boot. To try the build again, recreate the template.
 
 ## Related
 
-- [Resume actor](/flows/resume-actor/) - sees the GoldenSnapshot strategy
-  branch in action.
-- [Actor lifecycle](/flows/actor-lifecycle/) - full state machine.
-- [atecontroller](/components/atecontroller/) - reconciler internals.
-- [ActorTemplate](/concepts/actortemplate/) - the CRD itself.
-- [Atespace](/concepts/atespace/) - including the reserved `ate-golden`.
+- [ActorTemplate](/concepts/actortemplate/) - the resource itself.
+- [Create actor](/flows/create-actor/) - where the golden tag is frozen into
+  a new actor.
+- [Resume actor](/flows/resume-actor/) - the restore path a golden-seeded
+  actor takes.
+- [Snapshot](/concepts/snapshot/) - tags, fidelity, and durable storage.
+- [ateapi](/components/ateapi/) - where the reconciler runs.
+- [Atespace](/concepts/atespace/) - the template's atespace hosts its golden
+  actor and tag.

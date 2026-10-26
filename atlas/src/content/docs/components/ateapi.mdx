@@ -1,185 +1,263 @@
 ---
 title: ateapi
-description: The control plane API server. Source of truth for actor and worker state, owner of the resume/suspend/pause workflows.
+description: The control plane API server. Source of truth for atespaces, templates, actors, tags, and workers, and owner of every actor lifecycle workflow.
 ---
 
-`ateapi` is a stateless gRPC server backed by Redis/Valkey. It is **the** source
-of truth for actor and worker state - every other component either calls it
-(atenet) or is called by it (atelet).
+`ateapi` is the Substrate API server. It runs as the `ate-api-server`
+Deployment in `ate-system` (two replicas by default) behind the `api` Service on
+port 443, and it serves gRPC backed by PostgreSQL. It's the source of truth for
+every Substrate API resource (atespaces, actor templates, actors, tags, workers,
+and access and egress policies), and every other component either calls it
+(atecontroller, atenet, atelet, `kubectl ate`) or is called by it (atelet).
+
+The replicas don't hold any state of their own beyond caches, so anything that
+has to stay consistent across replicas (e.g. resource records, per-actor leases,
+the worker change feed, authorization tuples) lives in the database.
 
 ## What it owns
 
 ```mermaid
 flowchart LR
-  subgraph ateapi["ateapi process"]
+  subgraph POD["ate-api-server pod"]
     direction TB
-    GRPC[gRPC server :443]
-    CTL[Control service<br/>actor + atespace RPCs]
-    SID[SessionIdentity service<br/>MintJWT / MintCert]
-    WF[Workflow engine<br/>resume / suspend / pause]
-    SYNC[Worker-pool syncer<br/>watches K8s worker pods]
-    WCACHE[In-memory worker cache]
-    STORE[Redis store adapter]
+    subgraph ateapi["ateapi process"]
+      direction TB
+      AUTH[Authn + OpenFGA authz<br/>interceptors]
+      CTL[Control service<br/>client-facing API]
+      WS[WorkerService<br/>atelet-only API]
+      WF[Actor / tag / worker<br/>workflows]
+      TR[Template reconciler<br/>golden snapshots]
+      WAR[Worker-assignment<br/>reconciler]
+      SCHED[Scheduler]
+      WCACHE[In-memory worker cache]
+    end
+    PLUG[objectstore-plugin<br/>control sidecar]
   end
 
-  GRPC --> CTL
-  GRPC --> SID
+  AUTH --> CTL
+  AUTH --> WS
   CTL --> WF
-  WF --> STORE
-  WF --> WCACHE
-  SYNC --> STORE
-  SYNC --> WCACHE
+  WS --> WF
+  TR --> CTL
+  WF --> SCHED
+  SCHED --> WCACHE
+  WAR --> WCACHE
+  WF -- copy / delete snapshots --> PLUG
 
-  CLIENT[atenet ExtProc] -.->|ResumeActor| CTL
-  CLI[kubectl-ate] -.->|all RPCs| CTL
-  K8s[(K8s API)] -.->|watch worker pods| SYNC
-  STORE -.-> REDIS[(Redis / Valkey)]
-  WF -.->|gRPC| ATELET[atelet on target node]
+  CLI[kubectl-ate] -.->|Control| AUTH
+  CTRL[atecontroller] -.->|worker registry RPCs| AUTH
+  NET[atenet router / egress] -.->|ResumeActor, GetActor,<br/>MintActorJwt| AUTH
+  ATELET[atelet] -.->|WorkerService| AUTH
+  WF -.->|Run / Restore /<br/>Checkpoint / Terminate| ATELET
+  WF --> PG[(PostgreSQL)]
+  PG -. worker change feed .-> WCACHE
+  PLUG -.-> OBJ[(GCS / S3)]
 
   click ATELET "/components/atelet/" "atelet"
-  click CLIENT "/components/atenet/" "atenet"
-  click REDIS "/components/storage/" "Storage"
+  click NET "/components/atenet/" "atenet"
+  click CTRL "/components/atecontroller/" "atecontroller"
+  click PG "/components/storage/" "Storage"
+  click OBJ "/components/storage/" "Storage"
 ```
 
-## Resource identity: `(atespace, name)`
+As the diagram above shows, every caller comes in through the same
+authentication and authorization interceptors, whether it's `kubectl ate` on the
+`Control` service or atelet on the `WorkerService`, and both services hand off
+to the same actor, tag, and worker workflows.
 
-Every Substrate resource now carries a common `ResourceMetadata`
-(`atespace`, `name`, `uid`, `version`, `create_time`, `update_time`), and an
-actor's identity is the tuple **`(atespace, name)`** - the old bare `actor_id`
-is gone. Requests reference a resource with an `ObjectRef{atespace, name}`, or
-carry the resource body itself (e.g. `CreateActorRequest{actor: Actor}` where
-the identity lives in `actor.metadata`). See the [Atespace](/concepts/atespace/)
-concept for the Create/Get/List/Delete +
-`ObjectRef`/`ResourceMetadata` conventions.
+## Resource identity
 
-## The Control gRPC service
+Every resource carries a common `ResourceMetadata` with `atespace`, `name`,
+`uid`, `version`, `create_time`, `update_time`, and `delete_time`. An
+atespace-scoped resource (ActorTemplate, Actor, Tag) is identified by the tuple
+`(atespace, name)`, while a global resource (Atespace, Worker) is identified by
+`name` alone. Requests point at a resource with an `ObjectRef{atespace, name}`
+or carry the resource body itself (e.g. `CreateActorRequest{actor: Actor}`).
 
-| RPC | Request → Response | Notes |
+The server assigns `uid` and `version`, and updates require them as
+preconditions (deletes accept them optionally), so a stale read or a resource
+that was deleted and recreated fails with `Aborted` instead of overwriting the
+wrong thing. The [Atespace](/concepts/atespace/) page covers how scoping works.
+
+## The Control service
+
+`Control` is the client-facing API, and the table below lists its RPCs grouped
+by resource.
+
+| Resource | RPCs | Notes |
 |---|---|---|
-| `GetActor` | `GetActorRequest{actor: ObjectRef}` → `Actor` | Fetch one actor record |
-| `CreateActor` | `CreateActorRequest{actor: Actor}` → `Actor` | Identity in `actor.metadata.{atespace,name}`; created with status `SUSPENDED` |
-| `UpdateActor` | `UpdateActorRequest{actor: ObjectRef, worker_selector: Selector}` → `UpdateActorResponse{actor}` | Updates placement; takes effect on next resume |
-| `SuspendActor` | `SuspendActorRequest{actor: ObjectRef}` → `SuspendActorResponse{actor}` | Running → Suspended; uploads snapshot to external storage |
-| `PauseActor` | `PauseActorRequest{actor: ObjectRef}` → `PauseActorResponse{actor}` | Running → Paused; keeps the snapshot on the node VM |
-| `ResumeActor` | `ResumeActorRequest{actor: ObjectRef, boot: bool}` → `ResumeActorResponse{actor}` | Suspended/Paused → Running. `boot=true` skips the golden snapshot and cold-boots |
-| `DeleteActor` | `DeleteActorRequest{actor: ObjectRef}` → `Actor` | Only a `SUSPENDED` or `CRASHED` actor may be deleted; returns the deleted record |
-| `ListWorkers` | `ListWorkersRequest{page_size, page_token}` → `ListWorkersResponse{workers, next_page_token}` | Paginated |
-| `ListActors` | `ListActorsRequest{atespace, page_size, page_token}` → `ListActorsResponse{actors, next_page_token}` | Paginated; optional `atespace` scopes the scan |
-| `CreateAtespace` | `CreateAtespaceRequest{atespace: Atespace}` → `Atespace` | Atespace CRUD (see below) |
-| `GetAtespace` | `GetAtespaceRequest{atespace: ObjectRef}` → `Atespace` | |
-| `ListAtespaces` | `ListAtespacesRequest{page_size, page_token}` → `ListAtespacesResponse{atespaces, next_page_token}` | Paginated |
-| `DeleteAtespace` | `DeleteAtespaceRequest{atespace: ObjectRef}` → `Atespace` | Rejects `FailedPrecondition` if any actors remain |
+| Atespace | `CreateAtespace`, `GetAtespace`, `ListAtespaces`, `DeleteAtespace` | Delete fails `FailedPrecondition` while actors, templates, or tags remain |
+| ActorTemplate | `CreateActorTemplate`, `GetActorTemplate`, `ListActorTemplates`, `DeleteActorTemplate` | Immutable once created; delete also removes the template's golden actor and golden tag |
+| Actor | `CreateActor`, `GetActor`, `ListActors`, `UpdateActor`, `DeleteActor` | Created `SUSPENDED`; `UpdateActor` changes `worker_selector`, effective on the next resume; delete works from any state |
+| Actor lifecycle | `ResumeActor`, `SuspendActor`, `RevertActor` | See the workflows below |
+| EgressPolicy | `Get/Create/Update/DeleteActorEgressPolicy` | One `default` policy per actor |
+| Tag | `CreateTag`, `GetTag`, `ListTags`, `UpdateTag`, `DeleteTag` | A tag holds its own copy of an actor's external snapshot |
+| Actor identity | `MintActorJwt`, `MintActorCertificate` | Only the egress gateway may call these; see [Actor identity](/concepts/actor-identity/) |
+| Worker | `ListWorkers`, `GetWorker`, `CreateWorker`, `UpdateWorker`, `DeleteWorker`, `DrainWorker`, `MarkWorkerAvailable`, `MarkWorkerUnavailable`, `ListWorkerActorAssignments` | The write RPCs are driven by atecontroller's worker syncer |
+| AccessPolicy | `Get/Create/UpdateGlobalAccessPolicy`, `Get/Create/Update/DeleteAtespaceAccessPolicy` | Role bindings for authorization |
 
-Actor status is one of `SUSPENDED`, `RESUMING`, `RUNNING`, `SUSPENDING`,
-`PAUSING`, `PAUSED`, or `CRASHED`. `PAUSING`,
-`PAUSED`, and `CRASHED` are recent additions that go with the pause/crash flows.
+List RPCs page with `ListOptions{page_size, page_token}`, and `ListActors` and
+the other atespace-scoped lists take an optional `atespace` (leave it empty to
+list across all atespaces).
 
-The destructive `DebugClear` (drop all data from the database) no longer lives on
-`Control` - it was split out into a separate **`Debug`** service, which opens the
-door to gating it independently. Note that today the server always registers the
-`Debug` service; there is no flag to disable or access-control it separately yet.
+Actor `status.state` is one of `SUSPENDED`, `RESUMING`, `RUNNING`,
+`SUSPENDING`, `REVERTING`, `DELETING`, or `CRASHED`. Let's look at the three
+lifecycle RPCs a bit closer.
 
-### Atespaces
+- `SuspendActor` checkpoints a running actor and releases its worker. By
+  default it's asynchronous, which means it returns once the checkpoint is on
+  the node and atelet uploads it in the background, while
+  `DURABILITY_MODE_SYNCHRONOUS` waits until the snapshot is complete in object
+  storage.
+- `ResumeActor` places a suspended actor on a worker and restores it. A call on
+  an actor that's already `RUNNING` returns immediately (`resumed=false`), which
+  is what makes it cheap for the router to call on every request.
+- `RevertActor` discards a running or crashed execution (or a node-local
+  snapshot) and returns the actor to `SUSPENDED` at its last durable snapshot.
 
-Atespaces are the tenancy boundary an actor is created into - Substrate-native
-records stored in Redis, not Kubernetes objects. An `Atespace` is
-global-scoped (its `metadata.atespace` is empty; its identity is
-`metadata.name`). `DeleteAtespace` refuses (`FailedPrecondition`) to remove an
-atespace that still holds actors. See [Atespace](/concepts/atespace/).
+## The WorkerService
 
-## The SessionIdentity gRPC service
+`WorkerService` is a second service on the same port for the node side. ateapi
+serves it only to atelet, authenticated by atelet's pod certificate and only for
+workers on that atelet's own node, and atelet relays most of these RPCs on
+behalf of the worker processes it supervises.
 
-A second service on the same server.
+| RPC | Purpose |
+|---|---|
+| `AcquireWorkerEpoch`, `RegisterWorker` | A worker process takes a new epoch at startup and registers its pod IPs and capacity under it |
+| `SetWorkerSandboxRuntimes` | Reports the sandbox runtimes the worker can run; nothing is placed until it does |
+| `RequestActorSuspend` | The worker proposes suspending an idle actor; ateapi runs the normal suspend workflow |
+| `ReportActorSnapshotState` | Records that a background upload finished, or that atelet detached an actor from the node |
+| `ReportActorCrashed` | Moves a `RUNNING` actor whose sandbox died to `CRASHED` and frees its slot |
+| `MintWorkerActorCertificate`, `MintWorkerActorJwt` | `worker-for-actor` credentials atelet uses while acting for an actor it hosts |
 
-Workloads call these from inside their sandbox to mint **session-scoped
-credentials** that survive worker migration:
+So why run two services on the same port? The split keeps two kinds of caller
+apart, with `Control` answering to users and platform components and
+`WorkerService` carrying what only a node can observe.
 
-- `MintJWT(MintJWTRequest)` - an OIDC-discovery-compatible JWT whose subject is
-  `apps/{appid}/users/{userid}/sessions/{sessionid}` and which carries an
-  `ate.dev` extension claim with the app/user/session IDs.
-- `MintCert(MintCertRequest)` - an X.509 cert (returned as a DER chain,
-  leaf-first) scoped to the same app/user/session.
+## Workflows and leases
 
-The workload authenticates either with its K8s service-account bearer token
-(the pod identity) or with an mTLS client cert; ateapi checks that the
-credential belongs to the pod currently mapped to the requested session, then
-signs.
-
-## The workflow engine
-
-All actor state transitions go through a small generic workflow engine that
-runs a workflow as a list of idempotent steps. Each workflow:
-
-1. **Acquires `lock:actor:<atespace>:<name>` in Redis** with a 30s TTL. The
-   workflow runs under a context that times out at 28s (TTL minus 2s of
-   padding) so the lock cannot be released after it has already expired.
-2. **Runs its steps** in order - each step first checks whether it is already
-   complete (so a retried workflow fast-forwards), then reads/writes Redis and
-   may call atelet over gRPC.
-3. **Returns `Aborted`** to the caller if the lock is already held.
+Each lifecycle operation runs as a workflow, which is a fixed sequence of
+idempotent steps. Every step first checks persisted state to see whether its
+work is already done, so a retried workflow fast-forwards to wherever the last
+attempt stopped.
 
 ```mermaid
 flowchart LR
-  IN[RPC handler] --> LOCK{Acquire<br/>lock:actor:atespace:name}
-  LOCK -- failed --> ABORT[return Aborted]
-  LOCK -- ok --> S1[Step 1]
+  IN[RPC handler] --> LEASE{Acquire lease<br/>lease:actor:atespace:name}
+  LEASE -- held elsewhere --> ABORT[return Aborted]
+  LEASE -- ok --> S1[Step 1]
   S1 --> S2[Step 2]
-  S2 --> S3[Step 3]
-  S3 --> S4[Step N]
-  S4 --> UNLOCK[Release lock]
-  UNLOCK --> OUT[return Actor]
+  S2 --> SN[Step N]
+  SN --> REL[Release lease]
+  REL --> OUT[return Actor]
 ```
 
-The steps for each workflow:
+1. Acquire a lease on `lease:actor:<atespace>:<name>`. Leases are rows in
+   PostgreSQL with a 30s TTL that the holder renews in the background (about
+   every 10s). The workflow runs under a context that's cancelled if the lease
+   is lost, so a stalled replica can't keep writing after another one has taken
+   over.
+2. Run the steps, each of which reads and writes the database under a version
+   precondition and may call atelet over mTLS gRPC.
+3. Return `Aborted` ("another operation is in progress") if the lease is
+   already held, in which case the caller retries.
+
+The table below lists the main workflows and their steps.
 
 | Workflow | Steps |
 |---|---|
-| **Resume** | load the actor → assign a worker → tell atelet to restore → finalize as Running |
-| **Suspend** | load the actor → mark it Suspending → tell atelet to suspend → finalize as Suspended |
-| **Pause** | load the actor → mark it Pausing → tell atelet to pause → finalize as Paused |
+| Resume | load the actor → create external volumes → assign a worker → attach volumes → tell atelet to restore (or boot) → finalize as Running |
+| Suspend | load the actor → mark Suspending → tell atelet to checkpoint → detach volumes → finalize as Suspended → release the replaced snapshot |
+| Revert | load the actor → mark Reverting → discard the worker → discard any in-progress snapshot → finalize as Suspended |
+| Delete | mark Deleting → terminate on atelet → detach volumes → release the worker → delete volumes → release external snapshots → remove the record |
+| Tag | make sure the source snapshot is uploaded → reserve the tag → copy the snapshot to the tag's prefix → finalize |
 
-## The worker-pool syncer and worker cache
+`ResumeActor` reads the actor before it takes the lease, and if the actor is
+already running it returns without touching the lease table. Templates, tags,
+and workers have leases of their own (`lease:actortemplate:…`, `lease:tag:…`).
+We walk through the step-by-step flows in [Resume actor](/flows/resume-actor/)
+and [Suspend actor](/flows/suspend-actor/).
 
-The hot path needs to answer "give me a free worker in pool X" fast. That
-answer comes from Redis, fronted by an **in-memory worker cache**. A
-**worker-pool syncer** keeps Redis in sync with actual K8s state, and the cache
-keeps an in-process view current:
+## Scheduling and the worker cache
 
-- **Watching worker pods**: pod gets a `PodIP` → a worker record (idle, with no
-  assignment) is written to Redis. (Registration is keyed on the pod having an
-  IP, **not** on the Ready condition.)
-- **Pod removal**: pod is gone → if the worker held an assignment, its actor is
-  reset to `SUSPENDED`, then the worker record is deleted from Redis.
-- The worker cache streams worker updates from the store and periodically
-  relists to recover from missed events, exposing an O(1) view for scheduling.
+A worker is a multi-actor host, which means it reports a resource capacity and
+each actor assigned to it books its template's CPU and memory limits against
+that capacity. Assignments are their own records (`ActorAssignment`), one per
+hosted actor.
 
-:::caution[Known race]
-If a pod dies **and** a concurrent `SuspendActor` is in flight, the actor can
-get released twice. Best-effort cleanup only - tracked upstream.
+So how does the scheduler decide which worker should host an actor? It answers
+from an in-memory worker cache, which is seeded by listing workers, kept current
+by a change feed that PostgreSQL delivers from a transactional outbox, and fully
+relisted every 5 minutes to recover from missed events.
+
+A worker is a candidate when it is `ACTIVE`, has reported its runtimes,
+matches both the template's and the actor's `worker_selector`, runs the sandbox
+class and a runtime the actor's snapshot needs, sits on the required node when
+the latest snapshot is node-local, and has room. Among the candidates the
+scheduler samples two at random and picks the less-loaded one (power of two
+choices).
+
+## Background reconcilers
+
+Next to the RPC server, ateapi runs two loops of its own.
+
+- The template reconciler exists because ActorTemplates are database records
+  rather than Kubernetes objects, so ateapi builds their golden snapshots
+  itself. On a periodic resync (20s by default) it walks templates
+  whose golden snapshot isn't done, and for each one, holding a per-template
+  lease, it creates a golden actor in the template's own atespace (named by the
+  template's UID), resumes it, waits out the warmup, suspends it synchronously,
+  copies the snapshot into a published golden tag, and deletes the golden
+  actor. The warmup is 20s unless every container declares a wakeup probe, in
+  which case it's zero. See [Golden snapshot](/flows/golden-snapshot/).
+- The worker-assignment reconciler handles worker restarts. When a worker
+  process restarts it registers a higher epoch, and the reconciler notices the
+  epoch rise and crashes the actors that ran under the old epoch, since their
+  sandboxes died with it.
+
+Neither loop handles worker registration. atecontroller watches worker pods and
+calls the worker RPCs above, and when a worker's pod goes away, `DeleteWorker`
+moves any actor still running on it to `CRASHED` (an actor that already
+suspended cleanly stays `SUSPENDED`) before removing the record.
+
+## Object storage through a plugin
+
+ateapi never talks to object storage directly. Its pod runs the
+`objectstore-plugin` as a control sidecar on a Unix socket, and the workflows
+call it to copy a snapshot (for tags and golden snapshots) and to delete
+snapshots (on suspend, delete, and revert), while uploads and downloads happen
+on the nodes. The [Storage](/components/storage/) page covers both sides.
+
+## Authentication and authorization
+
+Callers authenticate with an mTLS client certificate (Substrate components use
+Kubernetes pod certificates carrying a SPIFFE ID) or with a bearer JWT from a
+provider listed in `--authentication-config`, such as Kubernetes ServiceAccount
+tokens, and either one becomes a principal ID.
+
+Authorization is always on, and every RPC is checked against an OpenFGA model
+embedded in ateapi. Its tuples live in the same PostgreSQL database, so a
+resource write and its authorization change commit together. Users get `owner`,
+`editor`, or `viewer` on the global scope or on one atespace through
+AccessPolicies, and `--authz-bootstrap-owners` names principals that are always
+global owners. Substrate's own components (atecontroller, the router, the egress
+gateway, atelet, the API server's sidecar) hold fixed system roles bound to
+their pod certificates, each granting only the calls that component makes.
+
+:::caution[Bootstrap owner in development installs]
+`ate-setup` makes the shared `ate-client` ServiceAccount the default bootstrap
+owner so demos and tests work, which means anyone who can mint a token for it
+is a global owner. For a shared install, set real operator principals instead.
 :::
-
-## The Redis keyspace
-
-| Key | Value | Notes |
-|---|---|---|
-| `actor:<atespace>:<name>` | Actor proto (JSON) | Keyed by `(atespace, name)` |
-| `atespace:<name>` | Atespace proto (JSON) | Global-scoped |
-| `worker:<ns>:<pool>:<pod>` | Worker proto (JSON) | Keyed by pod identity |
-| `lock:actor:<atespace>:<name>` | Lock owner ID | 30s TTL |
-
-## Authentication
-
-Incoming gRPC auth is selected by `--auth-mode`:
-
-- **`mtls`** (default) - client identity comes from transport-level mTLS.
-- **`jwt`** - *additionally* requires a Kubernetes ServiceAccount Bearer token
-  on every RPC, verified against the cluster's OIDC issuer in a gRPC
-  interceptor. This mode is a stopgap that will be dropped once Pod Certificates
-  are enabled by default in the minimum supported Kubernetes version.
 
 ## Related
 
-- [Resume actor flow](/flows/resume-actor/) - sees the workflow engine in action.
-- [Atespace](/concepts/atespace/) - the tenancy boundary in resource identity.
-- [System topology](/topology/) - how ateapi connects to everything else.
-- [Storage](/components/storage/) - Redis/Valkey and GCS/S3 details.
+- [Resume actor flow](/flows/resume-actor/) shows the resume workflow in action.
+- [Golden snapshot](/flows/golden-snapshot/) walks through the template
+  reconciler's flow.
+- [Atespace](/concepts/atespace/) covers the tenancy and authorization boundary.
+- [Actor identity](/concepts/actor-identity/) explains what `MintActorJwt` and
+  the `worker-for-actor` credentials assert.
+- [Storage](/components/storage/) covers PostgreSQL and the object-store plugin.
+- [System topology](/topology/) shows how ateapi connects to everything else.

@@ -1,265 +1,239 @@
 ---
-title: Suspend and pause an actor
-description: Freeze a running actor to a checkpoint and release its worker - either committing the snapshot to object storage (suspend) or keeping it on the node VM (pause). The inverse of resume.
+title: Suspend an actor
+description: Freeze a running actor to a new snapshot generation and release its room on the worker. By default the snapshot stays on the node and is uploaded in the background; a synchronous suspend uploads it before returning. The inverse of resume.
 ---
 
-Freezing a running actor is the trick that lets Substrate run far more actors
-than there are worker pods. A running actor is checkpointed, its worker is
-released back to the pool, and the actor record is updated to point at the
-snapshot. The next request triggers a [resume](/flows/resume-actor/) onto a
-worker.
+Freezing a running actor is how Substrate runs far more actors than its
+workers could hold at once. A running actor is checkpointed, its room on the
+worker is released back to the pool, and the actor record is updated to point
+at the new snapshot, so the next request triggers a
+[resume](/flows/resume-actor/).
 
-There are **two flavors** of this, driven by two RPCs on the `Control` service:
+So who decides an actor should be suspended? Suspend is explicit, and a
+client or a higher-level system calls `SuspendActor`
+(`kubectl ate suspend actor`) when it decides an actor is idle. The
+[golden snapshot](/flows/golden-snapshot/) reconciler also calls it to
+capture a template's golden actor. `SuspendActorRequest` names the actor by
+`ObjectRef{atespace, name}` and optionally sets `options.mode`, which picks
+one of the two modes below.
 
-| RPC | Where the snapshot lands | Effect on the next resume |
+| Mode | `SuspendActor` returns | Durable copy at return |
 |---|---|---|
-| **`SuspendActor`** | Uploaded to **object storage** (GCS/S3), node freed entirely | Can resume onto any eligible worker; downloads the snapshot |
-| **`PauseActor`** | Kept **local to the node VM**, node freed but the snapshot stays | Prefers to resume back onto that same node; no download |
+| `DURABILITY_MODE_ASYNCHRONOUS` (default) | As soon as the checkpoint is committed on the node | `PENDING`; atelet uploads it in the background |
+| `DURABILITY_MODE_SYNCHRONOUS` (`--mode=sync`) | After the snapshot is uploaded to object storage | `COMPLETED` |
 
-Both take a `SuspendActorRequest`/`PauseActorRequest` whose only field is an
-`actor` `ObjectRef{atespace, name}`, and both run as a four-step workflow under
-the per-actor lock. The workflows are near-identical - they differ only in the
-checkpoint type handed to atelet, the snapshot scope, and the `SnapshotInfo`
-variant written back.
+Both modes run the same workflow, and the mode only decides when atelet
+uploads. Let's walk through the sequence below.
 
-## Sequence (suspend)
+## Sequence
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant C as Client
   participant A as ateapi
-  participant R as Redis
-  participant L as atelet DaemonSet<br/>(on actor's worker node)
-  participant O as ateom-gvisor<br/>(actor's worker pod)
-  participant G as GCS / S3
+  participant DB as PostgreSQL
+  participant L as atelet<br/>(actor's node)
+  participant O as ateworker<br/>(actor's worker pod)
+  participant OS as Object storage<br/>(via plugin sidecar)
 
-  C->>A: SuspendActor(ObjectRef{atespace, name})
+  C->>A: SuspendActor(ObjectRef{atespace, name}, mode)
 
   rect rgb(245,235,235)
-    Note over A,R: Lock acquired:<br/>lock:actor:{atespace}:{name}<br/>(30s TTL, 28s workflow timeout)
+    Note over A,DB: lease:actor:{atespace}:{name}<br/>(30s TTL, renewed while running)
+    A->>DB: load actor + template<br/>(SUSPENDED? return it as is)
+    A->>DB: Mark SUSPENDING:<br/>new generation, uuid, URI,<br/>durable copy PENDING
 
-    A->>R: Load actor
-    A->>R: Mark SUSPENDING<br/>(status=SUSPENDING, allocate snapshot URI)
+    A->>L: Checkpoint(snapshot uuid/generation,<br/>fidelity, URI, upload mode)
+    L->>O: CheckpointWorkload (Unix socket)
+    O->>O: deactivate the actor's ingress,<br/>checkpoint, tear down sandbox
+    O-->>L: files written
+    L->>L: commit into the node's<br/>local checkpoint directory
+    opt synchronous
+      L->>OS: upload files (zstd), then manifest.json
+    end
+    L-->>A: snapshot state on the node
 
-    Note over A,L: Dial atelet on the node hosting<br/>the actor's worker pod (atelet pod IP, port 8085)
-    A->>L: Checkpoint(EXTERNAL, snapshotURI, scope=onCommit)
-    L->>O: Checkpoint call (gRPC over Unix socket)
-    O->>O: runsc checkpoint → files on node hostPath,<br/>then tear down the actor veth pair
-    O-->>L: SnapshotFiles[]
-    L->>G: zstd-compress + upload in parallel<br/>+ manifest.json
-    G-->>L: ok
-    L-->>A: Checkpoint ok
-
-    A->>R: Finalize → SUSPENDED<br/>(clear worker Assignment,<br/>latest_snapshot_info=External{URI}, status=SUSPENDED)
+    A->>A: detach external volumes, if any
+    A->>DB: Finalize: release the worker assignment,<br/>record the snapshot, state = SUSPENDED
   end
 
-  A-->>C: Actor{ status=SUSPENDED, latest_snapshot_info=External }
-```
+  A-->>C: Actor{ state = SUSPENDED }
+  A-)OS: release the durable snapshot it replaced<br/>(best-effort)
 
-**Pause** follows the same shape, with a different tail: `PauseActor` marks the
-actor `PAUSING`, checkpoints locally (`Checkpoint(LOCAL, snapshotPrefix,
-scope=onPause)`) so atelet moves the checkpoint into the node's local-checkpoint
-directory instead of uploading, then finalizes to status `PAUSED` and writes a
-`LocalSnapshotInfo` recording the node VM that holds the snapshot.
+  Note over L,OS: asynchronous mode, later:
+  L-)OS: upload (after --snapshot-upload-delay)
+  L-)A: ReportActorSnapshotState → durable copy COMPLETED
+```
 
 ## What happens in each step
 
-### Mark suspending / pausing - reserve the snapshot location
+### Load, and the idempotent short-circuit
 
-Before doing any work, ateapi flips the actor to `STATUS_SUSPENDING`
-(or `STATUS_PAUSING`) and reserves a snapshot location in
-`actor.in_progress_snapshot`, so that if anything crashes mid-checkpoint the
-stale data has a known location.
+ateapi takes the actor's lease and loads the actor and its template. A
+`SUSPENDED` actor is returned unchanged whatever the mode, even if its latest
+snapshot is still only on its node. An actor already `SUSPENDING` (a previous
+attempt died midway) continues from where that attempt stopped, and any other
+state is rejected with `FailedPrecondition`.
 
-- **Suspend** builds an external URI prefix of the form
-  `<snapshotsConfig.location>/<name>/<RFC3339-timestamp>-<random>`. The
-  bucket/prefix comes entirely from the template's `snapshotsConfig.location`
-  (trailing slash trimmed); ateapi appends `/<name>/<ts>-<rand>` (no fixed
-  `actors/` or `snapshots/` segment).
-- **Pause** reserves a plain, node-local prefix: `<name>-<RFC3339-timestamp>-<random>`
-  (no bucket - the snapshot never leaves the node).
+### Mark suspending and mint the new generation
 
-Both steps only act when the actor is `RUNNING`, and both short-circuit if the
-actor is already in the terminal state for their flow (`SUSPENDED` / `PAUSED`).
+Before any work, ateapi flips the actor to `ACTOR_STATE_SUSPENDING` and
+appends a new entry to `status.snapshots` with these values.
+
+- `generation = lastAssignedGeneration + 1`, and a fresh `uuid`;
+- `fidelity` from the template's `snapshotConfig.preferredFidelity`;
+- the sandbox runtime the actor is running under, so a later restore can find
+  a compatible worker;
+- a durable copy in state `PENDING`, at
+  `<location>/atespaces/<atespace>/actors/<actor-uid>/snapshots/<uuid>`.
+
+Why record the URI up front? If anything fails midway, the partial objects
+have a known owner and location, and a retry re-sends the same snapshot
+rather than starting another.
 
 ### Drive the checkpoint on atelet
 
-ateapi resolves the **atelet DaemonSet pod running on the same node** as the
-actor's worker pod - it looks up the atelet on that worker's node and dials
-its pod IP on `:8085`. atelet is per-node, not per-pod: one atelet serves every
-worker pod scheduled to its node.
+ateapi dials the atelet on the node named in the actor's worker assignment,
+over mutual TLS, and sends `Checkpoint` with the snapshot's uuid, generation,
+fidelity, and URI, plus the upload mode (`DEFERRED` for an asynchronous
+suspend, `IMMEDIATE` for a synchronous one). From there, the steps on the
+node go in this order.
 
-If the actor is in `SUSPENDING`/`PAUSING` but has no assigned worker (empty pod
-pointers), the step crashes the actor and fails - there's nothing to checkpoint.
+1. atelet calls the worker process in the pod (`ateworker-gvisor` or
+   `ateworker-microvm`) over a Unix socket in the node directory both pods
+   mount.
+2. The worker first deactivates the actor's ingress in its `atunnel`
+   listener, so no new request reaches the actor, then checkpoints at the
+   requested fidelity and tears the sandbox down. If it already holds a
+   completed checkpoint of this snapshot (e.g. a retry after a lost
+   response), it returns that instead of checkpointing again.
+3. atelet commits the files into the node's local checkpoint directory for
+   the actor, writing a `manifest.json` beside them.
+4. In `IMMEDIATE` mode, atelet uploads each file zstd-compressed through its
+   object-store plugin sidecar, and writes the manifest last.
 
-Otherwise atelet is sent a `CheckpointRequest`. The only differences between the
-two flows are:
+atelet finishes a checkpoint it has started even if ateapi stops waiting, so a
+caller timing out cannot leave half a snapshot behind. It returns its view of
+the actor's snapshots on the node, i.e. the latest local one, any upload in
+flight, and the latest durable one.
 
-| | Suspend | Pause |
-|---|---|---|
-| `Type` | `CHECKPOINT_TYPE_EXTERNAL` | `CHECKPOINT_TYPE_LOCAL` |
-| Config | `ExternalConfig{ snapshot_uri_prefix }` | `LocalConfig{ snapshot_prefix }` |
-| `Scope` | `snapshotsConfig.onCommit` | `snapshotsConfig.onPause` |
+### Detach volumes, then finalize
 
-The checkpoint request does **not** carry the sandbox config - atelet uses the
-version the actor is currently running (recorded on-node at Run/Restore) and
-pins it into the snapshot manifest. atelet then:
+External (CSI) volumes, if the template has any, are detached from the node.
+Then ateapi re-reads the actor (if something else has moved it out of
+`SUSPENDING` meanwhile, the step fails rather than overwrite it) and does
+three things in one update.
 
-1. Makes the Checkpoint call to ateom over a Unix socket in the shared
-   `/var/lib/ateom-gvisor` hostPath, so atelet (on the node) and ateom-gvisor
-   (inside the worker pod) see it at the same path. See
-   [resume actor](/flows/resume-actor/) for the hostPath diagram - checkpoint
-   uses the same plumbing in reverse.
-2. ateom-gvisor execs `runsc` to checkpoint into
-   `/var/lib/ateom-gvisor/actors/<actor-uid>/checkpoint-state/` on the
-   node - a full checkpoint of the `pause` container that roots the sandbox for
-   `Full` scope, or just an `fs-checkpoint` of the durable-dir volumes for
-   `Data` scope - then reports back **exactly the files runsc wrote** (a
-   `checkpoint.img` plus any pages images it emitted) rather than a hardcoded
-   list.
-3. **Suspend** zstd-compresses each reported file and uploads it to GCS/S3 **in
-   parallel**, then writes a `manifest.json` alongside them.
-   **Pause** instead moves the checkpoint into the node's
-   `.../local-checkpoint/` directory - no upload.
+1. It releases this actor's assignment on the worker, returning its CPU,
+   memory, and actor slot to the pool. Other actors on the same worker are
+   untouched.
+2. It records the new snapshot. A synchronous suspend marks its durable copy
+   `COMPLETED`. If atelet kept a local copy, or the durable copy is still
+   `PENDING`, the snapshot's `locality` is set to the node and the actor stays
+   attached to it (`assignedNode`); otherwise the node binding is cleared.
+3. It clears `workerAssignment`, prunes generations it no longer needs, and
+   sets `state = SUSPENDED`.
 
-### Finalize - release the worker
+Finally, ateapi asks its object-store plugin to delete any durable snapshot
+the update dropped. This is best-effort, and a failure only leaves objects in
+storage until the actor is deleted. A snapshot borrowed from a tag is never
+deleted, and an asynchronous suspend keeps the previous durable snapshot
+until a newer one is `COMPLETED`, so the actor always has one to fall back
+to.
 
-Once the snapshot is durably in place, ateapi:
+## After an asynchronous suspend
 
-1. **Clears the worker's `Assignment`** (sets `worker.Assignment = nil`) so it's
-   eligible to host a new actor - but only if the assignment still points at
-   this actor (guarding against a concurrent reassignment).
-2. **Updates the actor**: promotes `in_progress_snapshot` into
-   `latest_snapshot_info`, then clears `ateom_pod_namespace`,
-   `ateom_pod_name`, `ateom_pod_ip`, and `worker_pool_name`, and sets the final
-   status.
+The actor is `SUSPENDED` but still attached to its node, because that node
+holds the only copy of its newest state. From there, a few things can
+happen to it.
 
-The two flows write different `SnapshotInfo` variants:
+- A resume within the window restores from the local files on that node,
+  with no download. If the node has no room, the resume first asks atelet to
+  detach the actor (uploading the snapshot if needed) and then places it
+  anywhere.
+- The background upload runs about `--snapshot-upload-delay` (5 minutes by
+  default) after the checkpoint. atelet reports it through
+  `ReportActorSnapshotState`, and ateapi marks the durable copy `COMPLETED`.
+- The detach runs after `--snapshot-detach-delay` (30 minutes by default).
+  atelet makes sure the snapshot is durable, deletes the local files, and
+  reports it, and ateapi clears the snapshot's `locality` and the actor's
+  `assignedNode`.
 
-- **Suspend** → `SnapshotInfo{ external: ExternalSnapshotInfo{ snapshot_uri_prefix } }`, status `SUSPENDED`.
-- **Pause** → `SnapshotInfo{ local: LocalSnapshotInfo{ snapshot_prefix, node_vms_with_local_snapshots: [nodeName] } }`, status `PAUSED`. The node name is read from the worker being released, so the following resume knows which node still holds the snapshot.
+With an asynchronous suspend we trade durability for latency, because until
+the upload completes, the newest state exists only on that node. If the node is
+lost first, a resume tries the upload location on another node, and crashes
+the actor if the snapshot never got there (`RevertActor` then returns it to
+its previous durable snapshot). Use `--mode=sync` when the snapshot must be
+in object storage before the call returns, e.g. before creating a
+[tag](/concepts/snapshot/#tags) from it, or before a planned node drain.
+(`CreateTag` waits for a pending upload itself.)
 
 ## What gets checkpointed
 
-The checkpoint contents are decided by the snapshot **scope**, chosen per
-trigger in `snapshotsConfig` - `onCommit` for suspend, `onPause` for pause
-(with `onCommit` a subset of `onPause`). See [Snapshot](/concepts/snapshot/) for
-the `Full` vs. `Data` scopes and the exact on-disk layout. atelet treats the
-files as opaque: it ships exactly what `runsc` wrote, each zstd-compressed, plus
-a `manifest.json`. For gVisor that's a `checkpoint.img` (sentry state,
-registers, FD table, filesystem deltas) plus any pages images `runsc` emits;
-resume streams RAM pages in lazily, which is what keeps resume fast even on
-multi-GB checkpoints.
-
-## What if the workload is unresponsive?
-
-`runsc checkpoint` doesn't gracefully ask the workload to pause - gVisor freezes
-the sentry, then writes the state. From the workload's perspective, its next
-syscall just blocks until resume. There's no SIGTERM, no cleanup hook.
+The contents depend on the template's fidelity, which is `VOLUMES`,
+`ROOTFS`, or `MEMORY` (the default), and [Snapshot](/concepts/snapshot/)
+covers what each captures and the on-disk layout per sandbox runtime. For
+gVisor at `MEMORY` fidelity that is a `runsc checkpoint` of the sandbox plus
+separate filesystem bundles, and for micro-VMs it's a Cloud Hypervisor memory
+snapshot plus tars of the rootfs upper layer and durable volumes.
 
 ## What about in-flight requests?
 
-Neither suspend nor pause is **graceful**. There is no drain phase, no signal to
-the workload, and no coordination with the L7 proxy - the proxy keeps routing
-right up until the sandbox is destroyed. Two distinct cases are worth pulling
-apart.
+Suspend isn't graceful toward requests. There is no drain phase and no signal
+to the workload, and the worker's first move is to deactivate the actor in
+`atunnel`. That cancels requests already inside the tunnel and waits for their
+handlers to exit (so the client sees its request fail), and it refuses new
+requests for the actor with `421` and an `X-Ate-Assignment-Stale` header,
+telling the gateway its cached assignment is stale.
 
-### Requests *already inside* the sandbox when the checkpoint fires
+Whatever the workload was doing in memory is then captured mid-flight. A
+`MEMORY` snapshot preserves that in-progress state, but the response is gone,
+so **suspend has at-most-once semantics for in-flight work.** Anything that
+must survive should be flushed to a durable volume or an external system
+before the workload reports it done, which is the same discipline you'd want
+anyway, since suspend can be called at any moment.
 
-Once the Checkpoint call to ateom runs, the sequence inside the worker pod
-is:
+### Requests that arrive during the freeze
 
-1. `runsc checkpoint` on the `pause` container (which roots the sandbox) freezes
-   the sentry. Any goroutine in the workload that was mid-syscall stops where it
-   is. The kernel never sees the syscall complete; userspace never sees the
-   result.
-2. Best-effort `runsc delete` on the application containers and the `pause`
-   container. The sandbox process tree is destroyed.
-3. The **actor veth pair is torn down**: ateom deletes the host-side veth
-   `ateom0` (which also removes its peer) and any interior veth, undoing the
-   link-local `169.254.17.0/30` wiring and the `ateom_actor` nftables rules.
-   (This is the current model - the actor no longer moves a real `eth0` between
-   netns; the pod keeps its own `eth0` throughout.)
+What about a request that shows up while the actor is frozen? The gateway
+calls `ResumeActor` for the actor. While the suspend holds the actor's lease,
+that call returns `Aborted`, and once the actor is `SUSPENDING` it returns
+`FailedPrecondition`. Both are parked and retried (see
+[request parking](/flows/resume-actor/#request-parking)). When the suspend
+finishes, the next attempt resumes the actor (typically in place on the same
+node from its local snapshot), and the request is served late rather than
+failed. If the suspend outlasts the park budget (5 s by default), the client
+gets an error.
 
-That order matters. By step 2, the sentry that owned the request's sockets is
-gone, so any TCP state the workload was holding (open connections from the L7
-proxy, half-written HTTP responses, in-flight DB queries to external services)
-is dropped. By step 3, even segments still in flight land on a torn-down veth
-with no listener - the kernel responds with RST. The L7 proxy sees the
-connection close mid-response and propagates that to the client as a
-**502 / upstream-reset**. The work is lost; the checkpoint captured the state
-*before* the request finished, so the next resume has no memory it ever
-happened.
-
-This is also the moment any non-durable work disappears: an open file write that
-wasn't `fsync`'d, an outbound RPC whose response hadn't arrived yet, a metric
-increment that lived only in process memory. **Freezing an actor has
-at-most-once semantics for whatever the workload was doing.** Anything that
-needs to survive must be flushed to durable storage before the request appears
-done from the workload's side - which, since suspend/pause can be called at any
-moment, is the same discipline you'd want anyway.
-
-### Requests that arrive *during* the freeze window
-
-New requests routed by the L7 proxy go through ExtProc, which always calls
-`ResumeActor` on every request. While the Suspend or Pause workflow holds
-`lock:actor:<atespace>:<name>` in Redis, that `ResumeActor` call returns gRPC
-`Aborted` ("another operation is in progress for this actor").
-
-Crucially, this **does not** propagate to the client as an error. The router
-dedupes concurrent calls for the same actor (keyed `<atespace>/<actor_name>`)
-and adds an explicit retry loop: on `Aborted` it backs off and retries with an
-exponential backoff (7 steps, starting at 200ms, factor 1.5, jitter 0.2, capped
-by a 15s background context). All concurrent requests for the same actor share
-the single in-flight call, so the freeze → resume transition causes one resume
-to happen and every waiting request piggybacks on it.
-
-The client-visible effect is **added latency** (the freeze duration plus a
-resume) rather than a failure. The only way these requests turn into errors is
-if the retry budget runs out - i.e. the freeze takes longer than ~15 seconds,
-which exceeds even the workflow's own 28s timeout budget and would point at a
-stuck checkpoint. If that happens, the gRPC `Aborted` falls through to the
-default error mapping and the client gets HTTP 500.
-
-### Net effect
-
-| Request state when `Checkpoint` runs | Outcome |
-|---|---|
-| Already routed to the worker, being handled by the workload | Sandbox destroyed under it. Proxy sees connection reset, client gets 502, work is lost. |
-| Still in ExtProc / not yet routed | `ResumeActor` returns `Aborted`, the router dedupes and retries with backoff until the freeze completes, then routes to a worker. Added latency, no error. |
-
-The lack of a drain phase is a deliberate trade - it keeps suspend/pause cheap
-and bounded (no waiting for indeterminate request lifetimes), at the cost of
-pushing exactly-once semantics onto the workload. There's a tracked plan to do
-this more gracefully via a finalizer-based controller that holds the pod
-`Terminating` until the actor is suspended; see
-[issue #23](https://github.com/agent-substrate/substrate/issues/23).
+With AgentGateway, a request that hits the stale `421` evicts the cached
+assignment and re-resolves, so it joins the same park-and-resume path. With
+Envoy, the default dataplane, a request that was already routed when the
+actor was deactivated receives the `421` instead.
 
 ## Failure modes
 
-- **Lock conflict**: a concurrent operation on the same actor returns gRPC
-  `Aborted` ("another operation is in progress for this actor"). Client should
-  back off and retry.
-- **External upload fails (suspend)**: atelet returns a data-loss error that
-  signals the actor should be crashed; ateapi moves the actor to **`CRASHED`**
-  (external snapshot files aren't cached on failure, so the workflow can't safely
-  retry - tracked as
-  [#362](https://github.com/agent-substrate/substrate/issues/362)).
-- **No worker at checkpoint time**: if the actor is `SUSPENDING`/`PAUSING` but
-  has no assigned worker, the workflow crashes the actor - see
-  [actor lifecycle](/flows/actor-lifecycle/).
-- **Worker pod dies mid-checkpoint**: the syncer's release-on-death path
-  resets the actor to `SUSPENDED` (unless already `CRASHED`), clears
-  `in_progress_snapshot` and the `ateom_pod_namespace`/`ateom_pod_name`/`ateom_pod_ip`
-and `worker_pool_name` pointers, and
-  leaves `latest_snapshot_info` alone - so the previous successful snapshot (if
-  any) is still the resume target.
+- A lease conflict with another operation on the same actor returns
+  `Aborted`, so back off and retry.
+- On transient atelet errors (`Unavailable`, deadline exceeded, a snapshot
+  conflict reported as `Aborted`), the error is returned and the actor stays
+  `SUSPENDING` with its assignment intact, and a retried `SuspendActor`
+  resumes the same snapshot.
+- Any other checkpoint failure moves the actor to `CRASHED`, releases its
+  worker, and keeps the partial snapshot entry so `RevertActor` or
+  `DeleteActor` can clean it up.
+- If atelet's snapshot state conflicts with the record at finalize, the
+  workload is already gone, so the actor is crashed rather than retried.
+- If the worker pod dies mid-suspend, the checkpoint cannot complete, and the
+  actor typically ends up `CRASHED`, either from the failed checkpoint or
+  when ateapi deregisters the dead worker. `RevertActor` returns it to its
+  last durable snapshot (see
+  [actor lifecycle](/flows/actor-lifecycle/#what-can-move-an-actor-without-a-client-rpc)).
 
 ## Related
 
 - [Resume actor](/flows/resume-actor/) - the reverse flow.
 - [Actor lifecycle](/flows/actor-lifecycle/) - full state machine, including
-  `PAUSED` and `CRASHED`.
-- [Snapshot](/concepts/snapshot/) - external vs. local snapshots and scopes.
+  `CRASHED` and `REVERTING`.
+- [Snapshot](/concepts/snapshot/) - generations, fidelity, local vs. durable.
 - [atelet](/components/atelet/) - the node-side machinery.

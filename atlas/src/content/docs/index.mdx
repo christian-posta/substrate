@@ -24,17 +24,20 @@ import topologyHero from '../../assets/topology-hero.svg?raw';
 
 ## What is Substrate?
 
-**Agent Substrate** is a Kubernetes-native runtime for highly-multiplexed actor
-workloads - AI agents, sandboxed environments, stateful services. It decouples
-actor lifecycle from Pods, so a small pool of pre-warmed sandbox workers -
-**gVisor or micro-VM** - can host **30× more actors than there are pods**, by
-suspending idle actors to object storage and restoring them on demand.
+Agent Substrate is a Kubernetes-native runtime for workloads that spend most of
+their time idle (AI agents, sandboxed environments, stateful services, etc). We
+run a lot of these, and giving each one its own pod means paying for capacity
+that sits there waiting. Substrate decouples an actor's lifecycle from the pod
+that runs it, so a small pool of pre-started gVisor or micro-VM workers can host
+far more actors than there are pods. It does that by packing many actors onto
+each worker, suspending the idle ones to snapshots, and restoring them when a
+request shows up.
 
-Each actor lives in an [**atespace**](/concepts/atespace/) (Substrate's tenancy
-boundary), so its identity is the tuple `(atespace, name)` - which is why you'll
-see that pair in DNS names, storage keys, and every API call throughout this atlas.
-
-The bird's-eye view:
+Each actor lives in an [atespace](/concepts/atespace/) (Substrate's tenancy
+boundary), so its identity is the pair `(atespace, name)`. You'll see that pair
+everywhere in this atlas, e.g. in the `ate-target-actor` routing header, in
+storage keys, in credentials, and in every API call. The diagram below puts the
+whole system on one whiteboard.
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={topologyHero} />
@@ -48,21 +51,21 @@ The bird's-eye view:
 
 <CardGrid>
   <Card title="System topology" icon="seti:graphql">
-    The static architecture: every binary, every port, every connection.
+    The static architecture, with every binary, port, and connection.
     [Open →](/topology/)
   </Card>
   <Card title="Resume actor" icon="rocket">
-    The most interesting flow - touches every component. Cold start from
-    snapshot, end to end.
+    The most interesting flow, since it touches every component. Restoring an
+    actor from a snapshot, end to end.
     [Open →](/flows/resume-actor/)
   </Card>
   <Card title="ateapi internals" icon="seti:go">
-    Control plane API: RPCs, workflow engine, Redis keyspace.
+    Control plane API: RPCs, workflows, PostgreSQL leases, scheduling.
     [Open →](/components/ateapi/)
   </Card>
   <Card title="Concepts glossary" icon="document">
-    Quick definitions for the domain terms - actor, atespace, worker,
-    session, snapshot, WorkerPool, ActorTemplate.
+    Quick definitions for the domain terms, e.g. actor, atespace, worker,
+    actor identity, snapshot, WorkerPool, ActorTemplate.
     [Open Actor →](/concepts/actor/)
   </Card>
   <Card title="Source on GitHub" icon="github">
@@ -73,14 +76,14 @@ The bird's-eye view:
 
 ## How to read this atlas
 
-- **Mermaid diagrams** are the lingua franca: sequence diagrams for flows, state
-  diagrams for lifecycles, flowcharts for topology.
-- **Boxes are clickable** in the hero topology above and in every Mermaid
-  diagram on the deeper pages - try clicking `ateapi` above to drill into its
-  internals.
-- **This atlas describes the *concepts*** - the components, resources, and flows -
-  not specific lines of code. For the current implementation, browse the source
-  and the authoritative docs below.
+Most pages are built around Mermaid diagrams, with sequence diagrams for flows,
+state diagrams for lifecycles, and flowcharts for topology. The boxes are
+clickable in the hero diagram above and in the Mermaid diagrams on the deeper
+pages, so try clicking `ate-api-server` above to drill into its internals.
+
+We stick to the components, resources, and flows here and leave the line-by-line
+code to the source. If you want the current implementation, browse the repository
+and the docs listed below.
 
 :::note[Authoritative sources]
 The atlas is a visual layer over the prose in

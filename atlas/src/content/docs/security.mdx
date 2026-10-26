@@ -1,171 +1,305 @@
 ---
 title: Security & identity
-description: How Substrate answers "who is this?" (two identity layers + two control-plane auth modes) and "what can it touch?" (tenancy, sandbox, and network isolation), plus secrets, integrity, and the threat model.
+description: How Substrate answers "who is this?" (pod certificates, worker-for-actor certificates, actor JWTs) and "what may it do?" (OpenFGA authorization, sandboxes, default-deny networking, gateway-held credentials), plus the limits that matter today.
 ---
 
-Substrate has to answer two questions constantly: **"who is this?"** (identity and
-authentication) and **"what is it allowed to touch?"** (isolation). It answers
-both at several layers, and those layers are spread across the other pages in
-this atlas - this page ties them together.
+Substrate has to keep answering two questions, "who is this?" (identity and
+authentication) and "what may it touch?" (authorization and isolation), and it
+answers both at several layers that are spread across the other pages in this
+atlas. Let's pull them together here.
 
-:::note[Authoritative source]
-The project's own [`docs/threat-model.md`](https://github.com/agent-substrate/substrate/blob/main/docs/threat-model.md)
-is the canonical security document. This page maps the mechanisms that exist
-**today**; Substrate is early and, by the threat model's own admission, still
-lightly hardened - so treat this as "what's wired up," not "what's guaranteed."
-When in doubt, the threat model and the code win.
+:::note[Authoritative sources]
+The project's [`docs/security.md`](https://github.com/agent-substrate/substrate/blob/main/docs/security.md)
+lists the security principles with an implementation status for each, and
+[`docs/threat-model.md`](https://github.com/agent-substrate/substrate/blob/main/docs/threat-model.md)
+catalogs threats and the mitigations it recommends. A recommended mitigation
+isn't necessarily implemented. This page maps the mechanisms that are wired up
+today, and when in doubt, the code wins.
 :::
 
-## Two layers of identity
+## Logical identity versus infrastructure identity
 
-Substrate deliberately separates the identity of a **resource** from the identity
-of the **workload** running inside it.
+An Actor is addressed by `(atespace, name)`, and a server-assigned UID marks
+one incarnation at that address. The UID survives suspend, resume, and moves
+between workers, but deleting and recreating the actor gives it a new UID. The
+[atespace](/concepts/atespace/) is the tenancy boundary.
 
-| Layer | What it names | Form | Stable across… |
-|---|---|---|---|
-| **Resource identity** | the actor as a control-plane object | `(atespace, name)` in `ResourceMetadata` (+ server-assigned `uid`) | its whole lifecycle; survives suspend/resume and moving between workers |
-| **Workload (session) identity** | the app/user/session the workload acts as | JWT `sub` `apps/<appid>/users/<userid>/sessions/<sessionid>` or SPIFFE `spiffe://substrate-session.local/app/<appid>/user/<userid>/session/<sessionid>` | the life of the session, even as it migrates across physical workers |
+The pods that do the work have identities of their own, and Substrate keeps
+the two apart. A Worker Pod hosts many actors over its life, so its
+certificate says which pod is talking, never which actor, and anything that
+must name an actor gets a separate, actor-scoped credential. The diagram below
+shows who issues each of these credentials and where they're presented.
 
-- **Resource identity** is what routing, scheduling, storage, and locking all key
-  off - the [atespace](/concepts/atespace/) is the tenancy boundary, and an actor
-  name is only unique within it. See [Actor](/concepts/actor/).
-- **Workload identity** is minted on demand by the `SessionIdentity` service
-  (`MintJWT` / `MintCert`) so a workload can prove *what it is* to other services
-  regardless of which worker it currently sits on. See [Session](/concepts/session/).
-- **Actor self-identity at runtime:** atelet writes each actor's identity to
-  `/run/ate/actor-id` (atomically, regenerated on every resume), so the workload
-  can discover its own `(atespace, name)` without parsing headers. See
-  [atelet](/components/atelet/).
+```mermaid
+flowchart LR
+  PCC["podcertcontroller<br/>(pod certificate signers)"]
+  API["ateapi<br/>(actor-identity CA,<br/>actor JWT key)"]
+  IDP["ate-idp-server<br/>(OIDC discovery, JWKS)"]
 
-## Authenticating to the control plane
+  subgraph Node
+    ATELET[atelet]
+    subgraph WP["Worker Pod"]
+      AT[atunnel]
+      ACT[["Actor"]]
+    end
+  end
+  GW["atenet-egress"]
+  EXT([External API])
 
-Calls into `ateapi` are authenticated in one of two modes, selected by the
-`--auth-mode` flag:
+  PCC -- "pod certs" --> ATELET
+  PCC -- "pod cert" --> WP
+  AT -- "CSR" --> ATELET
+  ATELET -- "MintWorkerActorCertificate" --> API
+  AT -- "worker-for-actor cert" --> GW
+  GW -- "MintActorJwt" --> API
+  GW -- "request + actor JWT" --> EXT
+  EXT -.->|"verify signature"| IDP
 
-- **`mtls`** (default) - client identity comes from transport-level mutual TLS.
-- **`jwt`** - *in addition* to TLS, every RPC must carry a Kubernetes
-  ServiceAccount **Bearer token**, verified via OIDC discovery against a
-  configured issuer and audience (`--client-jwt-issuer` / `--client-jwt-audience`).
+  click API "/components/ateapi/" "ateapi"
+  click ATELET "/components/atelet/" "atelet"
+  click GW "/components/atenet/" "atenet"
+```
 
-JWT mode is explicitly **transitional**: the flag's own help notes Substrate will
-drop it once the Kubernetes **Pod Certificates** feature is enabled by default in
-the minimum supported Kubernetes version.
+## Who is this? The identities in play
 
-Component-to-component **mTLS identity** is issued by `podcertcontroller`, a
-polyfill for that upcoming Pod Certificates feature. It runs two signers:
+| Identity | Held by | Issued by | Names | Presented to |
+|---|---|---|---|---|
+| Pod certificate | Every Substrate pod: `ateapi`, controllers, atelet, routers, gateways, Worker Pods | `podidentity.podcert.ate.dev/identity` signer | `spiffe://cluster.local/ns/<ns>/sa/<sa>` | `ateapi` and other components, as an mTLS client |
+| Service DNS certificate | Servers: `ateapi`, the router, the egress gateway, `ate-idp-server` | `servicedns.podcert.ate.dev/identity` signer | The Service DNS names that select the pod | Their clients, as the TLS server |
+| `worker-for-actor` certificate | `atunnel`, one per actor activation | `ateapi`, signed by the actor-identity CA | `spiffe://substrate-actor.local/worker-for-actor/<atespace>/<name>` | The egress gateway |
+| Actor JWT | Never the actor; the egress gateway injects it | `ateapi`, signed by the actor JWT key | `sub: actor/<atespace>/<name>` | External services |
 
-- `servicedns.podcert.ate.dev/identity` - certs for Kubernetes service DNS names.
-- `podidentity.podcert.ate.dev/identity` - certs equivalent to ServiceAccount tokens.
+### Infrastructure: pod certificates
 
-Both are backed by a local CA and are expected to be replaced by upstream signers
-over time. Note that not every internal hop is mTLS: atelet talks to `ateom`
-over a **Unix domain socket** inside the worker pod (addressed by pod UID), not a
-network connection.
+`podcertcontroller` implements Kubernetes Pod Certificates signers, backed by
+local CAs, and kubelet projects the certificates into pods and rotates them.
+The `podidentity` signer's certificates authenticate components to each
+other, the `servicedns` signer's certificates serve TLS, and a third signer,
+`postgres.podcert.ate.dev/identity`, issues `ateapi` its client certificates
+for the bundled PostgreSQL. All of these establish which pods are talking, and
+none of them identifies an actor.
+
+### Acting for an actor: `worker-for-actor`
+
+When a worker activates an actor, `atunnel` generates a private key and sends
+only a certificate signing request to the node-local atelet. Atelet then calls
+`ateapi`'s `MintWorkerActorCertificate`, presenting its own pod certificate,
+and `ateapi` signs only for the worker the actor is assigned to, only for an
+atelet on that worker's node, and only when the request's actor UID matches
+the current incarnation. The certificate lives for one hour.
+
+The private key stays in `atunnel`, outside the sandbox and its snapshots.
+`atunnel` presents this certificate when it opens a `CONNECT` through the
+egress gateway on the actor's behalf, so the gateway can tell which actor a
+connection belongs to, where a pod certificate would only say which worker
+sent it. The certificate carries the actor's UID in an `ActorIdentity` X.509
+extension, but its SPIFFE URI names only `(atespace, name)`.
+
+A JWT counterpart, `MintWorkerActorJwt` (claims under
+`worker-for-actor.ate.dev`), lets atelet's node plugins exchange it for
+credentials scoped to one actor, such as a downscoped storage token for that
+actor's snapshots.
+
+### The actor itself: actor JWTs
+
+The credential that speaks for the actor is a JWT that `ateapi` mints under
+the install's issuer (by default `https://idp.<namespace>.svc`). Its `sub` is
+`actor/<atespace>/<name>`, and its claims under `actor.ate.dev` carry the
+atespace, name, and UID. `ate-idp-server` publishes the OIDC discovery
+document and key set that relying parties verify it with, and
+`kubectl ate admin` rotates the signing key.
+
+The actor doesn't hold this token. The egress gateway requests it from
+`ateapi` and swaps it into an outbound request header when the actor's
+`EgressPolicy` asks for an `actorJwt` injection, so the destination learns
+which actor is calling without the token ever entering the sandbox. The Envoy
+egress gateway implements this, while the pinned AgentGateway image resolves
+only stored-secret injections.
+
+`ateapi` also has a `MintActorCertificate` RPC for an X.509 actor certificate
+(`.../actor/<atespace>/<name>`), but no deployed component calls it.
+
+An actor that needs to know its own name, atespace, or UID can have them
+projected as files with a `systemInfo` volume's `actorMetadata` source. Those
+files are plain metadata, and none of them is a credential.
+
+## Authenticating to `ateapi`
+
+So how does a caller prove who it is to `ateapi`? It accepts two kinds of
+caller credential.
+
+- mTLS client certificates, where components present their pod certificates
+  and the principal is the certificate's SPIFFE ID.
+- Bearer JWTs from the providers listed in its authentication config. The
+  default install trusts the cluster's ServiceAccount token issuer, so a
+  ServiceAccount token with audience `api.ate-system.svc` works, and other
+  OIDC issuers can be added (`kubectl ate --token-file` sends one).
+
+Authentication only establishes a principal, so the next question is whether
+that principal may make the call.
+
+## Authorization on the control plane
+
+`ateapi` checks every RPC against an OpenFGA model embedded in the server
+(stored in the same PostgreSQL). There's no switch to turn it off, and an RPC
+without a rule is denied.
+
+- People and automation get `owner`, `editor`, or `viewer` through an
+  `AccessPolicy`, either on the global scope or on one atespace, managed with
+  `kubectl ate ... access-policy`. The atespace is the finest grant, and there
+  are no per-actor or per-template roles.
+- Bootstrap owners, set at install time, always hold global `owner`. If none
+  is set, `ate-setup` uses the shared `ate-client` ServiceAccount, which makes
+  anyone who can mint a token for it a global owner, so replace it outside
+  development.
+- Components hold fixed system roles bound to their pod certificates (listed
+  in the table below), and no access policy can grant those roles.
+
+| Role | Held by | Allows |
+|---|---|---|
+| `ingress_router` | `atenet-router` | `ResumeActor` on any actor; list actors everywhere |
+| `egress_gateway` | `atenet-egress` | Read actors and their egress policies; mint actor JWTs and certificates |
+| `controller` | `ate-controller` | Manage Worker records |
+| `atelet` | atelet | Read actors' egress policies |
+
+Only `egress_gateway` may mint actor credentials (not even a global owner
+can), since a credential lets its holder act as the actor. Worker-facing RPCs
+(registering a worker, minting `worker-for-actor` credentials, requesting a
+suspend) skip the role model and instead require atelet's pod certificate
+from the right node.
 
 ## Isolation, layer by layer
 
-Substrate is defense-in-depth: a request has to clear several independent
-boundaries before it reaches your code.
+A request has to clear several independent boundaries before it reaches your
+code, and the code has to clear them again on the way out.
 
 ```mermaid
 flowchart TB
-  T["Tenancy · atespace<br/>identity, routing, scheduling, locks<br/>all scoped to (atespace, name)"]
-  S["Sandbox · SandboxClass<br/>gVisor userspace kernel  —or—<br/>micro-VM hardware virtualization"]
-  N["Network · per-actor netns<br/>veth pair + nftables<br/>no direct pod-network access"]
+  T["Tenancy · atespace<br/>authorization scope for every API call"]
+  S["Sandbox · gVisor or microVM<br/>actor code never runs as a plain container"]
+  N["Network · private per-actor network<br/>all TCP out through atunnel and the egress gateway"]
   T --> S --> N --> WL[["Actor workload"]]
 
   click T "/concepts/atespace/" "Atespace"
-  click S "/components/ateom-microvm/" "Runtimes"
+  click S "/components/ateworker-gvisor/" "gVisor runtime"
+  click N "/components/atenet/" "atenet"
 ```
 
-- **Tenancy (atespace).** Every actor is scoped to an atespace; the store keys
-  (`actor:<atespace>:<name>`), DNS names, scheduling, and the per-actor workflow
-  lock (`lock:actor:<atespace>:<name>`) all include it, so tenants don't collide
-  or contend. Golden/system actors live in the reserved `ate-golden` atespace.
-- **Sandbox (SandboxClass).** Each actor runs inside a sandbox - either
-  [gVisor](/components/ateom-gvisor/) (a userspace kernel that intercepts the
-  workload's syscalls so it never calls the host kernel directly) or a
-  [micro-VM](/components/ateom-microvm/) (a real guest kernel behind KVM - a
-  stronger, hardware-virtualized boundary, at the cost of requiring `/dev/kvm`
-  and vhost device access on the node). The class is a hard scheduling gate, and
-  because a gVisor checkpoint and a micro-VM snapshot are different formats, a
-  snapshot from one class can never be restored on the other.
-- **Network.** Each actor gets its own network namespace wired to the pod by a
-  **veth pair** on a link-local `/30` (`169.254.17.1` host, `169.254.17.2` actor),
-  with an `ateom_actor` nftables table doing egress masquerade and inbound DNAT.
-  The workload never sits directly on the pod's network.
+- At the tenancy layer, every actor, template, tag, and egress policy lives in
+  an atespace, and authorization is granted per atespace.
+- At the sandbox layer, each actor runs in
+  [gVisor](/components/ateworker-gvisor/) (a userspace kernel that intercepts
+  its syscalls) or a [micro-VM](/components/ateworker-microvm/) (a guest
+  kernel behind KVM). A snapshot from one class never restores on the other,
+  and Worker Pods aren't privileged (they run with a fixed capability set the
+  sandbox needs).
+- At the network layer, each actor has its own network namespace, joined to
+  the worker over a link-local `/30` (`169.254.17.1` gateway, `169.254.17.2`
+  actor). Every outbound TCP connection is redirected to `atunnel` and leaves
+  through the egress gateway under the actor's `EgressPolicy`, and an actor
+  with no policy has no egress. DNS goes to a relay that answers only names
+  the policy allows, other UDP and other protocols are dropped, and link-local
+  destinations outside the actor's own `/30` (e.g. cloud metadata servers) are
+  blocked before they reach the gateway.
+- On the control plane network, every pod in `ate-system` denies ingress by
+  default and NetworkPolicies admit only the flows the system needs. Worker
+  Pods are excluded from reaching `ateapi`, and only Worker Pods may reach the
+  egress gateway.
 
-## Secrets & log hygiene
+## The network edges
 
-- **Secret env:** an ActorTemplate container may source an env var from a
-  Kubernetes Secret via `valueFrom.secretKeyRef` (never both a literal `value`
-  and a `secretKeyRef`). See [ActorTemplate](/concepts/actortemplate/).
-- **Router log redaction:** the atenet router does **not** log secrets in its
-  ext_proc request logs, and redacts the query string at its `statusz` sink, so
-  bearer tokens / query params don't leak into logs.
-- **Store transport:** ValKey (v9.1) is fronted by TLS and reloads its certs
-  every 12h, so cert rotation doesn't require a restart. ateapi can additionally
-  authenticate to it with Google Cloud **IAM** (`--redis-use-iam-auth`, a string
-  flag defaulting to `"true"`; IAM is used unless it is set to `"false"`), and it
-  is the only component that connects to the database. See
-  [Storage](/components/storage/).
+Both edges are shared proxies, which we cover in [atenet](/components/atenet/),
+and the table below compares the parts of each that affect security.
+
+| Edge | AgentGateway | Envoy (default) |
+|---|---|---|
+| Ingress client authentication | None; plaintext ports are served too | mTLS required; SPIFFE ID must be on `--ingress-allowed-spiffe-ids` |
+| Ingress authorization | None per actor | None per actor; the allowlist is all-or-nothing |
+| Router to worker | mTLS; `atunnel` accepts only the router; router checks the CA | mTLS; `atunnel` accepts only the router; router pins the worker's SPIFFE ID |
+| Egress authentication | `worker-for-actor` certificate, then actor must be `RUNNING` or `RESUMING` | Same |
+| Egress authorization | Per-actor `EgressPolicy` on `Host` or SNI; dials the authorized name | Same |
+| Interception CA key | Inside the proxy container | In a separate minting sidecar |
+
+The egress gateway never trusts what the actor says about the destination, so
+it authorizes a name from `Host` or SNI and then dials that name itself (on the
+port the actor dialed) rather than the IP in the tunnel.
+
+## Secrets and credentials
+
+- By default there are no credentials in the sandbox. Template environment
+  variables take literal values only (there's no `secretKeyRef`), and
+  Substrate projects no private key or token into an actor.
+- Credentials get injected at the gateway instead. An `EgressPolicy` rule can
+  tell the egress gateway to replace a placeholder header with a secret from a
+  _credential provider_ or with an actor JWT, so the actor sends the
+  placeholder and never sees the value. The bundled `k8s.io` provider reads
+  Kubernetes Secrets and is default-deny (an atespace may read only the
+  namespaces an admin grants it), and the provider is the only component that
+  reads secret storage; the gateway never does.
+- Interception needs consent from the template. For an `https` rule the
+  gateway terminates the actor's TLS with leaves from its own CA, and the
+  actor trusts that CA only if its template projects the `egress-mitm.ate.dev`
+  trust bundle.
+- For logs, the Envoy router's `/statusz` page redacts query strings from the
+  requests it records, since they may carry credentials.
 
 ## Integrity controls
 
-- **Pinned images.** Both `pauseImage` and container `image` must be digest-pinned
-  (contain `@`) - a CRD validation rule enforces it, because changing an image out
-  from under a snapshot would invalidate it.
-- **Verified assets.** `SandboxConfig` assets are content-addressed: each carries a
-  `sha256`, which both names the cached file and verifies the download. A
-  `ValidatingAdmissionPolicy` (`manifests/ate-install/sandboxconfig-validation.yaml`)
-  rejects configs that don't declare the assets their class requires. See
-  [SandboxConfig](/concepts/sandboxconfig/).
-- **Immutable templates.** An `ActorTemplate` spec is immutable
-  (`self == oldSelf`) - you publish a new template for a new version rather than
-  mutating one that snapshots already depend on.
-- **Input validation.** atelet validates every RPC field that becomes a host
-  filesystem path (atespace, name, container names, hashes) against DNS-1123 /
-  length rules, so a malicious control-plane input can't traverse out of an
-  actor's directory.
+- Container images must be pinned by digest, because a snapshot depends on the
+  exact bytes it was taken from.
+- Every `SandboxConfig` asset carries a `sha256`, which the node's object-store
+  plugin checks before atelet can read the file, and atelet checks it again
+  (see [SandboxConfig](/concepts/sandboxconfig/)).
+- Templates are immutable. There's no update call for an `ActorTemplate`, so
+  you publish a new template and repoint actors (see
+  [ActorTemplate](/concepts/actortemplate/)).
+- atelet and the worker never hold object-store credentials. On GCS each
+  snapshot transfer runs on a token downscoped to one actor's snapshot
+  prefixes, issued only while that actor is assigned to the requesting node,
+  and on S3 the object-store plugin transfers with its own credentials (see
+  [Storage](/components/storage/)).
 
-## Threats & mitigations
+## Limits of these boundaries
 
-`docs/threat-model.md` enumerates the attack surfaces Substrate reasons about:
-attacks **from external networks**, **from internal network / API clients**,
-**from actors** (the primary untrusted party - what the sandbox, network, and
-tenancy layers above defend against), **from nodes**, **insiders**,
-**misconfiguration**, and **detection & response**.
-
-:::caution[Read the threat model as a roadmap, not a spec of today]
-The threat model is explicit that Substrate is early and "has little to no
-security hardening at this time." Its **Suggested Concrete Mitigations** are
-*recommended invariants*, not a description of what the code does today. Treat the
-mechanisms documented on this page as the parts that **are** implemented, and the
-threat model as the target state. Don't assume a mitigation is in place because
-the threat model lists it.
+:::caution[Know these before relying on a boundary]
+- AgentGateway ingress is unauthenticated, so anything that can reach the
+  router can resume and call any actor by name. The Envoy allowlist is
+  all-or-nothing, and neither dataplane checks a caller against a specific
+  actor.
+- The egress gateway doesn't check the actor UID. The `worker-for-actor`
+  certificate carries the UID, but both gateways identify the actor by
+  `(atespace, name)` and check only that it's running or resuming. A
+  still-valid certificate from a deleted incarnation (it lives an hour) would
+  name a recreated actor at the same address, though using it requires the
+  private key held in `atunnel`.
+- The atespace is the only authorization boundary, which means any atespace
+  editor can tag an actor, and a tag is a durable copy of its memory and disk
+  (including any secrets in them).
+- Every atelet shares one identity, so the `atelet` role can read the egress
+  policy of any actor, including actors on other nodes.
+- Snapshots aren't verified before restore. The threat model calls for
+  checking a snapshot against a trusted digest or signature, which isn't
+  implemented, and per-actor snapshot encryption is future work, so snapshot
+  integrity rests on access control to object storage.
 :::
 
-Some notable invariants the threat model calls for that are **not yet guaranteed**
-(verify current status before relying on them):
+## Threats and mitigations
 
-- **Default-deny actor networking** - cross-actor and actor→control-plane traffic
-  blocked by default, synced with actor lifecycle.
-- **Cryptographic snapshot verification** before restore - today the gVisor
-  restore even passes `runsc`'s `-direct` flag, which *assumes the snapshot source
-  is trusted*, so snapshot integrity rests on securing the object store, not on a
-  verified digest.
-- **Deprivileged worker pods** - the worker pods still run `privileged: true` to
-  manage sandboxes and namespaces (the `atelet` DaemonSet was recently
-  deprivileged, but the workers themselves have not been yet).
-- **Snapshot-access credentials scoped away from the sandbox**, and **audit
-  logging** across the API and node components.
-
-The threat model also states Substrate's explicit **goals and non-goals** - the
-right starting point before relying on any single mechanism here.
+`docs/threat-model.md` enumerates attacks from external networks, from internal
+clients, from actors (the primary untrusted party, which the sandbox, network,
+and tenancy layers above defend against), from nodes, insiders,
+misconfiguration, and detection and response. For each it states a
+mitigating invariant and, where one exists, the current state.
+`docs/security.md` keeps a per-principle status (met, in progress, future, out
+of scope). Read both as a map of where the system is headed, and this page as
+what it does now.
 
 ## Related
 
-- [Atespace](/concepts/atespace/) - the tenancy boundary.
-- [Session](/concepts/session/) - workload identity (JWT / SPIFFE).
-- [ateapi](/components/ateapi/) - where control-plane auth is enforced.
-- [ateom-gvisor](/components/ateom-gvisor/) · [ateom-microvm](/components/ateom-microvm/) - the sandbox boundaries.
+- [atenet](/components/atenet/) - the router, egress gateway, and `atunnel`.
+- [Request path](/flows/request-path/) - the identities on each ingress hop.
+- [Atespace](/concepts/atespace/) - the tenancy and authorization boundary.
+- [ateapi](/components/ateapi/) - where authentication and authorization run.
+- [ateworker-gvisor](/components/ateworker-gvisor/) ·
+  [ateworker-microvm](/components/ateworker-microvm/) - the sandbox
+  boundaries.

@@ -1,24 +1,41 @@
 ---
 title: Resume actor (end-to-end)
-description: The most interesting flow in Substrate - a request arrives for a suspended actor, and the system wakes it on a pre-warmed gVisor worker in milliseconds.
+description: The most interesting flow in Substrate. A request arrives for a suspended actor, the gateway parks it, ateapi places the actor on a warm worker, atelet restores its snapshot, and the request is forwarded through the worker's tunnel.
 ---
 
 import nodeHostpath from '../../../assets/resume-node-hostpath.svg?raw';
 import lazyPaging from '../../../assets/resume-lazy-paging.svg?raw';
 
-This is **the** flow to understand if you want to understand Substrate. It
-touches DNS, the L7 proxy, ExtProc, ateapi's workflow engine, the Redis store,
-atelet, GCS, ateom-gvisor, and `runsc restore`. Six components and two data
-stores collaborate on a single HTTP request.
+If you want to understand Substrate, this is the flow to understand. A single
+HTTP request for a suspended actor touches the ingress gateway, ateapi's
+resume workflow and its PostgreSQL store, the scheduler, atelet on the chosen
+node, the object-store plugin, the worker process in the pod, the sandbox
+runtime, and the worker's `atunnel` listener.
+
+The ingress gateway is the atenet router Deployment, and it runs one of two
+dataplanes, chosen at install time with
+`ate-setup --atenet-dataplane envoy|agentgateway`. The default Envoy dataplane
+is Envoy plus an `ext_proc` server in the atenet-router container that calls
+ateapi. AgentGateway replaces both with a single AgentGateway proxy
+whose built-in Substrate ingress policy calls ateapi directly. We follow the
+AgentGateway path on this page and call out where Envoy differs in a way that
+changes the flow.
 
 ## The setup
 
-- The actor was created earlier and is now `SUSPENDED` (or `PAUSED`), carrying a
-  `latest_snapshot_info` that points at a checkpoint - either an
-  `ExternalSnapshotInfo` in object storage (Suspend) or a `LocalSnapshotInfo`
-  kept on a specific worker node's VM (Pause).
-- A pool of worker pods is pre-warmed and **idle** (no `assignment`).
-- A client wants to hit the actor, addressed by its `(atespace, name)` identity.
+- The actor was created earlier and is now `SUSPENDED`. Its newest usable
+  snapshot is one of the following.
+  - node-local, on the node it is still attached to after an asynchronous
+    suspend;
+  - durable, in object storage;
+  - borrowed from a tag (for a new actor, usually the template's golden
+    tag);
+  - or none, in which case the resume cold-boots the template's containers.
+- Worker pods are pre-warmed, registered with ateapi, and `ACTIVE`. Each
+  reports how much CPU, memory, and how many actors it can still take.
+- A client wants to reach the actor by its `(atespace, name)` identity.
+
+Let's follow that request through the cold path, step by step.
 
 ## The full sequence (cold path)
 
@@ -26,324 +43,349 @@ stores collaborate on a single HTTP request.
 sequenceDiagram
   autonumber
   participant C as Client
-  participant DNS as CoreDNS<br/>(atenet DNS)
-  participant E as L7 proxy<br/>(atenet router)
-  participant X as ExtProc<br/>(atenet router)
+  participant G as AgentGateway<br/>(atenet router)
   participant A as ateapi
-  participant R as Redis
-  participant L as atelet DaemonSet<br/>(on assigned worker's node)
-  participant G as GCS / S3
-  participant O as ateom-gvisor<br/>(worker pod)
-  participant W as Worker workload
+  participant DB as PostgreSQL
+  participant L as atelet<br/>(chosen node)
+  participant OS as Object storage<br/>(via plugin sidecar)
+  participant O as ateworker<br/>(worker pod)
+  participant W as Actor workload
 
-  C->>DNS: A? actor.atespace.actors.resources.substrate.ate.dev
-  DNS-->>C: atenet-router ClusterIP
-  C->>E: HTTP request, :authority=actor.atespace.actors.resources.substrate.ate.dev
-
-  E->>X: ext_proc: ProcessRequest (headers)
-  Note over X: parse request headers<br/>host → (atespace, actor_name)
-
-  X->>A: ResumeActor(ObjectRef{atespace, name})<br/>(de-duplicated, key atespace/name)
+  C->>G: HTTP request<br/>ate-target-actor: atespace/name
+  Note over G: assignment cache miss.<br/>One resume per actor,<br/>other requests wait on it
+  G->>A: ResumeActor(ObjectRef{atespace, name}) over mTLS
 
   rect rgb(240,240,255)
-    Note over A,R: Workflow engine runs under<br/>lock:actor:{atespace}:{name} (30s TTL, 28s workflow timeout)
-
-    A->>R: Load actor → fetch actor + template
-    A->>R: Assign worker: pick random idle eligible worker<br/>(local snapshot? restrict to nodes that hold it)
-    A->>R: UPDATE worker (assignment), UPDATE actor (RESUMING + ateom pod ref)
-
-    Note over A,L: Dial atelet on the *node* hosting<br/>the assigned worker pod (atelet pod IP : 8085)
-    A->>L: Restore(snapshot config, ateom pod, workload spec)
-    L->>G: Fetch manifest, then download checkpoint images (zstd, parallel)<br/>[LocalSnapshotInfo → copy from node instead]
-    G-->>L: bytes
-    L->>O: Restore call (gRPC over Unix socket)
-    O->>O: setup veth+nftables, exec runsc restore -background -direct -detach
-    O->>O: wait on container readyz (200)
-    O-->>L: ok (sentry up; pages lazy-load)
-    L-->>A: Restore ok
-
-    A->>R: Finalize → RUNNING: UPDATE actor (RUNNING)
+    Note over A,DB: lease:actor:{atespace}:{name}
+    A->>DB: load actor + template
+    A->>A: schedule: pick a worker with room
+    A->>DB: bind actor to worker,<br/>state = RESUMING
+    A->>L: Restore(snapshot uuid/generation/fidelity/URI,<br/>workload spec) or Run (no snapshot)
+    alt snapshot is local to this node
+      L->>L: use the local checkpoint in place
+    else
+      L->>OS: fetch manifest.json, then files (zstd)
+    end
+    Note over L: in parallel: stage sandbox runtime,<br/>refresh systemInfo files, unpack OCI bundle
+    L->>O: RestoreWorkload (Unix socket)
+    O->>O: actor netns + egress redirect,<br/>runsc restore -background -detach
+    O->>W: poll each wakeupProbe until 200
+    O->>O: activate actor in atunnel
+    O-->>L: ok, worker epoch
+    L-->>A: Restore ok, worker epoch
+    A->>DB: Finalize: state = RUNNING,<br/>worker epoch + pod IPs
   end
 
-  A-->>X: Actor{ ateom_pod_ip, status=RUNNING }
-  X-->>E: HeaderMutation: :authority := pod_ip:80
-
-  E->>W: HTTP request, :authority=pod_ip:80
-  W-->>E: HTTP response
-  E-->>C: HTTP response
+  A-->>G: Actor{ workerAssignment{ podIPs, workerSpiffeId } }
+  Note over G: cache the assignment (5s)
+  G->>O: mTLS CONNECT to atunnel :8443<br/>ate-target-actor: atespace/name
+  O->>W: forward to 169.254.17.2:80<br/>inside the actor's netns
+  W-->>O: HTTP response
+  O-->>G: response
+  G-->>C: HTTP response
 ```
 
 ## What's happening in each step
 
-### 1–3. DNS to the front door
+### 1. Naming the actor
 
-The client resolves `<actor_name>.<atespace>.actors.resources.substrate.ate.dev`
-(both labels are DNS-1123). The atenet **DNS controller** programs CoreDNS so
-this name pattern always returns the **ClusterIP of the atenet router service** -
-not the worker IP. This is deliberate: the worker IP isn't known until ExtProc
-consults ateapi, and it may change between requests if the actor moves between
-workers.
+A client sends its request to the atenet router Service and names the target
+in the `ate-target-actor: <atespace>/<name>` header. The header alone selects
+the actor, and `Host` passes through to the application untouched, so the
+workload sees whatever authority the client used. A missing or malformed
+header gets a `404`.
 
-### 4–5. L7 proxy + ExtProc
+Plain HTTP requests go to the actor's port 80. To reach another port, the
+client sends an HTTP `CONNECT` to the router naming the port in the
+authority, and each request inside that tunnel is routed (and the actor
+resumed) independently.
 
-The L7 proxy accepts the request on `:8080` and applies a single `ext_proc` filter
-that streams headers to **ExtProc on `:50051`**. ExtProc parses the `:authority`
-(or `Host`) header into an **`(atespace, actor_name)`** pair (port stripped); an
-unparseable host is answered with a 404.
+### 2. The gateway resolves the actor
 
-### 6. ResumeActor (with request coalescing)
+AgentGateway keeps a short-lived assignment cache per actor (`cacheTtl`, 5 s
+by default). On a hit it routes immediately, with no call to ateapi, and on a
+miss it calls `ResumeActor` over gRPC with mutual TLS, presenting the
+atenet-router pod identity. Concurrent misses for the same actor share one
+in-flight call, so a burst of 50 requests to a cold actor produces one
+resume.
 
-ExtProc calls `ResumeActor` with an `ObjectRef{atespace, name}`. To avoid
-stampedes when 50 concurrent requests hit a cold actor, ExtProc dedupes
-concurrent calls keyed by `<atespace>/<actor_name>` so only the first call goes
-through; the rest piggyback on its result. The in-flight resume runs under a
-detached background timeout so a caller disconnecting doesn't abort the resume
-for the others, and `Aborted` (a concurrent resume) is retried with backoff.
-ExtProc also opens an OTel span here.
+With Envoy, the `ext_proc` server calls `ResumeActor` on every request, since
+there is no assignment cache. Concurrent calls for the same actor are still
+collapsed into one in-flight "flight". For an actor that is already
+`RUNNING`, ateapi answers from a single read without taking the lease (see
+[the warm path](#what-about-the-warm-path)).
 
-### 7–9. ateapi runs the resume workflow
+### 3. ateapi runs the resume workflow
 
-ateapi acquires `lock:actor:<atespace>:<name>` in Redis (30s TTL, 2s padding →
-28s workflow timeout) and steps through:
+If the actor is already `RUNNING`, ateapi returns it with `resumed=false`.
+Otherwise it takes the actor's PostgreSQL lease (`Aborted` if another
+operation holds it) and steps through the workflow in this order.
 
-1. **Load the actor** and its `ActorTemplate`.
-2. **Assign a worker** - random shuffle over idle **eligible** workers (the
-   worker's `sandbox_class` must match the template's, and both the template's
-   `workerSelector` and the actor's own `worker_selector` must match the
-   worker's labels), then claim one via an `assignment`; the actor goes
-   `RESUMING`. **If the actor's `latest_snapshot_info` is a local snapshot**,
-   the free-worker search is restricted to the nodes in
-   `node_vms_with_local_snapshots` so the resume lands back on a node that
-   already holds the bytes.
-3. **Call atelet to restore** - pick which restore strategy to use, then
-   resolve the atelet DaemonSet pod that runs on the *same node* as the
-   assigned worker and dial that atelet's pod IP on `:8085`. atelet is a
-   per-node DaemonSet, not a per-pod sidecar - one atelet serves every worker
-   pod scheduled to its node.
-4. **Finalize** - set actor to `RUNNING`.
+1. Load the actor and its template.
+2. Create pending external volumes (CSI, preview), if the template has any.
+3. Assign a worker. The scheduler filters the fleet for workers that
+   match both the template's and the actor's `workerSelector`, run the sandbox
+   class that wrote the snapshot, can still restore its runtime (for a memory
+   snapshot), sit on the actor's `assignedNode` if it has one, and have room
+   for the template's CPU and memory limits plus one more actor. It samples
+   two candidates at random and takes the less loaded. ateapi binds the actor
+   to that worker (a per-worker `ActorAssignment`, admitted against the
+   worker's remaining capacity in the same write), then records the
+   `workerAssignment` and moves the actor to `RESUMING`.
+4. Attach external volumes to the chosen node.
+5. Call atelet on that node, with `Restore` if the actor has a snapshot and
+   `Run` if it has none.
+6. Finalize to `RUNNING`, recording the worker epoch atelet returned and the
+   worker pod's current IPs.
 
-The restore strategy branches on the actor's `latest_snapshot_info` first, then
-the template's golden snapshot, then a cold boot:
+Keep in mind that a worker is a shared host. It can run many actors at once,
+and the actor only claims its share of the worker's capacity.
+
+### 4. Choosing what to restore
+
+ateapi restores the newest usable snapshot generation, meaning one still on
+a node or one whose durable copy is `COMPLETED`. It tells atelet which
+snapshot (uuid, generation, object URI) to restore and at what fidelity,
+following the decision below.
 
 ```
-if actor.latest_snapshot_info is set          → Restore from it
-    ├─ LocalSnapshotInfo  → CHECKPOINT_TYPE_LOCAL, scope = onPause
-    └─ ExternalSnapshotInfo → CHECKPOINT_TYPE_EXTERNAL, scope = onCommit
-else if template.GoldenSnapshot != "" && !boot → Restore from golden snapshot
-else                                          → cold boot from spec (Run)
+newest generation with a local copy or a COMPLETED durable copy?
+├─ no                                  → Run: cold boot from the template spec
+└─ yes                                 → Restore that snapshot
+     ├─ captured under another template → at VOLUMES fidelity
+     ├─ memory runtime not on worker    → at ROOTFS fidelity
+     └─ otherwise                       → at the snapshot's own fidelity
 ```
 
-`boot=true` on the `ResumeActorRequest` forces the cold path by skipping the
-golden snapshot.
+You'll notice there is no separate "golden" branch, because a new actor's
+golden snapshot is simply its first, borrowed generation. If the snapshot is
+local to a different node
+than the one assigned, the actor is restored from the durable copy and the
+binding to the old node is dropped.
 
-### 10–14. atelet does the heavy lifting
+### 5. atelet prepares the restore
 
-:::note[What ateom-gvisor actually is]
-A worker pod runs **exactly one container** - and that container is
-**ateom-gvisor**, a small gRPC server. ateom-gvisor
-is **not** itself sandboxed; it runs as PID 1 in the worker pod with normal
-container privileges. Its job is to receive RPCs from atelet and `exec`
-`runsc` (the gVisor runtime), which spawns a **separate gVisor sandbox**.
-The actor's workload - pulled from the **actor's OCI image** - runs *inside
-that sandbox*, not alongside ateom-gvisor. The pod hosts at most one such
-sandbox at a time. See [ateom-gvisor](/components/ateom-gvisor/) for the
-RPC surface.
-:::
+ateapi dials the atelet on the assigned worker's node over mutual TLS, with
+each side checking the other's SPIFFE identity. atelet is a per-node
+DaemonSet, so one atelet serves every worker pod on its node.
 
-**Where the actor's state actually lands: on the node, not in the pod.**
-When atelet restores, it first fetches the small `manifest.json` (which pins
-the sandbox binaries and lists the checkpoint files), then downloads the
-snapshot images from GCS/S3 in parallel and zstd-decompresses them onto the
-**node's own filesystem**, under
-`/var/lib/ateom-gvisor/actors/<actor-uid>/restore-state/`. For a
-`LocalSnapshotInfo` there's no download at all - atelet copies the images from
-the node's local checkpoint dir instead. The files are owned by the host -
-they're not written into either pod's container filesystem.
+So where do the snapshot bytes go? They land on the node rather than in the
+pod. Every per-actor file lives under the node directory `/var/lib/ate`,
+which atelet and every worker pod mount via `hostPath` at the same path.
 
-How does the worker pod then *see* those bytes? Through a **`hostPath`
-bind mount**. Both pods on the node - the atelet DaemonSet pod and every
-worker pod - mount the same node directory `/var/lib/ateom-gvisor` into
-their own filesystem at the same path. A `hostPath` volume is a slice of
-the host's filesystem grafted into the pod's mount namespace, so when
-atelet writes a file there, ateom-gvisor (inside the worker pod) reads
-exactly the same bytes - no copy, no network, same inode.
+- If the snapshot is local and was written on this boot, atelet restores
+  from its local checkpoint directory in place, with no copy and no
+  download.
+- Otherwise atelet fetches `manifest.json` and then the files through its
+  object-store plugin sidecar, decompressing them into the actor's restore
+  directory. A snapshot shared through a tag is served from a node snapshot
+  cache after its first download on that node.
 
-This is also why the gRPC channel from atelet to ateom-gvisor can be a
-**unix socket**: the socket file `/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`
-sits in the same shared hostPath, so both ends address it by the same
-path. atelet opens it and makes the Restore call; ateom-gvisor, listening
-on the same path inside the worker pod, accepts the call and proceeds with
-the restore.
+While the download runs, atelet in parallel stages the sandbox runtime
+binaries from its content-addressed asset cache, rewrites the actor's
+`systemInfo` files (its name, atespace, and UID, which come out correct even
+when the snapshot was taken by a golden actor), and unpacks the OCI bundle
+for each container. Only the final restore call needs all of them. atelet
+then calls the worker process over a Unix socket at
+`/var/lib/ate/workers/<podUID>/worker.sock`, which both pods see through the
+shared mount, as the diagram below shows.
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={nodeHostpath} />
   <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
-    Two pods on one node, talking through the node's own filesystem. The shared
-    <code>hostPath</code> is how atelet "delivers" the snapshot files <em>and</em>
-    where it finds the unix socket to ateom-gvisor. Note the purple
-    <strong>gVisor sandbox</strong> inside the worker pod - that's a separate
-    runsc-managed sandbox that ateom-gvisor spawns; the actor's OCI image runs
-    in there, not in ateom-gvisor itself.
+    Two pods on one node talk through the node's own filesystem. atelet
+    delivers the snapshot files through the shared <code>hostPath</code>, and
+    finds the Unix socket to the worker process there too. The actor's OCI
+    image runs inside a sandbox the worker process starts, rather than in the
+    worker process itself.
   </figcaption>
 </figure>
 
-The pieces worth noticing in that picture:
-
-- **atelet is per-node, not per-pod.** One DaemonSet pod handles every
-  worker pod scheduled to that node. It does not run as a sidecar.
-- **ateom-gvisor and the actor live at different layers.** ateom-gvisor is
-  the *pod's* container (PID 1, unsandboxed). The actor runs in a
-  *runsc-managed gVisor sandbox* that ateom-gvisor spawns - a sibling
-  process tree, not a child of the ateom-gvisor binary. The "exec runsc
-  restore" step is the moment the sandbox comes into existence.
-- **The snapshot images are downloaded in parallel** and streamed through
-  `zstd` on the way to disk. atelet doesn't assume a fixed file list - the
-  manifest tells it exactly which files the runtime wrote.
-- **The download and the bundle prep overlap.** atelet runs the checkpoint
-  download (or local copy) *concurrently* with fetching the sandbox assets and
-  unpacking the OCI image, since only the final Restore call needs both.
-- **The unix socket path is conventional, not negotiated.** atelet
-  composes it from the worker pod's UID
-  (`/var/lib/ateom-gvisor/ateoms/<podUID>/ateom.sock`) and dials it
-  directly. ateom-gvisor inside the worker pod is listening on the same
-  path because it sees the same mount.
-- **OCI bundle goes there too.** Before making the Restore call, atelet
-  writes a fresh `config.json` + rootfs (unpacked from the actor's image)
-  into the hostPath so `runsc restore` finds everything in one place.
-- **The actor's identity file is (re)written on every resume.** atelet writes
-  the actor's own name to `/run/ate/actor-id` (atomic write) in a per-actor
-  identity dir and bind-mounts that dir read-only into each application
-  container - so the value is correct even when the actor was restored from a
-  shared golden snapshot whose checkpointed process env would otherwise carry
-  the golden actor's identity.
-
-### 15–16. ateom-gvisor sets up networking, then runs `runsc restore -background -direct`
-
-Before restoring, ateom-gvisor (re)builds the actor's network: a **veth pair**
-between the pod netns (`ateom0`, `169.254.17.1/30`) and the interior sandbox
-netns (`eth0`, `169.254.17.2/30`), plus an nftables table `ateom_actor` that
-masquerades actor egress and DNATs inbound pod-IP:80 traffic to the actor. The
-pod keeps its real `eth0`; the veth pair is torn down on checkpoint and rebuilt
-on restore. See [ateom-gvisor](/components/ateom-gvisor/) for the full wiring.
-
-Then it runs the restore. The `-background` flag enables **demand paging**.
-
-:::note[What "demand paging" means]
-A normal "eager" restore would have to copy the *entire* `pages.img` file
-into the sandbox's RAM before the workload could execute a single
-instruction - for a multi-GB snapshot that's seconds of wall clock spent
-just shuffling bytes.
-
-**Demand paging** flips that: `runsc` brings the sentry up immediately
-with `pages.img` mapped but **not yet resident in memory**. The very
-first time the workload reads or writes a given memory page, the CPU
-takes a *page fault*; `runsc` catches the fault, reads just that one
-page out of `pages.img`, hands it to the workload, and execution
-continues. Pages that the workload never touches are never loaded at
-all.
-
-This is the same trick the Linux kernel uses for `mmap`'d files and for
-loading executables - it's just being applied to the RAM image of a
-checkpointed process.
+:::note[What the worker process actually is]
+A worker pod's container runs `ateworker-gvisor` or `ateworker-microvm`, a
+small gRPC server that is _not_ itself sandboxed. Its job is to receive RPCs
+from atelet and drive the sandbox runtime (`runsc` for gVisor, Cloud
+Hypervisor for micro-VMs), which runs each actor's workload, from the actor's
+OCI image, in a sandbox of its own. One worker pod hosts many actor sandboxes
+side by side, and it also hosts `atunnel`, the listener every request to its
+actors comes through. See
+[ateworker-gvisor](/components/ateworker-gvisor/) and
+[ateworker-microvm](/components/ateworker-microvm/).
 :::
 
-So `-background` returns control as soon as the sentry is up; actual
-memory pages stream in lazily, on fault, as the workload touches them.
-`-direct` skips some gVisor security restrictions for snapshot data.
-`-detach` returns immediately.
+### 6. The worker restores the sandbox
+
+Before restoring, the worker builds the actor's network, which is a dedicated
+network namespace with a link-local address (`169.254.17.2`), and nftables
+rules that redirect all of the actor's outbound TCP to `atunnel`'s egress
+listener, which carries it to the egress gateway on the actor's behalf.
+Egress is active before the sandbox starts, but ingress isn't yet.
+
+For gVisor it then runs `runsc restore -background -detach`, and the two
+flags do different jobs.
+
+- `-detach` makes `runsc restore` return once the sandbox is up, instead of
+  waiting for it to exit.
+- `-background` restores memory on demand, so the sandbox starts running
+  with the memory image mapped but not yet loaded, and pages are brought in as
+  the workload touches them.
+
+Micro-VMs get the same effect from Cloud Hypervisor restoring guest memory on
+demand through `userfaultfd` (or prefaulting it eagerly, depending on the
+Cloud Hypervisor version).
+
+:::note[What "on demand" means]
+An eager restore would have to load the entire memory image before the
+workload could execute a single instruction, which for a multi-GB snapshot
+means seconds spent just moving bytes. With on-demand restore, the sandbox
+starts with its memory image mapped but not yet resident. The first time the
+workload touches a page, the fault is caught, just that page is read from the
+image, and execution continues, so pages the workload never touches are never
+loaded. The Linux kernel does the same thing for `mmap`'d files, and here it's
+applied to a checkpointed process's RAM.
+:::
 
 <figure style="margin: 1.5rem 0;">
   <div class="atlas-hero-svg" set:html={lazyPaging} />
   <figcaption style="text-align: center; font-size: 0.85em; opacity: 0.7; margin-top: 0.5rem;">
-    Without <code>-background</code>, restore would have to map every page of
-    <code>pages.img</code> before the workload can run a single instruction.
-    With it, the sentry is "up" the moment the metadata is loaded; the first
-    HTTP request page-faults its own working set in.
+    Without <code>-background</code>, restore would have to load every page of
+    the memory image before the workload can run a single instruction. With it,
+    the sandbox is up as soon as its state is loaded, and the first request
+    faults its own working set in.
   </figcaption>
 </figure>
 
-A few things to note about this trick:
+Does the restore return as soon as the sandbox is up? The worker still waits
+on the workload first, polling every container's `wakeupProbe` until it
+answers `200` (a probe that never does crashes the actor), and only then does
+it activate the actor in `atunnel` and return,
+along with its worker epoch. So ateapi moves the actor to `RUNNING` only once
+the workload is actually serving.
 
-- **The first request pays a small page-in tax**, but only for the pages it
-  actually touches - usually a tiny fraction of resident memory.
-- **Subsequent requests are warm.** Once a page is in, it stays in until
-  the actor suspends again, so steady-state latency is whatever the
-  workload's normal latency is.
-- **`-detach` is what makes `runsc restore` return.** Without it, the exec
-  would block until the sandboxed process exited. Combined with `-background`,
-  the sentry is up in milliseconds without paging the whole memory image in.
-- **The Restore call still waits on readyz.** After the restore exec returns,
-  ateom-gvisor blocks until every readyz-enabled container reports HTTP 200
-  (probing the actor's veth IP) before it returns `ok` to atelet. So ateapi
-  finalizes the actor to `RUNNING` only once the workload is actually serving.
+### 7. Finalize
 
-This is the trick that makes resume *fast*: we don't wait for the entire
-snapshot to be paged in before serving the request - only what the workload
-actually needs to handle this request.
+ateapi checks the epoch atelet returned against the epoch the worker
+registered. If the worker process restarted during the restore, the result is
+`Unavailable` and the request is retried. Otherwise ateapi writes `RUNNING`,
+the epoch, and the worker pod's IPs, and returns the actor.
 
-### 17–18. ExtProc rewrites :authority
+### 8. Forwarding through the worker's tunnel
 
-When ResumeActor returns, the Actor object now carries `ateom_pod_ip`.
-ExtProc emits a header-mutation response telling the proxy to overwrite
-`:authority` with `<pod_ip>:80`. The proxy then forwards the request to the
-worker.
+The gateway does not send traffic to the actor directly, because worker pod
+ports are not an ingress path. It opens an mTLS `CONNECT` to `atunnel` on the
+worker pod's IP, port 8443, carrying the `ate-target-actor` header. `atunnel`
+checks that the caller presents the router's identity and that the named
+actor is active on this worker, then dials the actor at `169.254.17.2:80` (or
+the requested port) inside its network namespace and strips the routing
+headers.
 
-### 19–22. The workload responds
+If the actor has moved, `atunnel` answers `421` with
+`X-Ate-Assignment-Stale: true`, and AgentGateway evicts its cached
+assignment, resolves again, and retries. From the workload's perspective,
+this is a plain HTTP request arriving at its listener, and it has no idea it
+was suspended five seconds ago.
 
-From the workload's perspective, this is a plain old HTTP request arriving at
-its listener. It has no idea it was suspended five seconds ago.
+## Request parking
 
-## What if there are no idle workers?
+In an oversubscribed system, the momentary answer to "resume this actor" is
+often "not yet" (e.g. every eligible worker is full, a suspend still holds
+the actor, or ateapi is mid-rollout). Rather than fail fast, the gateway parks the
+request and retries the resume with backoff until it succeeds or a budget
+runs out. The table below shows how each `ResumeActor` result is handled.
 
-ateapi's assign-worker step retries a few times with exponential backoff (10ms
-initial, factor 2, jitter). If no eligible worker is available after that, it
-fails with a "no free workers available" precondition error, which ExtProc maps
-to HTTP **503 ServiceUnavailable**.
+| `ResumeActor` result | Behavior |
+|---|---|
+| `OK` | Route to the worker |
+| `Aborted` (another operation holds the actor) | Retry |
+| `ResourceExhausted` ("no worker has room for the actor") | Park and retry |
+| `FailedPrecondition` (transient actor state) | Park and retry |
+| `Unavailable` (control plane or worker restarting) | Park and retry |
+| `NotFound` | Fail fast: `404` |
+| `PermissionDenied` / `Unauthenticated` | Fail fast: `403` / `401` |
+
+Both dataplanes share the same defaults, which are a 5 s park budget per
+actor (shared by every request waiting on that actor's resume), at most 1024
+parked requests per router (a full lot sheds with `503`), and a first retry
+after 100 ms growing by 1.1x. With parking disabled (`max = 0`), only
+`Aborted` is retried, within 15 s. See `docs/request-parking.md` for the
+metrics and flags.
+
+## Where AgentGateway and Envoy differ
+
+The parking defaults are shared, but the two dataplanes behave differently in
+several other places, and the table below lines them up.
+
+| | AgentGateway | Envoy (default) |
+|---|---|---|
+| Who calls `ResumeActor` | AgentGateway's built-in Substrate ingress policy | The `ext_proc` server in the atenet-router container |
+| Running actors | Cached for 5 s; no ateapi call on a hit | `ResumeActor` on every request |
+| Parking slot | Taken on every cache miss | Taken only once a resume has to retry |
+| Budget runs out | The in-flight attempt is canceled; client gets `504` | The in-flight attempt is allowed to finish and served late if it succeeds; otherwise `503` |
+| No worker has room | `429` | `503` |
+| Stale `421` from `atunnel` | Evict, re-resolve, retry | Returned to the client |
+| Worker identity check | Chains to the pod-identity CA | Pins the worker's exact SPIFFE ID |
+| Ingress client auth | Not yet enforced | mTLS, with a SPIFFE-ID allowlist |
+
+## What if there are no free workers?
+
+The scheduler answers immediately, and if no eligible worker has room,
+ateapi returns `ResourceExhausted` ("no worker has room for the actor") and
+the gateway parks the request. (ateapi itself only retries its assignment, up
+to a dozen times with jittered backoff capped at 250 ms, when it loses a race
+for a worker another resume just filled.)
+
+If the actor is attached to a node from an asynchronous suspend and _that_
+node is full, ateapi first checks that some other node has room, then asks
+the old node's atelet to detach the actor (uploading its snapshot if it is
+not durable yet, then deleting the local copy), and schedules again without
+the node constraint. The restore then downloads from object storage.
 
 ## What about the warm path?
 
-If the actor is already `RUNNING`, the workflow is a no-op: `ResumeActor`
-returns the current Actor (with current `ateom_pod_ip`) and ExtProc proceeds
-straight to step 17. Same code path, just no atelet / GCS / runsc work.
+If the actor is already `RUNNING`, AgentGateway usually has its assignment
+cached and forwards straight to `atunnel` (step 8) without calling ateapi.
+Envoy calls `ResumeActor`, which reads the actor without taking the lease and
+returns it with `resumed=false`. Either way, no atelet, object storage, or
+sandbox work happens.
 
 ## State transitions during this flow
 
 ```mermaid
 stateDiagram-v2
-  [*] --> SUSPENDED: CreateActor
-  SUSPENDED --> RESUMING: ResumeActor<br/>(assign worker)
-  PAUSED --> RESUMING: ResumeActor<br/>(prefers node with<br/>local snapshot)
-  RESUMING --> RUNNING: Finalize → RUNNING
-  RESUMING --> CRASHED: restore fails
-  RUNNING --> SUSPENDING: SuspendActor
-  RUNNING --> PAUSING: PauseActor
-  SUSPENDING --> SUSPENDED: worker released,<br/>external snapshot
-  PAUSING --> PAUSED: node-local snapshot kept
-  SUSPENDED --> [*]: DeleteActor
-  CRASHED --> [*]: DeleteActor
+  SUSPENDED --> RESUMING: assign worker
+  RESUMING --> RUNNING: Restore / Run ok,<br/>epoch matches
+  RESUMING --> CRASHED: restore failed,<br/>probe timed out,<br/>worker gone
+  RUNNING --> RUNNING: ResumeActor<br/>(resumed=false)
   note right of RUNNING
-    The only state in which
-    a worker is assigned.
+    Has a worker assignment;
+    traffic flows through atunnel.
   end note
 ```
 
-`ResumeActor` can wake an actor from either `SUSPENDED` (restore from an
-external snapshot) or `PAUSED` (restore from the node-local snapshot, steered
-back to a node that holds it). A restore failure lands the actor in `CRASHED`;
-both `SUSPENDED` and `CRASHED` actors can be deleted.
+A transient failure (`Unavailable`, a deadline, a lost race, etc) leaves the
+actor `RESUMING` with its worker assignment, and the next `ResumeActor` picks
+up on the same worker. A `CRASHED` actor cannot be resumed until
+`RevertActor` returns it to `SUSPENDED` (see
+[Actor lifecycle](/flows/actor-lifecycle/)).
 
 ## Why this design is interesting
 
-- **No K8s scheduler on the hot path.** Worker pods are pre-warmed; ateapi
-  picks one in microseconds via a Redis lookup.
-- **No per-pod sidecar.** A single L7-proxy fleet handles all routing.
-- **Lazy-paging restore.** The workload is "back" the instant `runsc restore
-  -background` returns; pages come in on demand.
-- **Per-actor distributed lock.** Two concurrent `Resume` calls for the same
-  actor don't race - the second one waits or gets `Aborted`.
+- The Kubernetes scheduler stays off the hot path. Worker pods are
+  pre-warmed, and ateapi places the actor with an in-memory view of the fleet
+  and one database write.
+- A worker runs many actors at once, so placement is a capacity booking
+  rather than a pod claim.
+- A recently suspended actor resumes in place on the node that still holds
+  its snapshot, with no download.
+- Memory is restored on demand, so the workload runs as soon as the sandbox
+  is up and pages arrive as it touches them.
+- Two concurrent resumes for the same actor never race, because the gateway
+  collapses them and ateapi's per-actor lease serializes anything left.
 
 ## Related
 
 - [Suspend actor](/flows/suspend-actor/) - the reverse flow.
 - [Actor lifecycle](/flows/actor-lifecycle/) - full state machine.
+- [Request path](/flows/request-path/) - the ingress path in more detail.
 - [ateapi internals](/components/ateapi/) - the workflow engine in detail.
+- [atenet](/components/atenet/) - the router and its dataplanes.

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 820" role="img" aria-labelledby="title desc" font-family="'Comic Sans MS', 'Patrick Hand', 'Caveat', cursive, system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 860" role="img" aria-labelledby="title desc" font-family="'Comic Sans MS', 'Patrick Hand', 'Caveat', cursive, system-ui, sans-serif">
   <title id="title">Resume: inside one worker node</title>
-  <desc id="desc">atelet DaemonSet pod and the worker pod live on the same node and both bind-mount /var/lib/ateom-gvisor. atelet downloads three snapshot files from GCS into that hostPath, then dials the ateom unix socket that also lives in the hostPath. ateom-gvisor reads the same bytes from its side of the mount.</desc>
+  <desc id="desc">The atelet DaemonSet pod and a worker pod live on the same node and both mount the node directory /var/lib/ate at the same path. atelet, reached by ateapi over mutual TLS on port 21998, restores a node-local snapshot in place, or downloads the files listed in manifest.json from object storage through its object-store plugin sidecar. In parallel it stages the sandbox runtime from the node asset cache, refreshes the actor's systemInfo files, and unpacks the OCI bundle. It then dials the worker's Unix socket at /var/lib/ate/workers/podUID/worker.sock, and ateworker-gvisor, which hosts many actor sandboxes, restores the actor from the same bytes.</desc>
 
   <defs>
     <filter id="sketch" x="-2%" y="-2%" width="104%" height="104%">
@@ -43,142 +43,142 @@
     </style>
   </defs>
 
-  <rect width="1280" height="820" fill="#fdfcf7"/>
+  <rect width="1280" height="860" fill="#fdfcf7"/>
 
   <!-- Title -->
-  <text x="640" y="38" text-anchor="middle" class="label-big">Inside one worker node - how atelet hands the snapshot to ateom</text>
-  <text x="640" y="60" text-anchor="middle" class="annot">Two pods. One node filesystem. No network between them.</text>
+  <text x="640" y="38" text-anchor="middle" class="label-big">Inside one worker node - how atelet hands the snapshot to the worker</text>
+  <text x="640" y="60" text-anchor="middle" class="annot">Two pods. One node directory. A snapshot already on this node is restored in place, with no download.</text>
 
   <!-- ============================== NODE REGION ============================== -->
   <g filter="url(#sketch-region)" opacity="0.55">
-    <rect x="40" y="90" width="1060" height="700" rx="18" fill="#ecfdf5" stroke="#166534" stroke-width="1.6" stroke-dasharray="8 7"/>
+    <rect x="40" y="90" width="1060" height="740" rx="18" fill="#ecfdf5" stroke="#166534" stroke-width="1.6" stroke-dasharray="8 7"/>
   </g>
   <text x="60" y="116" class="region-tag">KUBERNETES NODE</text>
 
-  <!-- ============================== bind-mount pillars (drawn first so they sit behind) ============================== -->
-  <!-- Each pillar visually connects a pod to the hostPath. -->
+  <!-- ============================== mount pillars (drawn first so they sit behind) ============================== -->
   <g filter="url(#sketch)">
-    <!-- atelet → hostPath pillar -->
-    <rect x="180" y="380" width="160" height="150" rx="6" class="mount"/>
-    <!-- worker → hostPath pillar -->
-    <rect x="800" y="380" width="160" height="150" rx="6" class="mount"/>
+    <rect x="180" y="400" width="160" height="150" rx="6" class="mount"/>
+    <rect x="800" y="400" width="160" height="150" rx="6" class="mount"/>
   </g>
-  <text x="260" y="455" text-anchor="middle" class="label-tiny" fill="#92400e">bind-mount</text>
-  <text x="260" y="471" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ateom-gvisor</text>
-  <text x="880" y="455" text-anchor="middle" class="label-tiny" fill="#92400e">bind-mount</text>
-  <text x="880" y="471" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ateom-gvisor</text>
+  <text x="260" y="470" text-anchor="middle" class="label-tiny" fill="#92400e">hostPath mount</text>
+  <text x="260" y="486" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ate</text>
+  <text x="880" y="470" text-anchor="middle" class="label-tiny" fill="#92400e">hostPath mount</text>
+  <text x="880" y="486" text-anchor="middle" class="label-tiny" fill="#92400e">/var/lib/ate</text>
 
   <!-- ============================== atelet pod ============================== -->
   <g filter="url(#sketch)">
-    <rect x="80" y="150" width="360" height="240" rx="14" class="box-cp"/>
+    <rect x="80" y="150" width="360" height="250" rx="14" class="box-cp"/>
   </g>
-  <text x="260" y="190" text-anchor="middle" class="label-big">atelet pod</text>
-  <text x="260" y="212" text-anchor="middle" class="label-sm">DaemonSet - one per node</text>
-  <text x="260" y="232" text-anchor="middle" class="label-tiny">listens on :8085 (per-pod IP)</text>
-  <text x="260" y="248" text-anchor="middle" class="label-tiny">handler: AteomHerder.Restore()</text>
-  <text x="260" y="282" text-anchor="middle" class="label-sm">1. fetch runsc binary</text>
-  <text x="260" y="302" text-anchor="middle" class="label-sm">2. parallel GCS downloads</text>
-  <text x="260" y="322" text-anchor="middle" class="label-sm">3. zstd-decompress into hostPath</text>
-  <text x="260" y="342" text-anchor="middle" class="label-sm">4. dial ateom unix socket</text>
-  <text x="260" y="370" text-anchor="middle" class="label-tiny" fill="#6b7280">(unsandboxed, has host privileges)</text>
+  <text x="260" y="186" text-anchor="middle" class="label-big">atelet pod</text>
+  <text x="260" y="206" text-anchor="middle" class="label-sm">DaemonSet - one per node</text>
+  <text x="260" y="224" text-anchor="middle" class="label-tiny">gRPC :21998 · mTLS, accepts only ateapi</text>
+  <text x="260" y="238" text-anchor="middle" class="label-tiny">+ objectstore-plugin sidecar (holds storage creds)</text>
+  <text x="100" y="266" class="label-sm">1. local copy from this boot? use it in place</text>
+  <text x="100" y="286" class="label-sm">2. else download via the plugin sidecar</text>
+  <text x="100" y="306" class="label-sm">3. meanwhile: stage runtime from the asset</text>
+  <text x="118" y="322" class="label-sm">cache, refresh systemInfo, unpack bundles</text>
+  <text x="100" y="342" class="label-sm">4. dial the worker's Unix socket</text>
+  <text x="260" y="378" text-anchor="middle" class="label-tiny" fill="#6b7280">(unsandboxed, has host privileges)</text>
 
   <!-- ============================== worker pod ============================== -->
   <g filter="url(#sketch)">
-    <rect x="700" y="150" width="360" height="240" rx="14" class="box-pod"/>
+    <rect x="700" y="150" width="360" height="250" rx="14" class="box-pod"/>
   </g>
   <text x="880" y="178" text-anchor="middle" class="label-big">worker pod</text>
-  <text x="880" y="196" text-anchor="middle" class="label-tiny">pre-warmed · hosts ≤1 actor at a time</text>
+  <text x="880" y="196" text-anchor="middle" class="label-tiny">pre-warmed · hosts many actors, each booked against its capacity</text>
 
-  <!-- ateom-gvisor inner box: the PID 1 process in the pod. Unsandboxed. -->
+  <!-- ateworker-gvisor inner box: the pod's process. Unsandboxed. -->
   <g filter="url(#sketch)">
     <rect x="730" y="208" width="300" height="58" rx="10" class="box-gvis"/>
   </g>
-  <text x="880" y="230" text-anchor="middle" class="label-med">ateom-gvisor</text>
-  <text x="880" y="250" text-anchor="middle" class="label-tiny">PID 1 · gRPC server · NOT inside gVisor</text>
+  <text x="880" y="230" text-anchor="middle" class="label-med">ateworker-gvisor</text>
+  <text x="880" y="250" text-anchor="middle" class="label-tiny">gRPC server · hosts atunnel · NOT inside gVisor</text>
 
   <!-- exec runsc arrow + label between the two sub-boxes -->
-  <path d="M 880 266 L 880 286" class="conn" stroke="#5b21b6"/>
-  <text x="895" y="282" class="annot" fill="#5b21b6">exec runsc</text>
+  <path d="M 880 266 L 880 290" class="conn" stroke="#5b21b6"/>
+  <text x="895" y="284" class="annot" fill="#5b21b6">runsc restore</text>
 
-  <!-- gVisor sandbox sub-box: what runsc actually creates. Contains the actor workload. -->
+  <!-- stacked sandboxes: many actors per worker -->
   <g filter="url(#sketch)">
-    <rect x="730" y="290" width="300" height="90" rx="10" fill="#ede9fe" stroke="#5b21b6" stroke-width="1.8"/>
+    <rect x="746" y="294" width="296" height="90" rx="10" fill="#f5f3ff" stroke="#a78bfa" stroke-width="1.4"/>
+    <rect x="738" y="300" width="296" height="90" rx="10" fill="#f5f3ff" stroke="#a78bfa" stroke-width="1.4"/>
+    <rect x="730" y="306" width="296" height="88" rx="10" fill="#ede9fe" stroke="#5b21b6" stroke-width="1.8"/>
   </g>
-  <text x="880" y="312" text-anchor="middle" class="label-med" fill="#5b21b6">gVisor sandbox</text>
-  <text x="880" y="328" text-anchor="middle" class="label-tiny" fill="#5b21b6">runsc-managed · one per actor</text>
-  <line x1="760" y1="336" x2="1000" y2="336" stroke="#c4b5fd" stroke-width="1.2"/>
-  <text x="880" y="354" text-anchor="middle" class="label-sm" font-weight="700">actor workload</text>
-  <text x="880" y="372" text-anchor="middle" class="label-tiny">from the actor's OCI image (+ pause container)</text>
+  <text x="878" y="326" text-anchor="middle" class="label-med" fill="#5b21b6">gVisor sandboxes</text>
+  <text x="878" y="342" text-anchor="middle" class="label-tiny" fill="#5b21b6">one per actor · many per worker</text>
+  <line x1="760" y1="350" x2="996" y2="350" stroke="#c4b5fd" stroke-width="1.2"/>
+  <text x="878" y="368" text-anchor="middle" class="label-sm" font-weight="700">actor workload</text>
+  <text x="878" y="384" text-anchor="middle" class="label-tiny">from the actor's OCI image</text>
 
-  <!-- ============================== GCS (off-node) ============================== -->
+  <!-- ============================== object storage (off-node) ============================== -->
   <g filter="url(#sketch)">
-    <rect x="1130" y="190" width="130" height="140" rx="14" class="box-st"/>
+    <rect x="1130" y="190" width="130" height="170" rx="14" class="box-st"/>
   </g>
-  <text x="1195" y="226" text-anchor="middle" class="label-med">GCS / S3</text>
-  <text x="1195" y="250" text-anchor="middle" class="label-tiny">snapshot bucket</text>
-  <text x="1195" y="272" text-anchor="middle" class="label-tiny">checkpoint.img.zstd</text>
-  <text x="1195" y="290" text-anchor="middle" class="label-tiny">pages.img.zstd</text>
-  <text x="1195" y="308" text-anchor="middle" class="label-tiny">pages_meta.img.zstd</text>
-  <text x="1195" y="346" text-anchor="middle" class="label-tiny" fill="#991b1b">(off-node)</text>
+  <text x="1195" y="222" text-anchor="middle" class="label-med">GCS / S3</text>
+  <text x="1195" y="242" text-anchor="middle" class="label-tiny">object storage</text>
+  <text x="1195" y="268" text-anchor="middle" class="label-tiny">zstd files listed</text>
+  <text x="1195" y="284" text-anchor="middle" class="label-tiny">in manifest.json</text>
+  <text x="1195" y="306" text-anchor="middle" class="label-tiny">(manifest is</text>
+  <text x="1195" y="322" text-anchor="middle" class="label-tiny">written last)</text>
+  <text x="1195" y="378" text-anchor="middle" class="label-tiny" fill="#991b1b">(off-node)</text>
 
   <!-- ============================== hostPath bar ============================== -->
   <g filter="url(#sketch)">
-    <rect x="80" y="520" width="980" height="240" rx="14" class="box-host"/>
+    <rect x="80" y="540" width="980" height="270" rx="14" class="box-host"/>
   </g>
-  <text x="570" y="552" text-anchor="middle" class="label-big">hostPath: /var/lib/ateom-gvisor</text>
-  <text x="570" y="574" text-anchor="middle" class="annot">one directory on the node - bind-mounted into both pods → atelet writes, ateom reads, same bytes</text>
 
   <!-- snapshot files box -->
   <g filter="url(#sketch)">
-    <rect x="110" y="600" width="260" height="140" rx="10" class="box-file"/>
+    <rect x="105" y="565" width="290" height="180" rx="10" class="box-file"/>
   </g>
-  <text x="240" y="624" text-anchor="middle" class="label-med">actors/{actor-uid}/</text>
-  <text x="240" y="644" text-anchor="middle" class="label-sm">restore-state/</text>
-  <text x="240" y="668" text-anchor="middle" class="label-tiny">├── checkpoint.img</text>
-  <text x="240" y="686" text-anchor="middle" class="label-tiny">├── pages.img</text>
-  <text x="240" y="704" text-anchor="middle" class="label-tiny">└── pages_meta.img</text>
-  <text x="240" y="724" text-anchor="middle" class="label-tiny" fill="#6b7280">(written by atelet)</text>
+  <text x="250" y="589" text-anchor="middle" class="label-med">snapshots/&lt;actor-uid&gt;/</text>
+  <text x="125" y="614" class="label-sm">├── local-checkpoint/&lt;uuid&gt;/</text>
+  <text x="160" y="630" class="label-tiny">restored in place, no download</text>
+  <text x="125" y="652" class="label-sm">├── restore-state/</text>
+  <text x="160" y="668" class="label-tiny">downloaded files land here</text>
+  <text x="125" y="690" class="label-sm">└── checkpoint-state/</text>
+  <text x="160" y="706" class="label-tiny">written by a suspend</text>
+  <text x="250" y="732" text-anchor="middle" class="label-tiny" fill="#6b7280">file names vary by runtime; the manifest lists them</text>
 
   <!-- unix socket box -->
   <g filter="url(#sketch)">
-    <rect x="430" y="600" width="280" height="140" rx="10" class="box-sock"/>
+    <rect x="420" y="565" width="270" height="180" rx="10" class="box-sock"/>
   </g>
-  <text x="570" y="624" text-anchor="middle" class="label-med">ateoms/&lt;podUID&gt;/</text>
-  <text x="570" y="648" text-anchor="middle" class="label-sm">ateom.sock</text>
-  <text x="570" y="676" text-anchor="middle" class="label-tiny">unix socket - both pods see</text>
-  <text x="570" y="692" text-anchor="middle" class="label-tiny">the same inode under the</text>
-  <text x="570" y="708" text-anchor="middle" class="label-tiny">shared hostPath mount</text>
+  <text x="555" y="589" text-anchor="middle" class="label-med">workers/&lt;podUID&gt;/</text>
+  <text x="555" y="613" text-anchor="middle" class="label-sm">worker.sock</text>
+  <text x="555" y="645" text-anchor="middle" class="label-tiny">Unix socket - both pods see</text>
+  <text x="555" y="661" text-anchor="middle" class="label-tiny">the same inode under the</text>
+  <text x="555" y="677" text-anchor="middle" class="label-tiny">shared hostPath mount</text>
 
-  <!-- OCI bundle box -->
+  <!-- per-actor runtime files box -->
   <g filter="url(#sketch)">
-    <rect x="770" y="600" width="260" height="140" rx="10" class="box-file"/>
+    <rect x="715" y="565" width="320" height="180" rx="10" class="box-file"/>
   </g>
-  <text x="900" y="624" text-anchor="middle" class="label-med">OCI bundle/</text>
-  <text x="900" y="648" text-anchor="middle" class="label-sm">config.json + rootfs</text>
-  <text x="900" y="676" text-anchor="middle" class="label-tiny">prepared by atelet before</text>
-  <text x="900" y="692" text-anchor="middle" class="label-tiny">calling RestoreWorkload</text>
+  <text x="875" y="589" text-anchor="middle" class="label-med">actors/&lt;actor-uid&gt;/</text>
+  <text x="735" y="614" class="label-sm">├── bundles/</text>
+  <text x="770" y="630" class="label-tiny">config.json + rootfs per container</text>
+  <text x="735" y="652" class="label-sm">├── sandbox-assets/</text>
+  <text x="770" y="668" class="label-tiny">linked from the node asset cache</text>
+  <text x="735" y="690" class="label-sm">├── system-info/</text>
+  <text x="770" y="706" class="label-tiny">name, atespace, UID; rewritten each restore</text>
+  <text x="735" y="728" class="label-sm">└── durable-dir/</text>
+
+  <text x="570" y="780" text-anchor="middle" class="label-big">hostPath: /var/lib/ate</text>
+  <text x="570" y="800" text-anchor="middle" class="annot">one directory on the node, mounted into both pods at the same path → atelet writes, the worker reads, same bytes</text>
 
   <!-- ============================== arrows ============================== -->
 
-  <!-- GCS → atelet (downloads). Orthogonal polyline along the top of the node region -
-       stays well clear of both pod boxes so the line never crosses content.
-       Emerges from GCS's left edge, runs up to y=132 (well above pod row at y=150),
-       across, then drops into atelet's top edge. -->
+  <!-- object storage → atelet (download). Runs along the top of the node region,
+       clear of both pod boxes, then drops onto atelet's top edge. -->
   <path d="M 1130 200 L 1130 132 L 410 132 L 410 150" class="conn"/>
-  <text x="770" y="120" text-anchor="middle" class="step">10 · 11 - 3 files in parallel · zstd-decompress on the fly</text>
+  <text x="770" y="124" text-anchor="middle" class="step">download through the plugin sidecar · skipped for a local snapshot</text>
 
-  <!-- atelet → unix socket box (the dial).  Comes down the right side of the atelet pod,
-       passes through atelet's bind-mount pillar (which is what's literally true),
-       and lands on the socket box. -->
-  <path d="M 360 390 Q 380 500 460 600" class="conn-blue"/>
-  <text x="395" y="510" class="step">12</text>
-  <text x="395" y="528" class="annot">dial socket</text>
+  <!-- atelet → unix socket box (the dial) -->
+  <path d="M 380 400 Q 395 480 450 565" class="conn-blue"/>
+  <text x="446" y="446" class="annot">dial worker.sock</text>
 
-  <!-- unix socket → ateom-gvisor (the actual RPC). Comes up the left side of the worker
-       pod via worker's bind-mount pillar, lands on ateom-gvisor (NOT the sandbox -
-       the RPC is handled by the ateom-gvisor process, which then execs runsc). -->
-  <path d="M 690 600 Q 715 430 735 260" class="conn"/>
-  <text x="710" y="510" class="step">13</text>
-  <text x="710" y="528" class="annot">RestoreWorkload RPC</text>
+  <!-- unix socket → ateworker-gvisor (the RPC) -->
+  <path d="M 650 565 Q 680 400 728 250" class="conn"/>
+  <text x="640" y="524" text-anchor="end" class="annot">RestoreWorkload RPC</text>
 
 </svg>

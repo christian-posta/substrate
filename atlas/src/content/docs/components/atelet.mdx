@@ -1,142 +1,205 @@
 ---
 title: atelet
-description: The node-level DaemonSet. Receives gRPC calls from ateapi, drives the in-pod ateom over a Unix socket, and ships checkpoints to GCS/S3.
+description: The node-level DaemonSet. Serves ate-api-server's Run / Checkpoint / Restore calls, drives the node's ateworker processes over Unix sockets, caches sandbox binaries and images, and moves snapshots through an object-store plugin.
 ---
 
-`atelet` is the node-side workhorse. One pod per worker node (it's a
-DaemonSet), exposing a gRPC server that ateapi calls into for every Run /
-Checkpoint / Restore. atelet doesn't make decisions - it executes.
+`atelet` runs on every worker node (it's a DaemonSet, so there's one pod per
+node), and it's where the control plane's decisions turn into running
+sandboxes. ate-api-server calls into it for every Run / Checkpoint / Restore,
+and every worker process on the node calls into it to register and to get
+credentials. Placement gets decided in ate-api-server, and atelet carries out
+those decisions and reports back what only the node can see.
 
-It is **runtime-agnostic**: it drives whichever sandbox a worker pod runs
-(`ateom-gvisor` or `ateom-microvm`) over the same Unix-socket gRPC contract.
+atelet works the same way whichever worker a pod runs (`ateworker-gvisor` or
+`ateworker-microvm`), since it drives both over the same Unix-socket gRPC
+contract. It also runs with low privilege on purpose. Mounts, netlink, device
+and namespace work all happen inside the worker pod, so atelet itself only
+reads and writes the node's `/var/lib/ate` tree.
 
 ## What it does
 
 ```mermaid
 flowchart LR
-  API[ateapi] -- gRPC :8085 --> AT[atelet]
+  API[ate-api-server] -- "Atelet service<br/>mTLS :21998" --> SRV
 
-  subgraph AT_internals["atelet process"]
+  subgraph AT_internals["atelet pod"]
     direction TB
-    SRV["gRPC server"]
-    PULL["Image puller<br/>(pre-stage OCI bundles)"]
-    OCI["OCI bundle builder"]
-    OBJ["GCS / S3 client<br/>(zstd compress/decompress)"]
-    SOCK["Unix socket gRPC client<br/>→ ateom"]
+    SRV["Atelet gRPC server<br/>(ate-api-server only)"]
+    WS["WorkerSupport server<br/>(node-local Unix socket)"]
+    IMG["Image cache<br/>(unpacked OCI layers)"]
+    ASSET["Sandbox asset cache<br/>+ runtime index"]
+    SYNC["Worker sandbox syncer<br/>(writes sandbox-runtimes.json)"]
+    OSP["objectstore-plugin<br/>sidecar"]
   end
 
-  SRV --> PULL
-  SRV --> OCI
-  SRV --> OBJ
-  SRV --> SOCK
+  SRV -- "RunWorkload /<br/>CheckpointWorkload /<br/>RestoreWorkload" --> OM[ateworker<br/>in each worker pod]
+  OM -- "register, certs,<br/>crash reports" --> WS
+  WS -- "WorkerService" --> API
+  SRV --> IMG
+  SRV --> ASSET
+  SYNC --> ASSET
+  SRV --> OSP
+  OSP <--> GCS[("GCS / S3")]
 
-  SOCK -- "Run /<br/>Checkpoint /<br/>Restore" --> OM[ateom<br/>in worker pod]
-  OBJ <--> GCS[("GCS / S3")]
-
-  click API "/components/ateapi/" "ateapi"
-  click OM "/components/ateom-gvisor/" "ateom"
+  click API "/components/ateapi/" "ate-api-server"
+  click OM "/components/ateworker-gvisor/" "ateworker"
   click GCS "/components/storage/" "Storage"
 ```
 
-## The gRPC service
+## Two gRPC services
 
-Three RPCs, each called by ateapi during the corresponding workflow. Every
-request's path components (atespace, actor name, container names, target ateom
-UID, snapshot URI prefix) are validated up front, and an invalid request is
-rejected as an invalid-argument error.
+As the diagram above shows, atelet serves two gRPC services, and each one has
+different callers and different authentication.
 
-| RPC | Caller | What atelet does |
-|---|---|---|
-| Run | ateapi resume workflow (cold boot fallback) | Fetch sandbox assets, reset actor dirs, build OCI bundles, issue the Run call to ateom |
-| Checkpoint | ateapi suspend / pause workflow | Re-fetch the recorded sandbox assets, issue the Checkpoint call to ateom, then ship exactly the files ateom reports (zstd-compressed) locally or to GCS/S3 |
-| Restore | ateapi resume workflow | Fetch sandbox assets, download the snapshot files (parallel), decompress to a local volume, issue the Restore call to ateom |
+The `Atelet` service is the downward path. ate-api-server finds the atelet pod
+on the target node and dials it over mTLS on port `21998`. atelet admits
+exactly one client identity (ate-api-server's SPIFFE ID), so no other pod can
+drive the sandboxes on a node. atelet also runs at most one of these
+operations per actor at a time, and a second call waits for the first.
 
-## Sandbox assets (not a hardcoded runsc download)
+| RPC | What atelet does |
+|---|---|
+| Run | Prepare the actor's directories, compose its rootfs from the image cache, stage the sandbox runtime the scheduler picked, write system-info volumes, then call `RunWorkload` on the worker |
+| Restore | Same preparation, plus put the snapshot files in place (local copy, shared-snapshot cache, or a download), then call `RestoreWorkload` |
+| Checkpoint | Call `CheckpointWorkload`, keep the snapshot locally, and make it durable in object storage now or in the background |
+| PromoteSnapshot | Upload a local snapshot while keeping the local copy (e.g. for tagging) |
+| DetachActor | Make the latest local snapshot durable, then drop the node's copies so the actor can resume anywhere |
+| Terminate | Kill any running workload for the actor, detach its volumes, and clean up its node state |
 
-The runtime binaries are no longer a baked-in "download runsc" step. The Run
-request carries a **sandbox-assets** description: a `sandbox_class` plus a
-per-architecture set of content-addressed files (URL + sha256). atelet projects
-that onto the node's architecture, then fetches each asset:
+`WorkerSupport` is the upward path. It listens on a Unix socket under
+`/var/lib/ate` and only accepts worker pods that are scheduled on atelet's own
+node and authenticate with their pod certificate. Most calls get forwarded to
+ate-api-server's `WorkerService`, with atelet naming the worker its caller
+proved itself to be.
 
-- The download is **streamed to a temp file** (hashing as it goes, verified
-  against the expected sha256 and capped) and atomically renamed into the
-  shared content-addressed cache - never buffered whole in memory.
-- Public buckets (gVisor's `runsc` in `gs://gvisor`) are tried anonymously
-  first, then the cluster's own object-storage client.
-- gVisor needs a single `runsc` asset; the micro-VM runtime needs several
-  (e.g. `cloud-hypervisor`, `kata-kernel`, `kata-image`).
+| RPC | Purpose |
+|---|---|
+| AcquireWorkerEpoch / RegisterWorker | A worker process announces itself, its pod IPs, and its capacity |
+| SetWorkerSandboxRuntimes | The worker reports which sandbox runtimes it can run (see below) |
+| MintActorCertificate | `atunnel` gets a `worker-for-actor` certificate for the actor it is serving |
+| GetActorEgressPolicy | `atunnel` reads the actor's egress policy |
+| ReportActorCrashed | The worker saw an actor's sandbox die on its own |
+| RequestActorSuspend | The worker asks the control plane to suspend an actor it hosts |
 
-atelet also **records the asset set on the node** at Run/Restore
-(`sandbox-assets.json` under the actor dir) so a later Checkpoint - whose
-request no longer carries the sandbox config - can re-fetch the identical
-binaries and pin them into the snapshot manifest.
+atelet also calls `WorkerService` on its own behalf, to report snapshot
+uploads and detaches and to mint the short-lived `worker-for-actor` JWTs that
+it hands to node-side plugins. We cover what those credentials carry on the
+[Security](/security/) page.
 
-## Actor identity file
+## Sandbox runtimes: what each worker advertises
 
-Before building the OCI bundles, atelet writes the actor's own name to
-`actor-id` in the per-actor identity dir and **bind-mounts that dir read-only
-at `/run/ate`** in each application container. The write is atomic, and the
-dir is **regenerated on every resume**, so the value is correct even when the
-actor was restored from a shared golden snapshot (whose checkpointed process
-environment would otherwise carry the golden actor's identity).
+A worker can only take actors whose sandbox binaries it can run, and only
+atelet knows what the node can run. So how does the control plane find out?
+The _worker sandbox syncer_ in atelet watches this node's worker pods, their
+`WorkerPool`s, and the pools' [SandboxConfig](/concepts/sandboxconfig/)s, and
+it takes the same four steps for each worker.
 
-## How atelet talks to ateom
+1. Resolves the SandboxConfig the pool runs and picks the versions this
+   node's architecture has assets for.
+2. Hashes each version's asset digests into a `sandbox_bundle_hash` and
+   records it in a node-local _runtime index_.
+3. Fetches the assets and probes what a memory snapshot taken on that runtime
+   would need to find again (ie, the CPU features `runsc` reports for gVisor,
+   or the host CPU vendor and model for micro-VM).
+4. Writes `sandbox-runtimes.json` into the worker's directory, with a default
+   runtime plus any other restorable runtimes, each as a set of compatibility
+   attributes.
 
-Each worker pod has a host-bind-mounted Unix socket at:
+The worker watches that file and re-reports it to the control plane whenever
+it changes. A SandboxConfig or WorkerPool edit rewrites the files across the
+fleet with up to thirty seconds of jitter, so workers don't all re-register at
+once.
 
-```
-/var/lib/ateom-gvisor/ateoms/<pod-uid>/ateom.sock
-```
+When ate-api-server later sends Run or Restore, the request names the runtime
+the assigned worker registered, and atelet resolves its bundle hash in the
+runtime index. If the index doesn't hold that hash, atelet refuses the request
+as a placement error rather than serving it from whatever the request
+describes.
 
-atelet dials this socket (over `unix://`) and gets a gRPC client to that
-specific pod's ateom. No TCP, no service discovery - the pod UID in the
-filesystem path is the addressing scheme. The base path is shared by atelet and
-ateom.
+## Sandbox asset cache
 
-## Snapshot upload / download
+The binaries themselves live in one node-local, content-addressed cache
+keyed by sha256. Each actor gets hard links into the cache under its own
+`sandbox-assets/` directory, which is the only place a worker will run a
+sandbox binary from. Nothing is copied per actor, an asset downloads once per
+node, and each worker's default runtime stays linked so it's never evicted
+while idle. With a byte budget set, a periodic pass evicts the oldest unlinked
+entries. Downloads go through the object-store plugin (falling back to
+anonymous reads for public `gs://` buckets such as gVisor's releases) and are
+sha256-verified.
 
-atelet is the **only** component that talks to object storage; the same
-interface fronts both GCS and S3.
+## Images and volumes
 
-ateom reports the exact set of files it wrote (rather than atelet assuming a
-fixed list), so atelet ships precisely that set: gVisor's checkpoint image
-files, or the micro-VM's cloud-hypervisor snapshot set. Every on-disk snapshot
-file is uploaded with a **sparse-extent zstd format** (magic `ATESPRSE`) that
-compresses only the populated extents and skips the holes - so a mostly-zero RAM
-image (whether a gVisor `pages.img` or a micro-VM `memory-ranges`) only costs its
-resident pages. Snapshots can be kept node-local (for
-Pause) or uploaded to external storage (for Suspend), keyed under the prefix
-supplied by the `ActorTemplate`. Restore downloads happen in parallel; zstd
-compression is applied on the atelet side to keep network bytes down.
+- atelet pulls container images itself, using the node's kubelet credential
+  provider, and keeps the unpacked layers in a node-local, content-addressed
+  image cache that survives restarts. An actor's rootfs is composed from those
+  layers as an overlay, so a warm start skips image extraction, and image
+  volumes come from the same cache.
+- DurableDir volumes get a per-actor directory that the worker mounts and
+  snapshots capture.
+- External (CSI) volumes are a preview feature. ate-api-server provisions and
+  attaches them, and atelet calls the driver's node plugin (found through a
+  cluster-scoped `CSIDriverConfig`) to make them available on the node.
+- System-info volumes are read-only files that atelet writes on every Run and
+  Restore, holding the actor's own name, atespace, or UID, and selected trust
+  bundles. Because they're regenerated on every activation, they're correct
+  even for an actor restored from a shared golden snapshot.
+
+## Snapshot storage
+
+atelet holds no object-storage credentials. External snapshots move through
+an object-store plugin sidecar in the atelet pod (the in-tree plugin backs GCS
+or S3), which atelet reaches over a Unix socket. Each transfer
+carries a `worker-for-actor` JWT that the plugin checks, so a transfer is
+authorized for one actor. The plugin stores each file zstd-compressed and
+refuses to serve snapshot locations as sandbox assets.
+
+The worker reports exactly which files it wrote, so atelet ships precisely
+that set. A suspended actor's snapshot also stays on the node, and the next
+resume on that node restores from the local copy. By default the upload
+happens in the background after the checkpoint returns, while a synchronous
+suspend uploads before returning. After a detach delay (or when the node needs
+room), atelet uploads if needed, deletes the local copy, and reports the
+detach so the actor can resume on any node. Shared snapshots, such as a
+template's golden snapshot, are cached once per node, so concurrent restores
+share one download.
 
 ## Local filesystem layout
 
-atelet manages a tree on each node:
+atelet and the workers share a host directory, `/var/lib/ate`, mounted at the
+same path in both. Apart from the snapshot directory, this layout is an
+implementation detail.
 
 | Path | Contents |
 |---|---|
-| `/var/lib/ateom-gvisor/static-files/runsc-<sha>` | Content-addressed sandbox asset binaries |
-| `/var/lib/ateom-gvisor/actors/<actor-uid>/` | Per-actor working tree (keyed by the actor's server-assigned UID) |
-| `.../identity/` | The `actor-id` file, bind-mounted read-only at `/run/ate` |
-| `.../sandbox-assets.json` | Recorded sandbox asset set (survives Run→Checkpoint) |
-| `.../bundles/<container>/` | OCI bundles per container |
-| `.../checkpoint-state/` | Output of a checkpoint |
-| `.../restore-state/` | Input to a restore (downloaded files staged here) |
+| `actors/<actor-uid>/` | Per-actor tree: OCI bundles, volume roots, `sandbox-assets/` hard links |
+| `snapshots/` | Per-actor snapshot staging; may be a dedicated disk mounted before actors run |
+| `sandbox-asset-cache/` | Content-addressed sandbox binaries |
+| `workers/<pod-uid>/worker.sock` | Each worker's gRPC socket, addressed by pod UID |
+| `workers/<pod-uid>/sandbox-runtimes.json` | What that worker advertises |
+| `workers/<pod-uid>/default-runtime/` | Links that keep the worker's default runtime cached |
+| `worker-support.sock` | atelet's `WorkerSupport` socket |
+| `atelet-otlp.sock` | Node-local OTLP relay that workers push telemetry into |
 
-`checkpoint-state` and `restore-state` are kept separate so a future restore
-doesn't trample a checkpoint in progress.
+## Node devices
+
+For the micro-VM class, atelet runs a device plugin that advertises
+`/dev/kvm` as the extended resource `ate.dev/kvm`, but only on nodes where the
+device exists. Micro-VM worker pods request that resource, so they land only
+on KVM-capable nodes and get the device without running privileged.
 
 ## Why a DaemonSet, not a sidecar?
 
-atelet is heavy: it caches sandbox binaries, holds object-storage credentials,
-and image-pulls. Running one per worker pod would multiply those costs by
-the worker count. One atelet per node, shared by all worker pods on that
-node, is much cheaper.
+atelet caches images and sandbox binaries, runs the object-store plugin, and
+keeps snapshots on local disk. Running one atelet per node, shared by every
+worker pod and every actor on that node, keeps those costs per node instead of
+per worker, and it lets a snapshot outlive the worker that took it.
 
 ## Related
 
 - [Resume actor flow](/flows/resume-actor/) · [Suspend actor flow](/flows/suspend-actor/) -
   atelet's two main jobs.
-- [ateom-gvisor](/components/ateom-gvisor/) · [ateom-microvm](/components/ateom-microvm/) -
-  the two runtimes atelet drives.
-- [Storage](/components/storage/) - GCS/S3 layout details.
+- [ateworker-gvisor](/components/ateworker-gvisor/) · [ateworker-microvm](/components/ateworker-microvm/) -
+  the two workers atelet drives.
+- [Workers](/components/workers/) - how a worker registers through atelet.
+- [Storage](/components/storage/) - snapshot layout in object storage.

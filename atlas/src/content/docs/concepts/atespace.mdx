@@ -1,78 +1,109 @@
 ---
 title: Atespace
-description: The tenancy boundary an actor lives in. Actor identity is (atespace, name), and it shows up in DNS, Redis keys, and every API call.
+description: The tenancy and authorization boundary for templates, actors, and tags. An actor's identity is (atespace, name), and it shows up in routing, credentials, storage paths, and every API call.
 ---
 
-An **atespace** is Substrate's isolation boundary for actors - the closest thing
-to a "namespace," but a Substrate-native resource rather than a Kubernetes one.
-Every actor is created *into* an atespace, and an actor's name is only unique
-*within* its atespace. So the real identity of an actor is the tuple
-**`(atespace, name)`**, not a bare id.
+An _atespace_ is Substrate's tenancy boundary and the closest thing it has to a
+namespace, although it's a Substrate-native resource rather than a Kubernetes
+one. It's a record in [ateapi](/components/ateapi/)'s PostgreSQL database that
+you create through the API (`kubectl ate create atespace <name>`), and it never
+shows up as a Kubernetes object.
 
-:::note[This is a recent, load-bearing change]
-Substrate used to identify actors by a single `actor_id`. That is gone. Identity
-is now `(atespace, name)`, carried in a common `ResourceMetadata` on every
-resource. This changes the DNS name, the Redis keys, and the shape of every
-Control RPC - so it shows up all over this atlas.
-:::
+Every ActorTemplate, Actor, and Tag is created into an atespace, and its name is
+only unique _within_ that atespace, so the real identity of an actor is the
+tuple `(atespace, name)` carried in the common `ResourceMetadata` that every
+resource has.
+
+## What lives in an atespace
+
+```mermaid
+flowchart TB
+  G["Global"] --> GAP["AccessPolicy 'default'<br/>(global roles)"]
+  G --> AS["Atespace"]
+  G --> W["Worker<br/>(global, not in any atespace)"]
+  AS --> AP["AccessPolicy 'default'<br/>(atespace roles)"]
+  AS --> AT["ActorTemplate"]
+  AS --> A["Actor"]
+  AS --> T["Tag"]
+  A --> EP["EgressPolicy 'default'"]
+
+  click A "/concepts/actor/" "Actor"
+  click AT "/concepts/actortemplate/" "ActorTemplate"
+  click W "/concepts/worker/" "Worker"
+```
+
+As the diagram above shows, an `Atespace` is itself global-scoped, which means
+its `metadata.atespace` is empty and its identity is just `metadata.name` (a
+DNS-label-style short name). Workers are global too, since the capacity they
+provide is shared by every atespace.
 
 ## Where the atespace shows up
 
 | Surface | Form |
 |---|---|
-| **DNS name** | `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` |
-| **Redis actor record** | `actor:<atespace>:<name>` |
-| **Per-actor lock** | `lock:actor:<atespace>:<name>` |
-| **Control API** | requests carry an `ObjectRef{atespace, name}` (or an `Actor` whose `metadata.atespace`/`metadata.name` are set) |
-| **`ListActors`** | optional `atespace` field scopes the scan to `actor:<atespace>:*` |
+| Control API | `ObjectRef{atespace, name}`, or a resource whose `metadata.atespace` is set |
+| List RPCs | `ListActors`, `ListActorTemplates`, `ListTags` take an optional `atespace`; empty lists across all of them |
+| Ingress routing | The `ate-target-actor: <atespace>/<actor>` header names the actor a request is for |
+| Actor identity | SPIFFE ID `spiffe://substrate-actor.local/actor/<atespace>/<name>` and JWT subject `actor/<atespace>/<name>` |
+| Snapshot storage | `<location>/atespaces/<atespace>/actors/<actor-uid>/...` and `.../tags/<tag-uid>` |
+| Per-actor lease | `lease:actor:<atespace>:<name>` |
 
-The atespace is **caller-specified at creation and immutable** thereafter, just
-like the actor name.
+The caller specifies the atespace at creation, and just like the resource name,
+it's immutable from then on.
 
-## It is a first-class resource
+## Authorization per atespace
 
-Atespaces are Substrate-native records stored in Redis (not Kubernetes objects),
-with their own CRUD RPCs on the `Control` service:
+ateapi authorizes every call per atespace, and a principal gets a role on an
+atespace through that atespace's `AccessPolicy`.
 
-```mermaid
-flowchart LR
-  subgraph API["ateapi · Control service"]
-    CA["CreateAtespace"]
-    GA["GetAtespace"]
-    LA["ListAtespaces"]
-    DA["DeleteAtespace"]
-  end
-  REDIS[("Redis / Valkey")]
-  CA --> REDIS
-  GA --> REDIS
-  LA --> REDIS
-  DA --> REDIS
+| Role | Can |
+|---|---|
+| `viewer` | Get and list the atespace's templates, actors, and tags |
+| `editor` | Everything a viewer can, plus create and operate actors, templates, and tags |
+| `owner` | Everything an editor can, plus manage the atespace's AccessPolicy and delete the atespace |
 
-  click API "/components/ateapi/" "ateapi"
-  click REDIS "/components/storage/" "Storage"
-```
+A global `owner` is an owner of every atespace, and a global `viewer` can read
+every atespace. Creating an atespace takes the global `owner` role. Today the
+atespace is the finest boundary. There are no per-actor or per-template
+bindings, so anyone who can operate one actor in an atespace can operate all of
+them.
 
-An `Atespace` is **global-scoped**: it does not itself live inside another
-atespace, so its `metadata.atespace` is empty and its identity is just
-`metadata.name`. `DeleteAtespace` refuses to remove an atespace that still
-contains actors.
+## Golden actors live in the template's atespace
 
-## The reserved golden atespace
+When ateapi builds a template's [golden snapshot](/flows/golden-snapshot/), the
+throwaway golden actor is created in the template's own atespace, named by the
+template's UID, under the same policies and storage grants as ordinary actors.
+The finished snapshot is kept as a golden tag in that atespace.
 
-Per-template **golden actors** (the throwaway boots used to capture a
-[golden snapshot](/flows/golden-snapshot/)) live in a reserved system atespace
-named **`ate-golden`** rather than in any tenant atespace.
+## Sharing across atespaces
+
+So how does state get from one atespace to another? Tags are the one way it
+crosses. A tag is always owned and addressed by its atespace, but its scope
+decides who may start actors from it.
+
+- `ATESPACE` limits it to actors in the tag's own atespace.
+- `PUBLISHED` opens it to actors in any atespace (golden tags are published).
+
+## Deleting an atespace
+
+`DeleteAtespace` refuses (`FailedPrecondition`) while the atespace still holds
+any actors, templates, or tags. Its AccessPolicy and authorization grants are
+removed with it.
 
 ## Why identity is scoped this way
 
-Scoping the name to an atespace lets two tenants each have an actor named, say,
-`checkout` without collision, and lets scheduling, locking, and routing all key
-off the same `(atespace, name)` pair. Worker assignment and the per-actor
-workflow lock are both scoped by this tuple, so the same actor name in two
-different atespaces never contends.
+Scoping names to an atespace lets two tenants each have an actor named, say,
+`checkout` without collision, and lets routing, identity, storage, locking,
+and authorization all key off the same `(atespace, name)` pair. Storage paths
+use the actor's UID under the atespace, so a deleted and recreated actor with
+the same name never sees its predecessor's snapshots.
 
 ## Related
 
-- [Actor](/concepts/actor/) - what lives inside an atespace.
-- [Snapshot](/concepts/snapshot/) - snapshots are keyed under the actor, which is keyed under its atespace.
-- [ateapi](/components/ateapi/) - serves the atespace CRUD and actor RPCs.
+- [Actor](/concepts/actor/) covers what lives inside an atespace.
+- [Actor identity](/concepts/actor-identity/) covers the credentials that carry
+  `(atespace, name)` outside Substrate.
+- [ateapi](/components/ateapi/) serves the atespace CRUD, access policies, and
+  actor RPCs.
+- [Snapshot](/concepts/snapshot/) explains how snapshots and tags are stored
+  under their atespace.

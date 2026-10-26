@@ -1,153 +1,201 @@
 ---
 title: Workers
-description: The pre-warmed sandbox pods that run actor workloads. Members of a WorkerPool, gVisor OR micro-VM, hosted via an ateom helper inside each pod.
+description: The pre-warmed pods that run actor workloads. Members of a WorkerPool, gVisor or micro-VM, each hosting many actors through an in-pod ateworker that registers its capacity and runtimes through atelet.
 ---
 
-A **worker** in Substrate is a Kubernetes Pod that's *ready to host an actor*.
-It's pre-warmed: the in-pod `ateom` helper is already running and the sandbox
-binaries are staged on the node - so when ateapi assigns the worker, ateom can
-create the sandbox and restore an actor into it without waiting on image pulls
-or sandbox boot.
+A worker in Substrate is a pre-warmed Kubernetes Pod that's ready to host
+actors. By the time the scheduler places an actor on it, the in-pod
+`ateworker` is running and registered, the node has its sandbox binaries
+cached, and the pod network is up, so the worker can create the sandbox and
+restore the actor without waiting on Kubernetes scheduling, image pulls, or
+binary downloads.
 
-Every worker belongs to exactly one `WorkerPool`, and a pool is
-**single-class**: either gVisor (`ateom-gvisor` + runsc) or micro-VM
-(`ateom-microvm` + cloud-hypervisor). All pods in a pool run the same runtime,
-and snapshots are **not** portable across classes.
+A worker hosts many actors. Each actor runs in its own sandbox (a gVisor
+sandbox or a micro-VM) with its own network namespace and cgroup, and the
+worker takes actors until it reaches its actor limit or its CPU and memory
+capacity. Every worker belongs to one `WorkerPool`, and a pool runs one
+sandbox class, either gVisor (`ateworker-gvisor` + runsc) or micro-VM
+(`ateworker-microvm` + cloud-hypervisor).
 
 ## Anatomy of a worker pod
 
 ```mermaid
 flowchart LR
-  subgraph POD["Worker pod (idle: only the ateom container runs)"]
+  subgraph POD["Worker pod (one 'worker' container)"]
     direction TB
-    OM["ateom<br/>(gvisor OR microvm)<br/>gRPC on Unix socket"]
-    SB[["Sandbox<br/>(gVisor sandbox via runsc,<br/>OR cloud-hypervisor micro-VM)<br/>created on assignment"]]
-    OM -- "create / restore" --> SB
-    SB -.->|hosts| WL[["Actor workload<br/>(after restore)"]]
+    OM["ateworker<br/>(gvisor OR microvm)<br/>gRPC on worker.sock"]
+    TUN["atunnel<br/>(ingress :443 / :8443,<br/>actor egress)"]
+    SB1[["Actor sandbox"]]
+    SB2[["Actor sandbox"]]
+    OM --- TUN
+    OM -- "create / restore" --> SB1
+    OM -- "create / restore" --> SB2
   end
 
-  AT[atelet on node] -- "Unix socket<br/>/var/lib/ateom-gvisor/<br/>ateoms/{uid}/ateom.sock" --> OM
+  AT[atelet on node] -- "/var/lib/ate/workers/<br/>{pod-uid}/worker.sock" --> OM
+  OM -- "register, runtimes,<br/>crash reports" --> AT
+  RT[router] -- mTLS --> TUN
 
-  click OM "/components/ateom-gvisor/" "ateom-gvisor"
+  click OM "/components/ateworker-gvisor/" "ateworker-gvisor"
   click AT "/components/atelet/" "atelet"
+  click RT "/components/atenet/" "atenet"
 ```
 
-The actor's network is wired up **on assignment** by ateom - a per-activation
-veth pair into an interior netns, with nftables masquerade/DNAT in the pod
-netns. It's torn down on checkpoint and rebuilt on restore. (Same model in
-both runtimes; see [ateom-gvisor](/components/ateom-gvisor/) and
-[ateom-microvm](/components/ateom-microvm/).)
+As the diagram above shows, the worker's gRPC socket sits in the host's
+`/var/lib/ate` tree (which atelet and every worker pod mount at the same path),
+under a directory named by the pod UID, so the pod UID in that path is how a
+worker gets addressed. Each actor's
+network is built on assignment and torn down on checkpoint (see
+[ateworker-gvisor](/components/ateworker-gvisor/#actor-networking)).
 
-## What a worker is, in three sentences
+## How a worker registers
 
-1. A Pod owned by a `WorkerPool` Deployment.
-2. Running a single `ateom` container of its pool's class (a pause process and
-   the sandbox are created later, **on assignment**, not at pod start).
-3. A row in Redis (`worker:<namespace>:<pool>:<pod>`) once it has an IP,
-   tracking whether it's currently hosting an actor.
+Two parties register a worker. atecontroller's worker syncer watches worker
+pods and creates the `Worker` record in the control plane, and the worker
+process itself reports what only the node can observe, through atelet. The
+sequence below shows how those two halves interleave.
 
-## Worker states
+```mermaid
+sequenceDiagram
+  participant K as Kubernetes
+  participant S as atecontroller<br/>worker syncer
+  participant W as ateworker
+  participant L as atelet
+  participant API as ate-api-server
 
-Workers have a two-state lifecycle on the actor side: Idle or Assigned. See
-[Worker lifecycle](/flows/worker-lifecycle/) for the full state machine.
+  K->>S: pod scheduled to a node
+  S->>API: CreateWorker (UNAVAILABLE)
+  W->>L: AcquireWorkerEpoch
+  L->>API: WorkerService.AcquireWorkerEpoch
+  W->>L: RegisterWorker (epoch, pod IPs, capacity)
+  L->>API: WorkerService.RegisterWorker
+  Note over L: worker sandbox syncer writes<br/>sandbox-runtimes.json
+  W->>L: SetWorkerSandboxRuntimes
+  L->>API: WorkerService.SetWorkerSandboxRuntimes
+  Note over W: /readyz passes once registered
+  K->>S: pod Ready
+  S->>API: MarkWorkerAvailable (ACTIVE)
+```
 
-| State | Identifier |
+- The record is named after the pod UID and carries the pod's namespace,
+  pool, name, node, SPIFFE ID, and a copy of the WorkerPool's labels.
+- The worker's readiness probe fails until it has registered, so a pod is
+  never Ready, and never `ACTIVE`, before the control plane knows its
+  capacity.
+- The worker watches `sandbox-runtimes.json` and re-reports its runtimes
+  whenever atelet rewrites it (e.g. after a SandboxConfig gains a
+  version).
+
+## Capacity
+
+A worker reports its capacity once per process, in `RegisterWorker`, and the
+table below lists where each number comes from.
+
+| Dimension | Source |
 |---|---|
-| Idle | `assignment == nil` in the Redis worker record |
-| Assigned | `assignment` set to an `Assignment{actor_template, actor}` |
+| `cpu_millicores` | The worker container's CPU limit, projected through the downward API |
+| `memory_bytes` | The worker container's memory limit, likewise |
+| `actors` | The worker's actor limit, `--max-actors` (default 1000) |
 
-A given worker hosts **at most one actor at a time**. There's no multi-tenancy
-inside the sandbox.
+Without a container limit, the downward API projects the node's allocatable
+CPU or memory instead, so set `spec.template.resources` on the pool to split a
+node into several workers. The control plane tracks `allocated` as the sum of
+the resource limits of the actors assigned to the worker, and an actor whose
+template declares no limits costs only an actor slot. You can see the whole
+fleet with `kubectl ate get workers` and `kubectl ate top workers`.
 
-## The worker record
+## Sandbox runtimes
 
-Each worker's Redis record carries, among other fields:
+Alongside capacity, a worker advertises which sandbox runtimes it can run,
+meaning a default runtime for new and cold-booted actors plus restorable
+runtimes from the SandboxConfig's other enabled versions. Each runtime is a
+set of compatibility attributes that atelet computes (the architecture, a
+`sandbox_bundle_hash` over the version's assets, and the CPU features for
+gVisor or the CPU vendor and model for micro-VM). A worker that hasn't
+reported its runtimes takes no actors.
 
-- `assignment` - an **`Assignment{actor_template: KubeNamespacedObjectRef,
-  actor: ObjectRef}`**; `nil` means idle. This replaces the old flat
-  `actor_id` / `actor_namespace` / `actor_template` fields, and scopes the
-  binding by `(atespace, actor_name)`.
-- `sandbox_class` - the pool's class (`gvisor` or `microvm`), cached on the
-  worker so scheduling can match it against an actor's template class.
-- `node_name`, `labels` - the node the pod landed on and the pool's labels,
-  both cached for eligibility and node-local snapshot placement.
-- `ip`, `worker_pod_uid` - the pod IP and UID (the UID is the ateom socket
-  address).
+When a memory snapshot is taken, it's stamped with the runtime the actor ran
+under. A later memory restore needs a worker whose runtime matches, which
+means every attribute on the snapshot must be present with the same value,
+except `cpu_features`, where the snapshot's set must be a subset of the
+worker's.
 
-## How a worker is created
+## The Worker record
 
-You don't create workers directly. You create a `WorkerPool`:
+Workers live in the control-plane store (PostgreSQL) rather than in etcd, and
+each record carries these fields.
 
-```yaml
-apiVersion: ate.dev/v1alpha1
-kind: WorkerPool
-metadata: { name: default }
-spec:
-  replicas: 10
-  sandboxClass: gvisor        # or microvm
-  ateomImage: ghcr.io/.../ateom-gvisor:vX
-  # sandboxConfigName: ...    # else the cluster-default SandboxConfig for the class
-```
+- Identity (immutable): `worker_namespace`, `worker_pool`, `worker_pod`,
+  `worker_pod_uid`, `node_name`, `worker_spiffe_id`.
+- `labels`: the WorkerPool's labels, which template and actor selectors match
+  against.
+- `status.state`: `UNAVAILABLE`, `ACTIVE`, or `DRAINING`.
+- `status.capacity` / `status.allocated`: as above.
+- `status.sandbox_classes`: the class and runtimes the worker reported.
+- `status.ips`: the pod IPs, reported by the worker process.
+- Epochs (`issued_epoch`, `registered_epoch`, `observed_epoch`): which worker
+  process is current (see [Worker lifecycle](/flows/worker-lifecycle/)).
 
-`atecontroller` turns this into a Deployment named `<workerpool-name>`
-with `replicas` pods. As each pod gets a `PodIP`, ateapi inserts an idle worker
-record into Redis (stamping in the pool's `sandbox_class`, `node_name`, and
-`labels`). Registration is keyed on the pod having an IP, **not** on the Ready
-condition.
+The actors a worker hosts are `ActorAssignment` subresources of the Worker,
+one per hosted actor, each recording the resources it reserved. The
+actor side holds a matching `WorkerAssignment` with a denormalized copy of the
+worker's pod name, IPs, node, and the sandbox runtime the actor runs under.
 
-## How a worker is assigned
+## How an actor is placed
 
-When ResumeActor runs, ateapi's worker-assignment step:
+When ResumeActor runs, ate-api-server's scheduler picks from a watch-fed cache
+of workers. So which workers can it pick? A worker is eligible when it meets
+all of these conditions.
 
-1. Filters workers to those with **no assignment** that are **eligible** for
-   the actor - the worker's `sandbox_class` must equal the template's class,
-   and the worker must satisfy both the template's `workerSelector` and the
-   actor's own `worker_selector`.
-2. Honors node restrictions when the actor has node-local snapshots (a Pause
-   prefers the node its snapshot lives on).
-3. Picks one at random (shuffles the eligible set) to spread load.
-4. Sets the worker's `assignment` and stamps the worker's pool + IP back onto
-   the actor.
+1. It is `ACTIVE` and has registered its runtimes.
+2. If the actor resumes from a snapshot, the worker's sandbox class equals the
+   snapshot's. A snapshot's files are written and read by one class, at every
+   fidelity.
+3. If the resume restores memory, the worker can run the snapshot's runtime
+   (default or restorable).
+4. Its labels match the template's `workerSelector` and the actor's own
+   `worker_selector`.
+5. If the actor's latest snapshot is still local to a node, the worker is on
+   that node.
+
+Among eligible workers with room, the scheduler samples two at random and
+takes the less loaded one (the _power of two choices_), where load is the
+higher of actor-slot and CPU/memory utilization. The store re-checks
+eligibility and room under the worker's row lock when it binds, so two resumes
+can't both take the last slot.
+
+What if no worker that can run a memory snapshot's runtime has room? If the
+snapshot is durable in object storage, placement drops that requirement and
+the actor restores without memory state (its rootfs and volumes) on a worker
+of the same class. An actor with no snapshot boots on whichever class its
+selectors pick, and keeps that class from its first checkpoint on.
 
 ## How a worker is released
 
-After SuspendActor finishes the checkpoint and upload, ateapi clears the
-worker's `assignment` (and the actor's `worker_pool_name`). The worker is
-immediately eligible for the next actor.
-
-## What happens when a worker pod dies
-
-When a worker pod is deleted, ateapi's recovery path:
-
-1. If the worker had an `assignment`, that actor is **forced back to
-   SUSPENDED** (with whatever latest snapshot it already had).
-2. The worker record is deleted from Redis.
-
-This is a recovery path with a known race against concurrent SuspendActor
-calls.
+Suspend, delete, and crash each remove the actor's assignment, which returns
+its reserved resources to the worker. Other actors on the same worker are
+unaffected.
 
 ## Why two runtimes?
 
 `runsc` (gVisor) gives a small-footprint userspace kernel with first-class
-`checkpoint`/`restore` - the entire point of Substrate. The micro-VM class
-trades that footprint for a hardware-virtualized boundary (a real guest kernel
-behind KVM), suspending/resuming via cloud-hypervisor's snapshot/restore
-instead. A pool commits to one or the other.
+`checkpoint`/`restore`. The micro-VM class trades that footprint for a
+hardware-virtualized boundary (a real guest kernel behind KVM), suspending and
+resuming through cloud-hypervisor's snapshot/restore. A pool commits to one or
+the other.
 
 ## What's pre-warmed vs. lazy
 
-| Pre-warmed (idle pod has it) | Lazy (only on assignment) |
+| Pre-warmed (before any actor) | Lazy (on placement) |
 |---|---|
-| ateom running | Container image for the actor's workload |
-| Sandbox binaries cached on the node | OCI bundle built, actor network wired |
-| Pod scheduled, IP, pod network ready | Sandbox created + actor state restored |
-
-The first three are what makes resume sub-second despite the sandbox boundary.
+| Pod scheduled, IP and pod network ready | Actor network namespace(s) and atunnel listeners |
+| ateworker running and registered with capacity and runtimes | Container image layers, if not already cached on the node |
+| Default sandbox runtime cached on the node | Sandbox created, actor state restored |
 
 ## Related
 
-- [Worker lifecycle](/flows/worker-lifecycle/) - full state machine.
+- [Worker lifecycle](/flows/worker-lifecycle/) - states, epochs, and pod death.
 - [WorkerPool](/concepts/workerpool/) - the CRD that makes workers exist.
-- [ateom-gvisor](/components/ateom-gvisor/) · [ateom-microvm](/components/ateom-microvm/) -
-  the two runtimes that run inside.
-- [atelet](/components/atelet/) - who drives them externally.
+- [ateworker-gvisor](/components/ateworker-gvisor/) · [ateworker-microvm](/components/ateworker-microvm/) -
+  the two worker implementations.
+- [atelet](/components/atelet/) - drives the workers and relays their reports.

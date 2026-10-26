@@ -1,184 +1,220 @@
 ---
 title: Actor lifecycle
-description: The state machine every actor moves through - SUSPENDED, RESUMING, RUNNING, and the two hibernation paths (SUSPENDING/SUSPENDED and PAUSING/PAUSED) - plus the CRASHED terminal state and the transitions that aren't allowed.
+description: The state machine every actor moves through (SUSPENDED, RESUMING, RUNNING, SUSPENDING, plus CRASHED and the two recovery paths, REVERTING and DELETING) and what drives each transition.
 ---
 
-Every actor is in exactly one of **eight states** at any moment. State is
-stored in Redis at `actor:<atespace>:<name>` and changed only by ateapi's
-workflow engine under a per-actor lock.
-
-The actor status values are:
-`STATUS_UNSPECIFIED`, `STATUS_RESUMING`, `STATUS_RUNNING`, `STATUS_SUSPENDING`,
-`STATUS_SUSPENDED`, `STATUS_PAUSING`, `STATUS_PAUSED`, and `STATUS_CRASHED`.
-
-There are **two hibernation paths**. A [suspend](/flows/suspend-actor/) commits
-an *external* snapshot to object storage (GCS/S3) and fully frees the node; a
-**pause** keeps a *local* snapshot on the node VM so the following resume can be
-steered back onto that same node. Both free the worker; they differ only in
-where the snapshot lands.
+Every actor is in exactly one of seven states at any moment. That state is
+stored in the actor's row in ateapi's PostgreSQL store and changed by ateapi's
+workflows, each of which holds a per-actor lease while it runs. The
+`ActorState` values are `ACTOR_STATE_RESUMING`, `RUNNING`, `SUSPENDING`,
+`SUSPENDED`, `CRASHED`, `DELETING`, and `REVERTING` (plus the unused
+`UNSPECIFIED` zero value), and we can see in the diagram below how an actor
+moves between them.
 
 ## The states
 
 ```mermaid
 stateDiagram-v2
   [*] --> SUSPENDED: CreateActor
-  SUSPENDED --> RESUMING: ResumeActor<br/>(assign worker)
-  PAUSED --> RESUMING: ResumeActor<br/>(assign worker)
-  RESUMING --> RUNNING: Finalize → RUNNING
-  RUNNING --> SUSPENDING: SuspendActor<br/>(Mark SUSPENDING)
-  SUSPENDING --> SUSPENDED: Finalize → SUSPENDED<br/>(worker released)
-  RUNNING --> PAUSING: PauseActor<br/>(Mark PAUSING)
-  PAUSING --> PAUSED: Finalize → PAUSED<br/>(worker released)
-  SUSPENDED --> [*]: DeleteActor
-  CRASHED --> [*]: DeleteActor
+  SUSPENDED --> RESUMING: ResumeActor<br/>(worker assigned)
+  RESUMING --> RUNNING: Run / Restore done
+  RUNNING --> SUSPENDING: SuspendActor
+  SUSPENDING --> SUSPENDED: checkpoint done,<br/>worker released
 
-  RESUMING --> CRASHED: unrecoverable<br/>snapshot failure
-  SUSPENDING --> CRASHED: unrecoverable<br/>snapshot failure
-  PAUSING --> CRASHED: unrecoverable<br/>snapshot failure
+  RESUMING --> CRASHED: restore or boot failed
+  SUSPENDING --> CRASHED: checkpoint failed
+  RUNNING --> CRASHED: sandbox died,<br/>worker pod gone
+
+  RUNNING --> REVERTING: RevertActor
+  CRASHED --> REVERTING: RevertActor
+  SUSPENDED --> REVERTING: RevertActor<br/>(node-local snapshot)
+  REVERTING --> SUSPENDED: at durable snapshot
+
+  SUSPENDED --> DELETING: DeleteActor<br/>(any state)
+  DELETING --> [*]
 
   note right of RUNNING
-    Only state with an
-    assigned worker.
+    Has a worker assignment
+    and a live sandbox.
   end note
 
   note left of SUSPENDED
-    The "default" idle state.
-    Deletable. Has an external
-    latest_snapshot_info once
-    ever suspended.
+    The idle state. May still be
+    attached to a node that holds
+    its latest snapshot.
   end note
 ```
 
+`DeleteActor` is accepted from every state, but the diagram draws only the
+`SUSPENDED` edge to keep it readable.
+
 ## What each state means
 
-| State | Worker assigned? | Snapshot | Can be deleted? |
+| State | Worker assigned? | Snapshot activity | Typical exit |
 |---|---|---|---|
-| `SUSPENDED` | No | External (object storage), if ever suspended | **Yes** |
-| `PAUSED` | No | Local, on the node VM(s) in `LocalSnapshotInfo.node_vms_with_local_snapshots` | No |
-| `RESUMING` | Yes (just assigned) | Restoring from latest, else golden, else cold boot | No |
-| `RUNNING` | Yes | n/a (live) | No |
-| `SUSPENDING` | Yes (about to release) | External snapshot being written | No |
-| `PAUSING` | Yes (about to release) | Local snapshot being written | No |
-| `CRASHED` | No | Whatever it had | **Yes** |
-
-`SUSPENDED` is the state a freshly created actor starts in and the state it
-returns to after a suspend. `PAUSED` is a lighter-weight hibernation: the
-snapshot never leaves the node, so a resume that lands back on that node skips
-the download entirely. `CRASHED` is set when a snapshot operation fails
-unrecoverably (see below).
+| `SUSPENDED` | No (may be attached to a node) | Latest snapshot is node-local, durable, or both | `ResumeActor` |
+| `RESUMING` | Yes (just assigned) | Restoring the latest snapshot, or cold-booting if there is none | Finalize to `RUNNING` |
+| `RUNNING` | Yes | n/a (live) | `SuspendActor` |
+| `SUSPENDING` | Yes (about to release) | A new snapshot generation is being written | Finalize to `SUSPENDED` |
+| `CRASHED` | No | Keeps its snapshots, including any partial one | `RevertActor` or `DeleteActor` |
+| `REVERTING` | Being released | Discarding node-local and in-progress snapshots | Finalize to `SUSPENDED` |
+| `DELETING` | Being released | Collecting the actor's own snapshot prefix | Record removed |
 
 ## Allowed transitions
 
-| From | RPC | To |
+| From | RPC or event | To |
 |---|---|---|
 | `(none)` | `CreateActor` | `SUSPENDED` |
-| `SUSPENDED` / `PAUSED` | `ResumeActor` | `RESUMING` → `RUNNING` |
+| `SUSPENDED` | `ResumeActor` | `RESUMING` → `RUNNING` |
+| `RUNNING` | `ResumeActor` | unchanged; returns `resumed=false` |
 | `RUNNING` | `SuspendActor` | `SUSPENDING` → `SUSPENDED` |
-| `RUNNING` | `PauseActor` | `PAUSING` → `PAUSED` |
-| `SUSPENDED` / `CRASHED` | `DeleteActor` | gone |
+| `SUSPENDED` | `SuspendActor` | unchanged; returned as it is |
+| `RUNNING`, `CRASHED`, or `SUSPENDED` with a node-local latest snapshot | `RevertActor` | `REVERTING` → `SUSPENDED` |
+| any | `DeleteActor` | `DELETING` → gone |
+| `RESUMING` / `SUSPENDING` | an atelet failure the workflow cannot retry | `CRASHED` |
+| `RUNNING` | the worker reports its sandbox died | `CRASHED` |
+| `RUNNING` (or mid-operation) | the worker pod is deleted, or its worker process restarts | `CRASHED` |
 
-`DeleteActor` accepts an actor **only when it is `SUSPENDED` or `CRASHED`**; any
-other status is rejected with a precondition error. The store enforces this
-check on delete.
+Anything else is rejected with `FailedPrecondition`, e.g. `ResumeActor` on
+a `CRASHED` actor, or `RevertActor` on a `SUSPENDED` actor whose snapshot is
+already durable-only (it is already where a revert would take it).
 
-Some "no-op" transitions are idempotent rather than rejected. Suspending an
-already-suspended actor short-circuits inside the workflow and returns the actor
-unchanged (the suspend workflow treats `SUSPENDING`/`SUSPENDED` actors as
-already complete; the pause workflow does the same for `PAUSING`/`PAUSED`). The
-real serialization guarantee is the per-actor lock below.
+So what happens when a client retries in the middle of one of these
+transitions? Every workflow is re-entrant, and each step derives from the
+persisted record whether its work is already done, so a retry after a lost
+response or a failed ateapi replica fast-forwards to where the last attempt
+stopped. A `RESUMING` actor resumed again continues on the worker it was
+already assigned, and a `SUSPENDING` actor suspended again re-sends the same
+snapshot, which atelet answers without checkpointing twice.
 
 ## The CRASHED state
 
-When an atelet checkpoint or restore RPC fails in a way the workflow can't
-recover from, ateapi moves the actor to `STATUS_CRASHED` rather than leaving it
-wedged in a transient state:
+`CRASHED` means the actor lost its sandbox, or an operation on it failed in a
+way that cannot simply be retried. ateapi records a human-readable reason and
+time in `status.crash`, releases the actor's worker, and clears the
+assignment. The typical causes are listed below.
 
-- The suspend/pause workflows guard against calling atelet with no assigned
-  worker. If the actor was marked `SUSPENDING` / `PAUSING` but has no assigned
-  worker pod, the step crashes the actor and fails - there's nothing to
-  checkpoint.
-- When an atelet RPC returns an error signalling that the actor should be
-  crashed (for example, atelet failing to upload an external snapshot returns a
-  data-loss error), ateapi moves the actor to `CRASHED` and returns the
-  data-loss error to the caller.
+- atelet's `Run`, `Restore`, or `Checkpoint` returned a non-transient error,
+  including a `wakeupProbe` that never answered 200. (Transport errors,
+  `Unavailable`, and deadline errors are returned for a retry instead.)
+- The worker assigned to a `RESUMING` actor is gone, draining, no longer
+  hosts it, or no longer matches its placement constraints.
+- The node holding the actor's only copy of its latest snapshot no longer
+  exists.
+- The sandbox exited on its own while `RUNNING`, which the worker reports
+  through atelet (`ReportActorCrashed`).
+- The worker pod was deleted, or its worker process restarted and
+  re-registered with a new epoch, while the actor was bound to it.
 
-Crashing an actor also **releases its worker and clears the binding**, so a
-`CRASHED` actor no longer pins a worker and can be cleanly deleted. It keeps
-whatever `latest_snapshot_info` it had, is not auto-recovered, and its only exit
-is `DeleteActor`.
+Substrate does not recover a crashed actor automatically. The actor keeps
+its snapshot entries (including a partial one from a failed suspend, so the
+objects it names can still be cleaned up), and there are two ways out of
+`CRASHED`. `RevertActor` terminates anything still running for it, detaches
+volumes, discards node-local and in-progress snapshots, and returns it to
+`SUSPENDED` at its last completed durable snapshot, so the next resume
+restores from there. `DeleteActor` removes it entirely.
 
 ## Who writes each transition
 
 ```mermaid
 flowchart LR
   subgraph WF_Resume["ResumeActor workflow"]
-    R1[Load actor<br/>SUSPENDED / PAUSED ✓]
-    R2[Assign worker<br/>→ RESUMING]
-    R3[Restore via atelet]
-    R4[Finalize → RUNNING]
-    R1 --> R2 --> R3 --> R4
+    R1[Load actor + template<br/>RUNNING? return]
+    R2[Create pending volumes]
+    R3[Assign worker<br/>→ RESUMING]
+    R4[Attach volumes]
+    R5[atelet Run or Restore]
+    R6[Finalize → RUNNING]
+    R1 --> R2 --> R3 --> R4 --> R5 --> R6
   end
 
   subgraph WF_Suspend["SuspendActor workflow"]
-    S1[Load actor<br/>RUNNING ✓]
-    S2[Mark SUSPENDING<br/>→ SUSPENDING]
-    S3[Checkpoint via atelet<br/>external upload]
-    S4[Finalize → SUSPENDED]
-    S1 --> S2 --> S3 --> S4
+    S1[Load actor<br/>SUSPENDED? return]
+    S2[Mark SUSPENDING<br/>new snapshot generation]
+    S3[atelet Checkpoint]
+    S4[Detach volumes]
+    S5[Finalize → SUSPENDED<br/>release worker]
+    S1 --> S2 --> S3 --> S4 --> S5
   end
 
-  subgraph WF_Pause["PauseActor workflow"]
-    P1[Load actor<br/>RUNNING ✓]
-    P2[Mark PAUSING<br/>→ PAUSING]
-    P3[Checkpoint via atelet (local)<br/>keep local]
-    P4[Finalize → PAUSED]
-    P1 --> P2 --> P3 --> P4
+  subgraph WF_Revert["RevertActor workflow"]
+    V1[Mark REVERTING]
+    V2[atelet Terminate,<br/>detach, release]
+    V3[Discard pending snapshots]
+    V4[Finalize → SUSPENDED]
+    V1 --> V2 --> V3 --> V4
+  end
+
+  subgraph WF_Delete["DeleteActor workflow"]
+    D1[Mark DELETING]
+    D2[atelet Terminate,<br/>detach, release]
+    D3[Delete volumes +<br/>actor's snapshot prefix]
+    D4[Remove record]
+    D1 --> D2 --> D3 --> D4
   end
 ```
 
-The suspend and pause workflows are near-identical four-step machines; the only
-differences are the checkpoint type they hand atelet (external upload vs.
-node-local), the snapshot scope they pass (`onCommit` vs. `onPause`), and the
-`SnapshotInfo` variant they write back (external vs. local).
+As the diagram above shows, each RPC runs its own workflow inside ateapi.
+`DeleteActor` is best-effort across its cleanup steps, so if any of them
+fails, the record stays in `DELETING` and a retried delete picks up where it
+left off.
 
-## The lock that protects all of this
+## How are concurrent operations kept apart?
 
-Every transition runs inside a workflow that holds `lock:actor:<atespace>:<name>`
-in Redis with a 30-second TTL. The workflow itself times out at 28 seconds (TTL
-minus 2s of padding before the lock expires). Two concurrent calls for the same
-actor cannot both succeed - the second gets `Aborted`.
+Every resume, suspend, revert, delete, and update (and every tag created from
+an actor) runs under a PostgreSQL lease named
+`lease:actor:<atespace>:<name>`. The lease has a 30-second TTL and is renewed
+in the background for as long as the workflow runs, and if renewal fails, the
+workflow's context is canceled. A second operation on the same actor gets
+`Aborted` ("another operation is in progress for this actor").
 
-This is what prevents nasty races like "resume + suspend at the same time" or
-"delete while a worker is still assigned."
+On top of the lease, every write carries a version precondition, so a write
+based on a stale read fails rather than overwriting. Together they prevent
+races like "resume + suspend at the same time" or "delete while a sandbox is
+still live." The node side has its own guard too, since atelet and the
+worker processes serialize the operations they run for each actor UID with
+an in-process lock.
 
-## What can move an actor *without* an RPC?
+## What can move an actor without a client RPC?
 
-One path: **the worker pod dies**. The worker-pool syncer's pod-delete (and
-soft-delete) handler finds the actor via the worker's `Assignment` and forces it
-back to `SUSPENDED` - even mid-`RUNNING` - unless the actor is already
-`CRASHED`, in which case it is left alone. It also clears the actor's
-`ateom_pod_namespace`/`ateom_pod_name`/`ateom_pod_ip` pointers,
-`in_progress_snapshot`, and `worker_pool_name` (the `ateom_pod_uid` is left set -
-only a crash clears it). The
-actor's `latest_snapshot_info` is left untouched (whatever it was before, or
-empty for never-run actors).
+- When the worker reports a dead sandbox, atelet forwards the worker's
+  `ReportActorCrashed`, and a `RUNNING` actor goes to `CRASHED`. An actor in
+  the middle of another operation is left to that operation, which fails on
+  its own.
+- When a worker pod enters `Terminating`, the worker-pool syncer marks the
+  Worker `DRAINING` so nothing new is placed on it, and the worker propagates
+  `SIGTERM` into its sandboxes. Once the pod is gone, ateapi deregisters the
+  Worker. Actors already `SUSPENDED` are left alone, actors still bound to it
+  go to `CRASHED`, and atelet is asked, best-effort, to reclaim their on-node
+  state.
+- When atelet finishes a background upload or detach after an asynchronous
+  suspend, it reports through `ReportActorSnapshotState` that the snapshot
+  reached object storage or that it deleted the node-local copy. ateapi
+  records the first as the snapshot's durable copy becoming `COMPLETED`, and
+  the second by clearing the snapshot's node and the actor's `assignedNode`.
+  Neither changes the actor's state.
 
-This is a best-effort recovery path, not a normal transition, and it is known to
-race with concurrent `SuspendActor`/`PauseActor` calls (optimistic-version
-checking means whichever writes first wins).
+## Lifecycle events
 
-## Where state actually lives
+Each committed state change emits an `ate.actor.state_changed` event (an OTLP
+log event, or a stdout record), and every crash an `ate.actor.crashed` event.
+The last record for an actor's UID is the state it is in now. Actor identity
+is barred from metric labels, so these events are how a transition is
+attributed to one actor.
 
-Just one place: Redis. The key is `actor:<atespace>:<name>` and the value is the
-serialized `Actor` proto. Every other component (atelet, atecontroller, atenet)
-reads it via ateapi RPCs - they never touch Redis directly.
+## Where does state actually live?
+
+All of it lives in ateapi's PostgreSQL store, which holds the serialized
+`Actor` message. Every other component (atelet, atecontroller, and the atenet
+router) reads it through ateapi RPCs and never touches the database
+directly.
 
 ## Related
 
 - [Create actor](/flows/create-actor/) · [Resume actor](/flows/resume-actor/) ·
   [Suspend actor](/flows/suspend-actor/)
-- [Worker lifecycle](/flows/worker-lifecycle/) - the dual state machine
+- [Worker lifecycle](/flows/worker-lifecycle/) - the matching state machine
   on the worker side.
-- [Snapshot](/concepts/snapshot/) - external vs. local snapshots.
+- [Snapshot](/concepts/snapshot/) - generations, local vs. durable copies.
 - [ateapi internals](/components/ateapi/) - the workflow engine that drives
   every transition.

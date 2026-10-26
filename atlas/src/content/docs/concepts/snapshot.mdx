@@ -1,112 +1,180 @@
 ---
 title: Snapshot
-description: A frozen point-in-time image of an actor's state that lets it be restored on any worker. Kept on the node VM when paused, or uploaded to GCS/S3 when suspended.
+description: A point-in-time capture of an actor's state (volumes, root filesystem changes, and optionally process memory), kept on the node that took it and uploaded to object storage, so the actor can be restored on any compatible worker.
 ---
 
-A **snapshot** is what makes Substrate actors portable. It's a persisted
-representation of an actor's state at the moment it was checkpointed, so the
-actor can later be restored onto a (potentially different) worker instead of
-cold-booting. The exact bytes depend on the sandbox runtime, but the actor
-record refers to a snapshot through one uniform message: `SnapshotInfo`.
+A _snapshot_ is what makes a Substrate actor portable. It's a
+persisted capture of an actor's state at the moment it was checkpointed, so
+the actor can later be restored onto a (potentially different) worker instead
+of cold-booting. The bytes depend on the sandbox runtime, but the actor record
+refers to every snapshot through the same `Snapshot` message.
 
-## SnapshotInfo: external or local
+## Snapshot generations
 
-`SnapshotInfo` is a `oneof data` with two
-variants - a snapshot is either uploaded to object storage or kept on the node:
+Each suspend mints a new _generation_. The actor's `status.snapshots` holds
+its active and in-progress generations (at most a handful), and
+`status.lastAssignedGeneration` only ever counts up. The table below lists
+the fields each generation carries.
 
-| Variant | Message | Where it lives | Set by |
-|---|---|---|---|
-| **External** | `ExternalSnapshotInfo{ snapshot_uri_prefix }` | Object storage (GCS/S3) at a URI prefix | `SuspendActor` |
-| **Local** | `LocalSnapshotInfo{ snapshot_prefix, node_vms_with_local_snapshots[] }` | On the worker node VM(s) listed in `node_vms_with_local_snapshots` | `PauseActor` |
+| Field | Meaning |
+|---|---|
+| `uuid` | Server-generated name, used for the local checkpoint directory and the object-storage path |
+| `generation` | Monotonic counter, starting at 1 |
+| `owner` | `ACTOR` (taken from this actor) or `TAG` (borrowed from a [tag](#tags)) |
+| `fidelity` | What it holds: `VOLUMES`, `ROOTFS`, or `MEMORY` |
+| `actorTemplateUid` | The template whose sandbox the state was captured under |
+| `locality` | The node that holds the snapshot's files, while it does |
+| `durableSnapshot` | The object-storage copy: a URI and a status, `PENDING` or `COMPLETED` |
+| `sandboxRuntime` | The sandbox class and runtime version that took it |
 
-An actor's `latest_snapshot_info` field carries whichever of these was most
-recently produced. (There is no longer a `SnapshotType` enum or a
-`last_snapshot` string - those are gone.)
+When we resume an actor, the resume restores the newest generation that is
+usable, meaning one that is still on a node or whose durable copy is
+`COMPLETED`.
 
-:::note[Pause vs. Suspend]
-A **Pause** keeps a snapshot **local** to the node VM so the following Resume
-can be steered back onto the same node (fast, no upload). A **Suspend** commits
-an **external** snapshot to object storage, freeing the node entirely. See
-[Actor](/concepts/actor/) for the `PAUSED`/`SUSPENDED` lifecycle states.
+## Two copies: node-local and durable
+
+A snapshot can exist in two places at once, and most of the suspend and
+resume behavior follows from which copy is where.
+
+| Copy | Where | Recorded as |
+|---|---|---|
+| **Node-local** | On the node that took it, under atelet's `/var/lib/ate` directory | `locality = <node>`, and the actor's `assignedNode` |
+| **Durable** | In object storage (GCS or S3) | `durableSnapshot.status = COMPLETED` |
+
+So when does each copy show up, and when does the local one go away?
+
+- With an asynchronous suspend (the default), the checkpoint lands on the
+  node and `SuspendActor` returns with the durable copy `PENDING`. atelet
+  uploads it in the background (`--snapshot-upload-delay`, 5 minutes by
+  default) and reports it, which marks it `COMPLETED`. The actor stays
+  attached to that node, so its next resume restores in place with no
+  download.
+- With a synchronous suspend (`DURABILITY_MODE_SYNCHRONOUS`,
+  `kubectl ate suspend actor --mode=sync`), atelet uploads before
+  `SuspendActor` returns, so the durable copy is already `COMPLETED`, and
+  then tries to keep a local copy as well.
+- On detach, which happens after `--snapshot-detach-delay` (30 minutes by
+  default) or during a resume when the attached node has no room, atelet
+  uploads the snapshot if it still needs to and deletes the local files. The
+  snapshot's `locality` and the actor's `assignedNode` are cleared, and the
+  actor can resume on any eligible node.
+
+A node-local copy is only trusted on the boot that wrote it, so after a node
+reboot, atelet ignores it and falls back to the durable copy.
+
+:::note[Why keep a local copy at all?]
+An agent that is suspended and resumed again within minutes (the common
+pattern for a conversational agent) never pays for an upload and a download
+on its critical path. The durable copy is still made, just off that path.
 :::
 
-## Snapshot scope: what goes in
+## Fidelity: what a snapshot holds
 
-Independently of *where* a snapshot lands, the `ActorTemplate`'s
-`snapshotsConfig` decides *what* it contains, via the **`SnapshotScope`** enum:
+The template's `snapshotConfig.preferredFidelity` sets the ceiling for what a
+snapshot captures, and each level in the table below includes the ones above
+it.
 
-| Scope | Contents | On resume |
+| Fidelity | Contents | On resume |
 |---|---|---|
-| **`Full`** | Process memory plus the filesystem delta on top of the OCI image (which includes any attached [DurableDir](/concepts/actortemplate/) volumes, since they live inside rootfs) | Restores hot from the memory image |
-| **`Data`** | Only the contents of snapshot-supporting volumes (currently `DurableDir`); process memory and the rest of rootfs are discarded | Cold-boots from the OCI image with `DurableDir` contents restored |
+| **`VOLUMES`** | Durable volumes (`durableDir`) only | Cold-boots the containers from the OCI image with the volumes restored |
+| **`ROOTFS`** | Volumes plus root filesystem changes since boot | Cold-boots with the rootfs writes back in place |
+| **`MEMORY`** (default) | Volumes, rootfs changes, and process memory | Resumes where it left off |
 
-Scope is chosen per trigger in `SnapshotsConfig`:
+The ceiling is best-effort, and the system may package less when a layer
+cannot be captured. A restore can also use less than the snapshot holds, which
+happens in the two cases below.
 
-- **`onPause`** (default `Full`) - what a Pause captures and keeps on the node.
-- **`onCommit`** (default `Full`) - what a Suspend captures and uploads.
-
-`onCommit` must be a **subset** of `onPause` (enforced by a CEL validation rule
-on the CRD): if `onPause` is `Full`, `onCommit` may be `Full` or `Data`; if
-`onPause` is `Data`, `onCommit` must be `Data`.
+- after the actor was repointed at a different template, only the volumes are
+  restored;
+- if no eligible worker still offers the sandbox runtime that took a memory
+  snapshot, the restore drops to `ROOTFS` rather than fail.
 
 ## What's on disk
 
-atelet drives whichever sandbox runtime a pool uses over the same
-`Checkpoint`/`Restore` gRPC, and treats the checkpoint contents as **opaque** -
-it ships exactly the files the runtime wrote, each **zstd-compressed** (regular
-files use a sparse-extent zstd format that skips holes; magic `ATESPRSE`), plus
-a `manifest.json` it writes beside them to pin the sandbox binary versions and
-file list.
+atelet drives each sandbox runtime over the same `Checkpoint`/`Restore` gRPC
+and treats the files the runtime writes as opaque. What ends up in those files
+depends on the runtime.
 
-- **gVisor** (`ateom-gvisor`, `runsc checkpoint`/`restore`): a `checkpoint.img`
-  holding memory, sentry state, and filesystem deltas, plus any pages images
-  `runsc` emits. ateom reports exactly the files `runsc` wrote rather than a
-  hardcoded list, so resume can stream RAM pages in lazily instead of reading
-  the whole image up front.
-- **micro-VM** (`ateom-microvm`, cloud-hypervisor): a `config.json`, a
-  `state.json`, and a sparse `memory-ranges` file - the guest's writable rootfs
-  upper lives in guest RAM, so process memory *and* rootfs writes are both
-  captured by the memory snapshot.
+- With gVisor (`ateworker-gvisor`), a `MEMORY` snapshot is a
+  `runsc checkpoint` of the sandbox plus separate filesystem bundles for the
+  root filesystem and the durable volumes. `ROOTFS` and `VOLUMES` snapshots
+  save only the bundles they need, without memory.
+- With a micro-VM (`ateworker-microvm`, Cloud Hypervisor), the VM is paused,
+  a `MEMORY` snapshot takes a VM memory snapshot, and the durable volumes and
+  the rootfs upper layer are each shipped as a tar.
 
-Snapshots are **not portable across sandbox classes** - a gVisor snapshot can
-only be restored into a gVisor worker, and likewise for micro-VM.
+Next to the files, atelet writes a `manifest.json` that records the sandbox
+class, the sandbox runtime assets, the actor's identity, the file lists, and
+the fidelity. In object storage each file is stored zstd-compressed (sparse
+files in a format that skips holes), and the manifest is written last as the
+commit marker, so a snapshot without a manifest is incomplete.
 
-## Where snapshots are produced and consumed
+A worker that is asked to checkpoint an actor it already checkpointed (e.g. a
+retried suspend after a lost response) reuses the completed checkpoint
+instead of taking another, and clears any partial files left by an
+interrupted one. atelet commits a local checkpoint by staging the files and
+moving the staged directory into place with one rename.
 
-atelet is the only component on a node that touches object storage. On
-checkpoint it collects the files ateom wrote and either leaves them on the node
-(Pause) or uploads them zstd-compressed to the external prefix (Suspend). On
-restore it downloads/decompresses (or reads the local copy) onto the worker,
-then has ateom restore against them. See the [suspend flow](/flows/suspend-actor/)
-and [resume flow](/flows/resume-actor/).
+Snapshots are not portable across sandbox classes, so a gVisor snapshot only
+restores into a gVisor worker (and likewise for micro-VM), and the scheduler
+enforces this.
 
-## Golden vs. latest snapshot
+## Who touches object storage
 
-| Kind | Stored where | When created |
-|---|---|---|
-| **Golden Snapshot** | On the `ActorTemplate` status | Once, when the template is created, from a throwaway "golden" boot (see the [bootstrap flow](/flows/golden-snapshot/)) |
-| **Last / latest snapshot** | On the Actor record (`latest_snapshot_info`) | Every time `SuspendActor` (or `PauseActor`) finishes for that specific actor |
+Neither atelet nor ateapi talks to object storage for snapshots directly.
+Each runs an object-store plugin sidecar (`cmd/objectstore-plugin`, backed by
+GCS or S3) and calls it over a Unix socket, and the two plugins do different
+jobs.
 
-The resume workflow prefers the actor's latest snapshot if one exists;
-otherwise it falls back to the template's golden snapshot; otherwise it cold
-boots. (`ResumeActor` with `boot=true` skips the golden snapshot and cold
-boots deliberately.)
+- atelet's plugin uploads and downloads a snapshot's files, authenticated per
+  transfer with a credential scoped to the actor;
+- ateapi's plugin copies whole snapshots (for tags) and deletes them.
 
-## How external snapshots are addressed
+## How durable snapshots are addressed
 
-By URI prefix. The prefix comes from `ActorTemplate.spec.snapshotsConfig.location`
-(e.g. `gs://my-bucket/some/prefix`); ateapi appends a per-snapshot segment. The
-actor record stores just this prefix in `ExternalSnapshotInfo.snapshot_uri_prefix`;
-atelet appends the individual file names (each with a `.zstd` suffix) plus
-`manifest.json` when reading or writing.
+Durable snapshots are addressed by URI prefix under a storage location,
+which is ate-api-server's `--snapshot-location`, or the template's
+`snapshotConfig.storageLocation` when the `PerTemplateSnapshotLocation`
+preview gate is on. Every object sits under its owner's prefix, as the
+layout below shows.
 
-## Why zstd, not gzip?
+```
+<location>/atespaces/<atespace>/actors/<actor-uid>/snapshots/<uuid>   an actor's snapshot
+<location>/atespaces/<atespace>/tags/<tag-uid>                        a tag's only snapshot
+```
 
-Better ratio at comparable speed, and decompression is fast - important
-because decompress happens on the critical path of resume.
+Who owns a snapshot decides when it gets cleaned up. A synchronous suspend
+releases the durable snapshot it replaced, while an asynchronous one keeps the
+previous one until a newer one is durable, and `DeleteActor` deletes the
+actor's whole prefix. A borrowed snapshot lives under its tag's prefix, so an
+actor never collects it.
+
+## Tags
+
+What if we want many actors to start from the same snapshot? That's what a
+_tag_ is for. A tag is an atespace-owned, stable name for its own copy of one
+durable snapshot. `CreateTag` (`kubectl ate create tag`) takes the snapshot a
+`SUSPENDED` actor holds (waiting for its upload first if it is still pending)
+and copies it under the tag's prefix, so suspending or deleting the actor
+afterwards cannot collect it.
+
+- Scope `ATESPACE` lets the tag seed actors in its own atespace; `PUBLISHED`
+  lets actors in any atespace use it, still addressed as
+  `<atespace>/<tag>`.
+- A tag only seeds actors of the template it was taken under.
+- `CreateActor` with a tag borrows the snapshot rather than copying it, and
+  the actor's first suspend moves it onto its own.
+- `DeleteTag` deletes the copy. Actors still borrowing it can no longer
+  resume, and an atespace that holds tags cannot be deleted.
+
+The template's golden snapshot is a tag too (see
+[Golden snapshot bootstrap](/flows/golden-snapshot/)). Because a tag's
+snapshot is shared by many actors, atelet keeps it in a node-local snapshot
+cache after the first download on that node.
 
 ## Related
 
 - [Suspend actor](/flows/suspend-actor/) · [Resume actor](/flows/resume-actor/)
 - [Golden snapshot bootstrap](/flows/golden-snapshot/)
-- [Storage](/components/storage/) - the GCS/S3 layer.
+- [ActorTemplate](/concepts/actortemplate/) - `snapshotConfig`.
+- [Storage](/components/storage/) - the object-storage layer.

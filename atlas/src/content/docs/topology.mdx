@@ -3,155 +3,202 @@ title: System topology
 description: Every binary, every port, every connection. The static architecture map.
 ---
 
-Substrate is a **control plane / data plane** split that runs on Kubernetes but
-deliberately **routes around the K8s scheduler** for the hot path. Actor
-assignment to pre-warmed worker pods happens in `ateapi` in milliseconds, not in
-`kube-scheduler` in seconds.
+Substrate runs on Kubernetes, but it deliberately keeps the Kubernetes scheduler
+out of the hot path. Kubernetes schedules worker pods ahead of time, and when an
+actor needs to run, `ate-api-server` assigns it to one of those pods in
+milliseconds (rather than waiting on `kube-scheduler` to place a new pod, which
+takes seconds). That split between a control plane that decides and a data plane
+that already has capacity waiting is the thing to keep in mind as we walk through
+the rest of this page.
 
 ## In three pictures
 
-The whole-picture hero on the [Overview](/) is the elevator pitch. This page
-zooms in on the three regions that matter most - what's *in* each plane,
-and how a request actually flows.
+The hero diagram on the [Overview](/) is the whole system on one whiteboard. Here
+we zoom in on the three regions that matter most, what's inside each plane, and
+how a request actually reaches an actor. Let's start with the control plane,
+since that's where our decisions about actors get made.
 
 ### 1 · Control plane
 
 ```mermaid
 flowchart LR
   KAPI[(K8s API)]
-  ATECTRL["atecontroller<br/>(Deployment)<br/>CRD reconciler"]
-  ATEAPI["ateapi<br/>(Deployment)<br/>gRPC :443"]
-  REDIS[("Redis / Valkey<br/>actors · workers · locks · atespaces")]
+  ATECTRL["ate-controller<br/>(Deployment)<br/>WorkerPools · worker syncer"]
+  ATEAPI["ate-api-server<br/>(Deployment)<br/>gRPC :443"]
+  PG[("PostgreSQL<br/>atespaces · templates · actors<br/>workers · tags · leases")]
+  OBJ[("Object storage<br/>GCS / S3")]
 
-  ATECTRL -- "reconciles<br/>ActorTemplate · WorkerPool" --> KAPI
-  ATEAPI -- "watches worker pods" --> KAPI
-  ATEAPI <--> REDIS
+  ATECTRL -- "reconciles WorkerPool<br/>→ worker Deployments" --> KAPI
+  ATECTRL -- "creates and retires<br/>worker records" --> ATEAPI
+  ATEAPI <--> PG
+  ATEAPI -. "objectstore-plugin<br/>sidecar" .-> OBJ
 
   click ATEAPI "/components/ateapi/" "ateapi"
   click ATECTRL "/components/atecontroller/" "atecontroller"
-  click REDIS "/components/storage/" "Storage"
+  click PG "/components/storage/" "Storage"
+  click OBJ "/components/storage/" "Storage"
 ```
 
-Stateless workloads, declarative inputs. `atecontroller` owns the CRDs;
-`ateapi` is the operational brain backed by Redis.
+Kubernetes only holds the capacity side of the system. `WorkerPool`,
+`SandboxConfig`, and `CSIDriverConfig` are the CRDs, and that's it. Everything
+about the actors themselves (atespaces, ActorTemplates, actors, tags, worker
+records, etc) lives in PostgreSQL behind `ate-api-server`, which also runs the
+golden-snapshot reconciler. As the diagram above shows, `ate-controller` turns
+WorkerPools into worker Deployments and keeps a worker record in step with every
+worker pod, so the API server always knows what capacity it can hand out.
 
 ### 2 · Data plane (one worker node)
 
 ```mermaid
 flowchart LR
-  ATELET["atelet<br/>(DaemonSet)<br/>gRPC :8085"]
+  ATEAPI["ate-api-server"]
 
-  subgraph WPOD["Worker pod (gVisor pool shown)"]
-    direction TB
-    ATEOM["ateom-gvisor<br/>gRPC over Unix socket"]
-    RUNSC[["runsc<br/>(gVisor runtime)"]]
-    WL[["Actor workload"]]
-    ATEOM -- exec --> RUNSC
-    RUNSC -- manages --> WL
+  subgraph NODE["Worker node"]
+    direction LR
+    ATELET["atelet<br/>(DaemonSet)<br/>mTLS gRPC :21998"]
+    PLUG["objectstore-plugin<br/>(atelet sidecar)"]
+
+    subgraph WPOD["Worker pod (gVisor pool shown)"]
+      direction TB
+      WORKER["ateworker-gvisor<br/>gRPC on worker.sock"]
+      TUN["atunnel<br/>:8443 CONNECT · actor egress"]
+      SB1[["Actor sandbox"]]
+      SB2[["Actor sandbox"]]
+      WORKER -- "runsc" --> SB1
+      WORKER -- "runsc" --> SB2
+    end
   end
 
-  GCS[("GCS / S3<br/>snapshots (zstd)")]
+  OBJ[("GCS / S3<br/>snapshots")]
 
-  ATELET -- "Run · Checkpoint · Restore" --> ATEOM
-  ATELET <-- "upload / download" --> GCS
+  ATEAPI -- "Run · Checkpoint · Restore" --> ATELET
+  ATELET -- "worker.sock" --> WORKER
+  WORKER -- "register · crash reports<br/>(WorkerSupport)" --> ATELET
+  ATELET --> PLUG
+  PLUG <-- "upload / download" --> OBJ
 
   click ATELET "/components/atelet/" "atelet"
-  click ATEOM "/components/ateom-gvisor/" "ateom-gvisor"
+  click WORKER "/components/ateworker-gvisor/" "ateworker-gvisor"
   click WPOD "/components/workers/" "Workers"
-  click GCS "/components/storage/" "Storage"
+  click OBJ "/components/storage/" "Storage"
 ```
 
-Every node runs one `atelet` DaemonSet pod and many worker pods. atelet is
-the single component on the node that touches object storage.
+Now let's look at a single worker node, which is where those decisions turn into
+running sandboxes. Every node runs one `atelet` and some number of worker pods. A worker pod hosts
+many actors (as many as its capacity allows), and each actor gets its own
+sandbox, cgroup, and network namespaces. You'll notice in the diagram that atelet
+never talks to object storage directly. It holds no storage credentials, so
+snapshot bytes move through its `objectstore-plugin` sidecar instead.
 
-There are **two sandbox runtimes**, chosen per-pool by a `SandboxClass`:
-`gvisor` (shown above - `ateom-gvisor` shelling out to `runsc`) and `microvm`
-(`ateom-microvm`, a kata + cloud-hypervisor micro-VM needing `/dev/kvm`).
+There are two sandbox runtimes, and a pool picks one through its
+`sandboxClasses` entry and the [SandboxConfig](/concepts/sandboxconfig/) that
+entry names. The `gvisor` class runs `ateworker-gvisor`, which drives `runsc`,
+and the `microvm` class runs `ateworker-microvm`, which drives a Cloud Hypervisor
+micro-VM and needs `/dev/kvm` on the node.
 
-A **WorkerPool is single-class**: its `spec.sandboxClass` is one value, so every
-worker pod in the pool runs that one runtime. And a gVisor checkpoint (a `runsc`
-image) is a completely different format from a micro-VM snapshot (a
-cloud-hypervisor memory image) - **you can't restore one on the other**. So the
-scheduler treats sandbox class as a **hard gate**: an actor whose ActorTemplate
-is `gvisor` is only ever placed on `gvisor` workers, and its snapshots only move
-between workers of that same class. An actor is effectively pinned to one runtime
-family for life. (See [ActorTemplate](/concepts/actortemplate/) and
-[SandboxConfig](/concepts/sandboxconfig/) for how class is declared and resolved.)
+So can an actor move between the two? Once it has a snapshot it can't, because a
+WorkerPool is single-class and a gVisor checkpoint is a completely different
+format from a micro-VM snapshot (we can't restore one on the other). From then
+on, placement treats the actor's sandbox class as a hard gate, and a memory
+restore also needs a matching runtime. An actor that has never run boots on whatever
+class its template's `workerSelector` picks (see
+[ActorTemplate](/concepts/actortemplate/) and [Workers](/components/workers/)).
 
 Whichever runtime a pool uses, atelet drives it over the same
-`Run · Checkpoint · Restore` gRPC on a Unix socket. See
-[ateom-gvisor](/components/ateom-gvisor/); the micro-VM sibling
-`ateom-microvm` gets its own deep-dive in the Components section.
+`RunWorkload` / `CheckpointWorkload` / `RestoreWorkload` gRPC on a Unix socket.
+We cover each runtime on its own page, see
+[ateworker-gvisor](/components/ateworker-gvisor/) and
+[ateworker-microvm](/components/ateworker-microvm/).
 
 ### 3 · Request flow
 
 ```mermaid
 flowchart LR
-  Client([External client])
-  DNS["atenet DNS<br/>(CoreDNS Corefile mgr)"]
-  ROUTER["atenet router<br/>L7 proxy :8080/:8443<br/>ExtProc :50051"]
-  ATEAPI["ateapi"]
-  WORKLOAD[["Worker workload"]]
+  Client([Client])
+  ROUTER["atenet-router<br/>AgentGateway (preferred)<br/>or Envoy (default)"]
+  ATEAPI["ate-api-server"]
+  TUN["atunnel<br/>in the worker pod"]
+  ACTOR[["Actor"]]
 
-  Client -- "1. resolve name.atespace.actors…ate.dev" --> DNS
-  DNS -- "2. router ClusterIP" --> Client
-  Client -- "3. HTTP request" --> ROUTER
-  ROUTER -- "4. ResumeActor (per request)" --> ATEAPI
-  ATEAPI -- "5. Actor{pod IP}" --> ROUTER
-  ROUTER -- "6. rewritten :authority → worker pod" --> WORKLOAD
+  Client -- "1. HTTP request<br/>ate-target-actor: atespace/actor" --> ROUTER
+  ROUTER -- "2. ResumeActor" --> ATEAPI
+  ATEAPI -- "3. worker + IP<br/>(restores if suspended)" --> ROUTER
+  ROUTER -- "4. mTLS CONNECT :8443" --> TUN
+  TUN -- "5. actor :80" --> ACTOR
 
-  click DNS "/components/atenet/" "atenet DNS"
-  click ROUTER "/components/atenet/" "atenet router"
+  click ROUTER "/components/atenet/" "atenet"
   click ATEAPI "/components/ateapi/" "ateapi"
-  click WORKLOAD "/components/workers/" "Workers"
+  click TUN "/components/workers/" "Workers"
+  click ACTOR "/concepts/actor/" "Actor"
 ```
 
-The thing that lets Substrate scale: routing is **resolved at the request
-moment**, not pre-baked. No worker-IP DNS records, no sidecars, no
-scheduler involvement. For the full sequence (including the cold-restore
-case), see [Resume actor](/flows/resume-actor/).
+Finally, let's follow a request in from a client. How does it find an actor that
+may not even be running? The router
+resolves it at the moment the request arrives. The client names the actor in the
+`ate-target-actor` header, and there are no per-actor DNS records, no sidecars in
+the actor, and no scheduler involved. The router asks `ate-api-server` where the
+actor lives (which resumes it if it's suspended) and then tunnels the request to
+`atunnel` in that worker pod. AgentGateway caches the assignment for a few
+seconds and parks requests while an actor resumes. Envoy, which is the install
+default, asks `ate-api-server` on every request. We walk through the full
+sequence in [Request path](/flows/request-path/) and
+[Resume actor](/flows/resume-actor/).
+
+Outbound traffic takes the mirror-image path. The actor dials a destination, its
+connection gets redirected to `atunnel`, and `atunnel` opens an mTLS CONNECT to
+the egress gateway (`atenet-egress`), presenting a `worker-for-actor`
+certificate for that actor. The [atenet](/components/atenet/) page covers the
+egress side in detail.
 
 ## What each component is for
 
 | Component | Kind | Role |
 |---|---|---|
-| **ateapi** | Deployment | Source of truth for actor & worker state. Serves `Control` and `SessionIdentity` gRPC services. Owns the suspend/resume workflows. |
-| **atecontroller** | Deployment | Watches the K8s API. Reconciles `WorkerPool` (→ Deployments of worker pods) and `ActorTemplate` (→ golden snapshot bootstrap). |
-| **atenet** | Deployments (one binary, two subcommands) | `atenet router` runs an L7 proxy + ExtProc and does the per-request dance to find the right worker. `atenet dns` programs CoreDNS so `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` resolves. Each subcommand is typically deployed as its own Deployment. |
-| **atelet** | DaemonSet | Lives on each worker node. Receives gRPC calls from ateapi. Pulls images, manages OCI bundles, talks to `ateom` over a Unix socket, ships snapshots to GCS/S3. |
-| **ateom** | In-pod helper | Lives inside every worker pod. Tiny gRPC server on a Unix socket that drives the sandbox runtime. Two implementations: `ateom-gvisor` (shells out to `runsc`) and `ateom-microvm` (kata + cloud-hypervisor). |
-| **Worker pods** | Deployment-spawned (from `WorkerPool`) | Pre-warmed gVisor **or** micro-VM sandboxes (one class per pool). Each can host one actor at a time; the sandbox (with its pause process) is created on assignment, not at pod start. |
-| **Redis / Valkey** | StatefulSet | Holds actor records, worker records, and the per-actor distributed locks that serialize workflows. |
-| **GCS / S3** | External | Holds the checkpoint images (RAM + sentry state + lazy-load pages), zstd-compressed. |
-| **podcertcontroller** | Deployment | Polyfill for the upstream K8s Pod Certificate signers feature. Not on the hot path. |
+| **ate-api-server** | Deployment | Source of truth for atespaces, templates, actors, tags, and workers. Serves the public `Control` API and the node-only `WorkerService`. Runs the suspend, resume, revert, and delete workflows and the golden-snapshot reconciler. |
+| **PostgreSQL** | StatefulSet (bundled) or external | Holds every record, plus the leases that serialize per-actor workflows. Bundled by default; bring-your-own and Cloud SQL are supported. |
+| **ate-controller** | Deployment | Reconciles `WorkerPool` into worker Deployments, resolves and protects `SandboxConfig`s, and runs the worker syncer that creates and retires worker records. |
+| **ate-idp-server** | Deployment | Publishes OIDC discovery and the JWKS for actor JWTs, so outside services can verify them. |
+| **atenet-router** | Deployment | Ingress gateway. Reads `ate-target-actor`, gets the assignment from ate-api-server, parks requests during resume, and tunnels to the worker's `atunnel`. Runs AgentGateway, or Envoy with `atenet` ext_proc and xDS. |
+| **atenet-egress** | Deployment | Egress gateway. Terminates `atunnel`'s CONNECT, identifies the actor, applies its egress policy, and injects credentials. |
+| **k8s-credential-provider** | Deployment (optional) | The bundled provider of secrets for egress credential injection, backed by Kubernetes Secrets. You can point the egress gateway at your own provider instead, or turn injection off. |
+| **atelet** | DaemonSet | One per worker node. Takes Run/Checkpoint/Restore from ate-api-server, stages runtimes and images, drives the worker over a Unix socket, relays the worker's registration and crash reports, and moves snapshots through its `objectstore-plugin` sidecar. |
+| **Worker pods** | Deployment (from a `WorkerPool`) | Pre-started gVisor or micro-VM capacity. Each runs `ateworker-*` and `atunnel` and hosts many actor sandboxes. |
+| **objectstore-plugin** | Sidecar (atelet, ate-api-server) | Holds the object-storage credentials. Uploads and downloads snapshot files to GCS or S3. |
+| **podcertificate-controller** | Deployment | Signs pod certificates (service DNS and SPIFFE pod identity) for the system components. Not on the hot path. |
 
 ## Ports at a glance
 
 | Service | Port | Protocol |
 |---|---|---|
-| ateapi | 443 | gRPC (TLS) |
-| atelet | 8085 | gRPC |
-| atenet router (L7 proxy) | 8080 / 8443 | HTTP / HTTPS |
-| atenet ExtProc | 50051 | gRPC (ext_proc) |
-| atenet xDS | 18000 | gRPC (xDS control plane) |
-| ateom-gvisor | Unix socket | gRPC - `/var/lib/ateom-gvisor/ateoms/{podUID}/ateom.sock` |
+| ate-api-server (`api`) | 443 | gRPC over mTLS |
+| atelet | 21998 | gRPC over mTLS (ate-api-server only) |
+| atelet `WorkerSupport` | Unix socket | gRPC from worker pods on the same node |
+| ateworker | Unix socket | gRPC - `/var/lib/ate/workers/{pod-uid}/worker.sock` |
+| atenet-router | 443 → 8443, 8444 | HTTPS, CONNECT over TLS |
+| atenet-router (AgentGateway only) | 80 → 8080, 8081 | Plaintext HTTP, CONNECT |
+| atenet-egress | 443 | mTLS CONNECT from `atunnel` |
+| atunnel | 8443 / 443 / 15001 | Ingress CONNECT / HTTPS / egress intercept |
+| ate-idp-server (`idp`) | 443 | HTTPS (OIDC discovery, JWKS) |
+| PostgreSQL | 5432 | TLS, client-certificate auth |
 
-## How traffic *actually* gets to an actor
+:::caution[Ingress authentication differs by dataplane]
+With Envoy, the router requires client certificates on its TLS ports and only
+admits the SPIFFE IDs listed in `--ingress-allowed-spiffe-ids`. AgentGateway
+doesn't authenticate clients at all and also serves plaintext ports. See
+[Security & identity](/security/).
+:::
 
-The short version: there is **no per-pod sidecar**. atenet's centralized
-L7 proxy is the single dataplane proxy, and ExtProc consults ateapi on each
-request to discover (and if needed, resume) the actor's worker.
+## Keeping kube-scheduler off the hot path
 
-See the [request path flow](/flows/resume-actor/) for the full sequence.
-
-## The hot path bypasses kube-scheduler
-
-The big architectural bet: when an actor needs to wake up, **ateapi picks a
-pre-warmed worker out of Redis and tells atelet to restore into it**. The
-Kubernetes scheduler is never on the critical path. That's how Substrate gets
-sub-second resume times against 30× more actors than pods.
+When an actor needs to wake up, `ate-api-server` picks a worker with room from its
+worker records and tells that node's atelet to restore the actor into it. The
+Kubernetes scheduler never sits on that path, and **that's how Substrate gets
+sub-second resumes while running far more actors than pods.** Kubernetes still
+does what it's good at (scheduling and healing the worker pods), it just does it
+ahead of time.
 
 :::tip[Go deeper]
 Each component box above links to its own page. For the current implementation,
-browse the source and the authoritative `docs/` (architecture, glossary, API guide).
+browse the source and the authoritative `docs/` (architecture, glossary, API guide,
+etc).
 :::

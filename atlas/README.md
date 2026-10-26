@@ -25,6 +25,7 @@ npm run preview    # serve the build locally
 src/content/docs/
   index.mdx              Hero + entry point
   topology.mdx           Full system topology
+  security.mdx           Identity, authentication, authorization, egress
   flows/                 Sequence + state diagrams of the main flows
   components/            Per-component deep-dives
   concepts/              Glossary of domain terms (actor, worker, snapshot, ...)
@@ -37,17 +38,21 @@ src/content/docs/
 - **[Mermaid](https://mermaid.js.org)** — diagrams as text, rendered client-side.
   The `pre-mermaid` rehype strategy keeps `mermaid` code blocks intact at build
   time; a small head script then runs `mermaid.run()` on every page.
-- **Excalidraw** (Cut 3) — for the hand-drawn hero topology. Sources live under
-  `excalidraw-sources/`, exported SVGs under `src/assets/`.
+- **Hand-drawn SVGs** under `src/assets/` for the hero topology and the
+  resume and golden-snapshot illustrations. They are edited as SVG source and
+  imported with `?raw` so their boxes stay clickable.
 
-## Delivery cuts
+## Keeping it current
 
-This atlas was built in three cuts so each one is independently reviewable.
+The atlas describes upstream `main` as of commit `59a58a5fb` (2026-10-25).
+To resync, diff upstream since that commit, update the affected pages, and
+move this marker forward. Verify claims against the code and the checked-in
+install manifests rather than `docs/architecture.md`, which is partly
+aspirational.
 
-- **Cut 1 (current)**: scaffold + topology + resume-actor flow + ateapi
-  deep-dive + this README.
-- **Cut 2**: all remaining flow pages + state machines.
-- **Cut 3**: all remaining component + concept pages, polished Excalidraw hero.
+Mermaid renders in the browser, so `npm run build` does not catch a broken
+diagram. Parse every `mermaid` block (for example with `mermaid.parse` under
+jsdom) before publishing.
 
 ## Adding new pages
 
@@ -73,11 +78,13 @@ This atlas was built in three cuts so each one is independently reviewable.
 
 ## Conventions
 
-- Every claim about the codebase is paired with a `file:line` reference
-  styled as `<code class="fileref">...</code>` (a small visual tag). Treat
-  them as load-bearing — if you change the code, fix the atlas.
+- Describe the architecture and current behavior, not lines of code. Pages
+  name binaries, resources, and RPCs but carry no `file:line` references.
+- The router and egress gateway run AgentGateway or Envoy. Envoy is the
+  install default; the atlas centers the AgentGateway path and calls out Envoy
+  where it behaves differently.
 - Prefer **Mermaid** for anything procedural (sequence, state, flow). Reach
-  for **Excalidraw** when you need an organic, whiteboard-style overview that
+  for a hand-drawn SVG when you need an organic, whiteboard-style overview that
   Mermaid would render too rigidly.
 - Keep pages narrow: one diagram + just enough prose to read it. Cross-link
   liberally; don't duplicate.

@@ -1,143 +1,252 @@
 ---
 title: atenet
-description: The networking component. One binary, two Cobra subcommands - a centralized L7 proxy router (with xDS + ExtProc) and a CoreDNS controller.
+description: The networking layer. An ingress router that resumes and routes to actors by name, an egress gateway that authenticates and polices every outbound connection, and atunnel on each worker joining the two. AgentGateway or Envoy is the dataplane.
 ---
 
-`atenet` is one binary that exposes two Cobra subcommands: `atenet router`
-and `atenet dns`. Each subcommand is run as its **own Deployment** in
-practice. The router does the per-request actor lookup via an L7 proxy + ExtProc;
-the DNS controller programs CoreDNS so
-`<actor_name>.<atespace>.actors.resources.substrate.ate.dev` resolves to the
-router.
+`atenet` is Substrate's networking layer, and it puts a proxy on each side of
+every actor. On the way in, `atenet-router` (ingress) takes a client request
+addressed to an actor by name, resumes the actor if it's suspended, and
+forwards the request to whichever worker hosts it now. On the way out,
+`atenet-egress` (the egress gateway) receives every outbound TCP connection an
+actor makes, works out which actor it belongs to, and allows, inspects, or
+refuses it against that actor's `EgressPolicy`. Joining the two is `atunnel`,
+which runs inside every Worker Pod as part of the trusted worker supervisor.
+It's the far end of the router's tunnels and the near end of the egress
+gateway's, so actors never talk to either proxy directly. Both proxies are
+Deployments in `ate-system` that every actor in the install shares (neither
+one is a per-pod sidecar).
 
-## What it does
+## Two dataplanes
+
+The proxy itself is pluggable, and `ate-setup --atenet-dataplane` picks it for
+both Deployments at install time.
+
+- `envoy` is the default. Envoy carries the bytes, and the `atenet` Go binary
+  runs beside it in the same pod as `atenet router --mode=ingress` (the xDS
+  server and `ext_proc` callout on the router), `atenet router --mode=egress`
+  (the `ext_proc` callout on the egress gateway), and `atenet sdsmint` (the
+  egress gateway's certificate minter).
+- `agentgateway` replaces each pod with a single AgentGateway container. The
+  Substrate logic is built into AgentGateway as native policies that call
+  `ateapi` directly from a static config, so no `atenet` process runs at all.
+
+We show the AgentGateway path in this atlas's diagrams (like the one below) and
+call out Envoy where it's the default or where it behaves differently in a way
+that matters.
 
 ```mermaid
 flowchart LR
-  Client([Client]) -- "DNS:<br/>name.atespace.actors.resources.substrate.ate.dev" --> DNS[atenet dns Deployment]
-  Client -- "HTTP" --> ROUTER[atenet router Deployment]
+  Client([Client]) -- "HTTPS<br/>ate-target-actor: ns/name" --> ROUTER
 
-  subgraph ROUTER_internals["Router subsystem"]
-    direction TB
-    XDS["xDS server :18000"]
-    EXT["ExtProc server :50051"]
-    ENVR["Proxy runner<br/>(K8s Deployment mgmt)"]
+  subgraph SYS["ate-system"]
+    ROUTER["atenet-router<br/>(AgentGateway)"]
+    EGRESS["atenet-egress<br/>(AgentGateway)"]
+    API[ateapi]
   end
 
-  subgraph DNS_internals["DNS subsystem"]
-    DNSCTL[CoreDNS Corefile controller]
+  subgraph WP["Worker Pod"]
+    AT["atunnel"]
+    ACT[["Actor sandbox"]]
   end
 
-  ROUTER --> XDS
-  ROUTER --> EXT
-  ROUTER --> ENVR
-  ENVR -- bootstrap --> ENVOY[(L7 proxy pods)]
-  XDS -- snapshot --> ENVOY
-  EXT -- ResumeActor --> API[ateapi]
+  ROUTER -- "ResumeActor" --> API
+  ROUTER -- "mTLS CONNECT :8443" --> AT
+  AT -- "actor network" --> ACT
+  ACT -.->|"any TCP dial,<br/>redirected"| AT
+  AT -- "mTLS CONNECT :443<br/>worker-for-actor cert" --> EGRESS
+  EGRESS -- "GetActor,<br/>GetActorEgressPolicy" --> API
+  EGRESS -- "allowed traffic" --> EXT([External destination])
 
   click API "/components/ateapi/" "ateapi"
+  click AT "/components/workers/" "Workers"
+  click ROUTER "/flows/request-path/" "Request path"
 ```
 
-## The Router subsystem
+### What runs in each pod
 
-Three pieces sharing one process:
+| | AgentGateway | Envoy (default) |
+|---|---|---|
+| **`atenet-router` pod** | One `agentgateway` container | `envoy` + `atenet router --mode=ingress` |
+| Actor lookup | Native `substrateIngress` policy calls `ateapi` | `ext_proc` on `127.0.0.1:50051` calls `ateapi` |
+| Config | Static ConfigMap | xDS from `atenet` on `127.0.0.1:18000`, built once at startup |
+| Router Service ports | `443` (TLS), `8444` (CONNECT over TLS), `80` (plaintext), `8081` (CONNECT, plaintext) | `443` (TLS, client cert required), `8444` (CONNECT over TLS, client cert required) |
+| **`atenet-egress` pod** | One `agentgateway` container | `envoy` + `atenet router --mode=egress` (`ext_proc`) + `atenet sdsmint` |
+| Interception leaves | Minted by AgentGateway from the MITM CA it mounts | Minted by `sdsmint`; the MITM CA key never enters the Envoy container |
 
-### xDS server (:18000)
+In the Envoy variant, the Envoy admin API and the `atenet` `/statusz` debug
+page bind loopback, so neither is reachable from other pods, and `/statusz`
+redacts query strings from the requests it records.
 
-Serves the L7 proxy's dynamic configuration. The snapshot it publishes
-contains:
+## Ingress: finding the actor
 
-- `ingress_http_listener` on `:8080` and `ingress_https_listener` on `:8443`
-  (the HTTPS listener is added only when a TLS port is configured).
-- A route table (`substrate_routes`) whose single catch-all route forwards to
-  the `dynamic_forward_proxy_cluster`; the HTTP connection manager runs
-  **every request through the `ext_proc` filter** first.
-- A static `ate-cluster` pointing at ExtProc (default `127.0.0.1:50051`, HTTP/2).
-- A `dynamic_forward_proxy_cluster` that follows whatever `:authority` the
-  proxy has after ExtProc rewrites it.
+So how does a client say which actor it wants? It puts the actor's atespace
+and name in an `ate-target-actor` header, rather than in DNS or `Host`.
 
-When an OTLP collector address is configured, the snapshot also carries an
-`otel_collector_cluster` and the connection manager gets an OpenTelemetry
-tracing provider so Envoy emits ingress spans.
+```
+ate-target-actor: <atespace>/<actor>
+```
 
-The router's controller loop runs every 5 seconds and re-snapshots after
-polling for ready templates (a periodic poll, not an informer-driven
-watch).
+`Host` and `:authority` stay application metadata and pass through to the
+actor unchanged. There's no per-actor DNS name, so clients address the
+`atenet-router` Service and let the header pick the actor. A request without a
+valid header gets a 404 before the router makes any control-plane call.
+Browsers can't set the header, so a browser-facing app puts a reverse proxy in
+front that sets it from trusted configuration.
 
-### ExtProc server (:50051)
+Let's follow what the router does with each request once it has the header.
 
-This is the brain of the routing. The L7 proxy hands every request's
-headers off to ExtProc; ExtProc:
+1. It resolves the assignment by calling `ResumeActor` on `ateapi`. For a
+   running actor that's a quick read that returns the current worker
+   assignment, and for a suspended one it runs the
+   [resume workflow](/flows/resume-actor/) first. Either way the answer
+   carries the worker pod IP and the worker's SPIFFE ID.
+2. It parks the request if it has to. Pool saturation and transient
+   control-plane errors are retried inside a bounded park budget (5s by
+   default) rather than failed (see
+   [Request path](/flows/request-path/#request-parking)).
+3. It tunnels to the worker, opening an mTLS `CONNECT` to `atunnel` on the
+   worker pod's port 8443 that carries the actor reference and the target
+   port. Tunnels to one worker share an HTTP/2 connection.
+4. `atunnel` accepts only the router's client certificate
+   (`spiffe://cluster.local/ns/ate-system/sa/atenet-router`), checks that the
+   named actor is active on this worker, and forwards the request over the
+   actor's private network to its port (80 unless a `CONNECT` named another).
 
-1. Parses the `:authority` / `Host` header into an **`(atespace, actor_name)`**
-   pair from
-   `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` (port
-   stripped). An unparseable host is answered with a 404.
-2. Asks ateapi to resume that actor, referencing it by `ObjectRef{atespace, name}`.
-   Concurrent requests for the same actor collapse into a single resume.
-3. Receives the `Actor` back and reads `ateom_pod_ip`.
-4. Returns a `HeaderMutation` telling the proxy to overwrite `:authority`
-   with `<pod_ip>:80`. (The `:80` is currently hardcoded; supporting other
-   actor ports is a known follow-up.)
+Concurrent requests for the same actor share one in-flight `ResumeActor`, so a
+burst of fifty requests at a cold actor costs one resume rather than fifty.
 
-After that, the proxy's dynamic forward proxy carries the request to the
-worker. The server is instrumented with OTel: it extracts any inbound
-`traceparent` from the request headers and starts a span so its work links to
-the Envoy ingress span.
+### Where the dataplanes differ on ingress
 
-### Proxy runner
+| Behavior | AgentGateway | Envoy (default) |
+|---|---|---|
+| Assignment reuse | Caches each actor's assignment for 5s, and a cache hit skips `ateapi` | No cache, so every request calls `ResumeActor` |
+| Worker identity check | Verifies `atunnel`'s certificate chains to the pod-identity CA, but not which worker presented it | Pins `atunnel`'s certificate to the exact worker SPIFFE ID the assignment named |
+| Actor moved since lookup | `atunnel` refuses with 421 (stale assignment); AgentGateway drops its cached entry, re-resolves, and retries | Rare without a cache; the request fails and is not retried |
+| Park budget runs out | 504 | 503 with the capacity message |
 
-atenet **manages a K8s Deployment of L7 proxy pods** as part of its own
-reconciliation - it's not a sidecar pattern, the proxy pods are a separate
-fleet that this process keeps healthy. Bootstrap config points the proxies
-at the xDS server above. (Reconciliation of the proxy Deployment is skipped
-in standalone / file-backed modes.)
+The worker SPIFFE ID names the pool's ServiceAccount rather than one pod, so
+the per-request guarantee that a request reaches the right actor comes from
+`atunnel`'s own check against its active actors.
 
-## The DNS subsystem
+### Arbitrary ports
 
-Independent from the router - it's a separate Cobra subcommand
-(`atenet dns`) typically run as its own Deployment. The DNS controller
-reconciles on an interval and:
+What if the client needs an actor port other than 80? It sends an HTTP
+`CONNECT` whose authority names the port, with `ate-target-actor` on the outer
+`CONNECT`. The router terminates the `CONNECT` and runs each request inside the
+tunnel through the same lookup, so a long-lived tunnel still re-routes if the
+actor moves. Only HTTP(S) works inside the tunnel today (raw TCP doesn't).
 
-1. Looks up the `atenet-router` and `dns` Service ClusterIPs in the
-   `ate-system` namespace.
-2. Generates a CoreDNS Corefile whose `template` plugin answers any
-   `<actor_name>.<atespace>.actors.resources.substrate.ate.dev` name (both
-   labels are DNS-1123) with the
-   **`atenet-router` ClusterIP**.
-3. Writes the Corefile to the shared volume and signals CoreDNS to reload
-   (`SIGUSR1`), and points GKE's `kube-dns` ConfigMap `stubDomains` at the
-   `dns` service for the actor suffix.
+## Ingress client authentication
 
-The trick: DNS answers point at the **router**, not at any worker. Worker
-IPs change too often for DNS to be a good source of truth.
+The two dataplanes differ most on how they authenticate ingress clients. The
+Envoy router (the default) serves TLS listeners only and requires a client
+certificate on both of them. That certificate must chain to
+`--ingress-client-ca-file` (by default the pod-identity CA, which issues
+`spiffe://cluster.local/ns/<namespace>/sa/<serviceaccount>`) and carry a SPIFFE
+ID listed in `--ingress-allowed-spiffe-ids`, and `ate-setup` refuses to install
+the Envoy router without that list. The list is the whole policy, which means
+any listed client may reach any actor.
 
-## The request-coalescing optimization
+AgentGateway doesn't authenticate ingress clients at all. It also serves
+plaintext HTTP and plaintext `CONNECT` alongside TLS, and
+`--ingress-allowed-spiffe-ids` doesn't apply to it.
 
-If 50 simultaneous requests hit a cold actor, ExtProc would naïvely fire
-50 `ResumeActor` calls at ateapi. Instead, concurrent requests keyed by
-`<atespace>/<actor_name>` collapse: only the first goes through, the
-rest piggyback on its result. The in-flight resume also runs under a detached
-background timeout so a caller disconnecting doesn't abort the resume for the
-others, and `Aborted` responses (a concurrent resume) are retried with backoff.
+:::caution[An AgentGateway router is open to anything that can reach it]
+The router's NetworkPolicy admits its ports from any pod, and nothing checks
+who the caller is, so any client that can reach the `atenet-router` Service can
+resume and call any actor by name. Put an authenticating proxy in front, or use
+the Envoy dataplane, when callers are not all trusted.
+:::
 
-## Logging hygiene
+Neither dataplane authorizes per actor, and the router's own `ateapi` identity
+holds the `ingress_router` system role, which allows `ResumeActor` on every
+actor (see [Security](/security/#authorization-on-the-control-plane)).
 
-The router's status dashboard records recent requests, but it **redacts the
-query string** off recorded paths (it may carry credentials) before storing
-them. Secrets are never logged verbatim.
+## Egress: the gateway's side
 
-## Why ship router + DNS in one binary?
+Now let's look at the other direction. Every outbound TCP connection an actor
+makes leaves through `atunnel` and the egress gateway. The Actor dials an
+external destination, and the worker's nftables rules redirect that TCP
+connection to `atunnel` in the trusted worker supervisor. `atunnel` then opens
+an mTLS `CONNECT` through the egress gateway, presenting a `worker-for-actor`
+certificate for that Actor, and the `CONNECT` target is the IP and port the
+Actor dialed.
 
-They share Go packages (CRD types, K8s clients, logging) and are versioned
-together, but each is its own Cobra subcommand with its own Deployment.
-Splitting them into separate binaries would be a packaging change, not an
-architectural one.
+```mermaid
+sequenceDiagram
+  autonumber
+  participant ACT as Actor
+  participant AT as atunnel (worker)
+  participant GW as atenet-egress (AgentGateway)
+  participant API as ateapi
+  participant DST as Destination
+
+  ACT->>AT: TCP connect(IP:port), redirected
+  AT->>GW: mTLS, worker-for-actor cert
+  AT->>GW: CONNECT IP:port
+  GW->>GW: verify cert against actor-identity CA,<br/>read actor from SPIFFE URI
+  GW->>API: GetActor
+  API-->>GW: RUNNING or RESUMING
+  GW-->>AT: 200
+  ACT->>GW: first bytes inside the tunnel
+  GW->>API: GetActorEgressPolicy
+  Note over GW: HTTP: decide on Host<br/>TLS: decide on SNI, then intercept or pass through
+  GW->>DST: dial the authorized name on the dialed port
+```
+
+The sequence above shows what the gateway does with each tunnel.
+
+1. It authenticates the tunnel. The gateway requires a client certificate
+   signed by the actor-identity CA whose single SPIFFE URI is
+   `spiffe://substrate-actor.local/worker-for-actor/<atespace>/<name>`, and it
+   refuses CA certificates. It then asks `ateapi` whether that actor exists and
+   is `RUNNING` or `RESUMING` (a booting actor may need the network before its
+   wakeup probe passes), and anything else closes the tunnel.
+2. It classifies the traffic by looking at the first bytes inside the tunnel.
+   Cleartext HTTP is decided per request on `Host` against the actor's `http`
+   rules, and TLS is decided at the ClientHello on SNI. With an `https` rule
+   the gateway terminates TLS with a leaf it mints, decides each request, and
+   re-originates TLS; with a `tls_passthrough` rule it relays the bytes
+   untouched; and with no rule it closes the connection. WebSocket upgrades
+   and nested `CONNECT` are refused, and any other protocol is closed.
+3. It dials by name, resolving the name the policy authorized and dialing it
+   on the port the Actor dialed. The IP in the `CONNECT` never picks the
+   destination, so an Actor can't claim an allowed name while dialing some
+   other address.
+4. It injects credentials where a rule asks for them. A rule's
+   `replaceHeaders` effect swaps a placeholder header for a credential from a
+   credential provider, so the secret never enters the sandbox.
+
+An actor with no `EgressPolicy` gets no egress. DNS doesn't go through the
+gateway either (a relay in the sandbox answers only the names the actor's
+policy allows).
+
+| Behavior | AgentGateway | Envoy (default) |
+|---|---|---|
+| Policy freshness | Fetched from `ateapi` per decision | Cached per actor for 10s (`--egress-policy-cache-ttl`) |
+| Actor JWT injection (`actorJwt`) | Not handled by the pinned image; only `credentialUri` entries resolve | Mints the token through `ateapi` |
+| Extra `ext_proc` hook | Not available | `--experimental-additional-egress-extproc-service` |
+| Interception CA key | Mounted in the proxy container | Held by the `sdsmint` sidecar, outside Envoy |
+
+The egress gateway's NetworkPolicy admits only Worker Pods, and its `ateapi`
+identity holds the `egress_gateway` system role, which is the only role that
+may mint actor credentials.
+
+## Graceful shutdown
+
+On `SIGTERM` the router flips `/readyz`, waits out endpoint propagation
+(`--drain-delay`, 13s in the manifest), drains established connections, and
+lets parked requests finish before the pod exits. With Envoy, `atenet` drives
+the drain through Envoy's admin API and releases Envoy's `preStop` hook when
+it's done, while AgentGateway manages its own termination.
 
 ## Related
 
-- [Request path flow](/flows/request-path/) - the warm-path mechanics.
-- [Resume actor flow](/flows/resume-actor/) - the cold-path mechanics
-  through atenet.
-- [ateapi](/components/ateapi/) - atenet's only gRPC dependency.
-- [Atespace](/concepts/atespace/) - why the DNS name carries an atespace.
+- [Request path](/flows/request-path/) - one ingress request end to end,
+  parking, and error codes.
+- [Resume actor flow](/flows/resume-actor/) - what `ResumeActor` does for a
+  suspended actor.
+- [Security & identity](/security/) - the certificates each hop presents and
+  who verifies them.
+- [Workers](/components/workers/) - the pods that host `atunnel`.
+- [ateapi](/components/ateapi/) - the control plane both proxies call.

@@ -1,127 +1,149 @@
 ---
 title: atecontroller
-description: The Kubernetes reconciler. Watches the WorkerPool and ActorTemplate CRDs and turns them into Deployments and golden snapshots.
+description: The Kubernetes reconciler. Turns WorkerPool CRDs into worker Deployments and NetworkPolicies, and keeps ateapi's Worker registry in step with the worker pods.
 ---
 
-`atecontroller` is the Kubernetes-native half of the control plane.
-Everything declarative about Substrate goes through it: `WorkerPool` and
-`ActorTemplate` are the CRDs it reconciles, and reconciling them produces real
-K8s resources (Deployments) and ateapi state (golden snapshots).
+`atecontroller` is the Kubernetes-native half of the control plane. It owns the
+infrastructure side of Substrate (the prepared capacity that actors run on) and
+nothing about the actors themselves, and it runs as the `ate-controller`
+Deployment in `ate-system`.
 
-## What it owns
+The split follows the resource model, where `WorkerPool`, `SandboxConfig`, and
+`CSIDriverConfig` are Kubernetes CRDs (`ate.dev/v1`) and atespaces, actor
+templates, actors, and tags are records in [ateapi](/components/ateapi/)'s
+database. atecontroller reconciles the first group and reports what it sees to
+ateapi, and it never touches an ActorTemplate (ateapi builds golden snapshots
+itself).
 
-It runs **exactly two reconcilers** - one per CRD:
+## What it runs
 
 ```mermaid
 flowchart LR
   subgraph CTRL["atecontroller process"]
     direction TB
     WPR["WorkerPool reconciler"]
-    ATR["ActorTemplate reconciler"]
+    NPR["NetworkPolicy reconciler"]
+    SCP["SandboxConfig protection"]
+    EMT["Egress MITM trust"]
+    SYNC["Worker syncer"]
   end
 
   K8s[(K8s API)] --> WPR
-  K8s --> ATR
+  K8s --> NPR
+  K8s --> SCP
+  K8s --> EMT
+  K8s -- watch worker pods<br/>+ WorkerPools --> SYNC
 
-  WPR -- SSA apply --> DEP["K8s Deployment<br/>(N worker pods)"]
-  ATR -- CreateAtespace /<br/>CreateActor /<br/>ResumeActor /<br/>SuspendActor --> API[ateapi]
+  WPR -- SSA apply --> DEP["Deployment<br/>(N worker pods)"]
+  WPR -- status --> WPS["WorkerPool.status<br/>resolved SandboxConfig"]
+  NPR -- SSA apply --> NP["NetworkPolicy<br/>ingress from atenet-router only"]
+  EMT -- writes --> CTB["ClusterTrustBundle"]
+  SYNC -- CreateWorker / DrainWorker /<br/>MarkWorkerAvailable / DeleteWorker --> API[ateapi]
 
   click API "/components/ateapi/" "ateapi"
 ```
 
-There is no atespace or SandboxConfig reconciler here. `SandboxConfig` is a
-cluster-scoped CRD, but ateapi consumes it directly (via a lister) when
-scheduling - atecontroller does not reconcile it.
+The diagram above shows the five loops that run in the one process, and the
+table below lists what each of them watches and what it produces.
+
+| Loop | Watches | Produces |
+|---|---|---|
+| WorkerPool reconciler | `WorkerPool`, its `Deployment`, `SandboxConfig` | The worker Deployment, and `WorkerPool.status` (replicas, resolved SandboxConfig per sandbox class) |
+| NetworkPolicy reconciler | `WorkerPool` | A NetworkPolicy per pool admitting ingress to worker pods only from atenet-router |
+| SandboxConfig protection | `SandboxConfig`, `WorkerPool` | Removes the protection finalizer from a deleted SandboxConfig once no pool uses it |
+| Egress MITM trust | The `egress-mitm-ca-pool` Secret | A ClusterTrustBundle actors use to trust the egress gateway's intercepting CA |
+| Worker syncer | Worker pods, `WorkerPool` | Worker records in ateapi, kept in step with the pods |
 
 ## WorkerPool reconciler
 
 ```yaml
-apiVersion: ate.dev/v1alpha1
+apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
-  name: default
+  name: agent-pool
+  namespace: ate-demo
+  labels:
+    workload: secret-agent        # what template/actor selectors match
 spec:
   replicas: 10
-  ateomImage: ghcr.io/.../ateom-gvisor:vX
-  sandboxClass: gvisor
+  workerImage: ko://go.ate.dev/substrate/cmd/ateworker-gvisor
+  sandboxClasses:
+  - name: gvisor                  # exactly one class today
+    configRef:
+      name: gvisor-default        # optional; else the class default
 ```
 
-The reconciler:
+Given a pool like the one above, the WorkerPool reconciler goes through the
+same three steps on each reconcile.
 
-1. Reads desired state from `WorkerPool.spec`.
-2. Server-side-applies a K8s `Deployment` named `<workerpool-name>` (same name as
-   the pool; owning it, so pod changes re-trigger reconcile).
-3. Updates `WorkerPool.status.replicas` with the Deployment's actual replica
-   count.
+1. It resolves each sandbox class to a SandboxConfig (the one named by
+   `configRef`, or the newest config of that class annotated as the class
+   default) and adds a protection finalizer to it so it can't disappear while a
+   pool depends on it.
+2. It records the resolution in `status.sandboxClasses`. A switch to a new
+   config goes through a `pendingConfigRef` first and is confirmed against the
+   API server, so status never names a config whose protection was already
+   released.
+3. It server-side-applies a Deployment with the pool's name, owned by the pool,
+   running `spec.workerImage`. A new pool gets its Deployment only once every
+   class has a config, and an existing Deployment is applied first on every
+   pass, so a SandboxConfig problem never blocks a scale.
 
-That's it. No data plane involvement, no Redis writes. The pods themselves get
-registered in Redis by ateapi's worker-pool syncer once they go Ready.
+Worker pods don't take anything from the SandboxConfig directly, since atelet is
+what fetches the sandbox binaries it names (see
+[SandboxConfig](/concepts/sandboxconfig/)).
 
-Crucially, a WorkerPool is **decoupled from ActorTemplate**: templates no longer
-reference a pool. Instead, placement is selector-based - the scheduler ANDs a
-template's `workerSelector` with the actor's own `worker_selector` and matches
-against pool labels (and `sandboxClass`).
+So how does an actor end up on a pool's workers? A WorkerPool doesn't reference
+templates at all, and placement is selector-based instead. The scheduler in
+ateapi ANDs a template's `worker_selector` with the actor's own and matches them
+against the pool's labels, which each Worker record mirrors.
 
-## ActorTemplate reconciler
+## The worker syncer
 
-```yaml
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
-metadata:
-  name: my-agent
-spec:
-  sandboxClass: gvisor
-  workerSelector: { matchLabels: { pool: default } }
-  containers: [...]
-  pauseImage: ...
-  snapshotsConfig: { location: gs://my-bucket/actors }
-```
-
-This one is more interesting - it runs a **golden snapshot bootstrap** as a
-small phase machine (`ActorTemplate.Status.Phase`), described in
-[Golden snapshot](/flows/golden-snapshot/):
+The syncer is how ateapi learns about capacity. It watches pods labeled
+`ate.dev/worker-pool` and the WorkerPools, and it drives each pod's Worker
+record through ateapi's `Control` RPCs as the state diagram below shows.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> PhaseInitial
-  PhaseInitial --> PhaseResumeGoldenActor: CreateAtespace(ate-golden)<br/>+ CreateActor()
-  PhaseResumeGoldenActor --> PhaseWaitGoldenActor: ResumeActor()<br/>(stamp TakeGoldenSnapshotAt)
-  PhaseWaitGoldenActor --> PhaseReady: requeue fires, SuspendActor()
-  PhaseReady --> [*]
+  [*] --> UNAVAILABLE: pod scheduled<br/>CreateWorker
+  UNAVAILABLE --> ACTIVE: pod Ready with an IP<br/>MarkWorkerAvailable
+  ACTIVE --> UNAVAILABLE: pod not Ready<br/>MarkWorkerUnavailable
+  ACTIVE --> DRAINING: pod terminating<br/>DrainWorker
+  UNAVAILABLE --> DRAINING: pod terminating<br/>DrainWorker
+  DRAINING --> [*]: pod gone<br/>DeleteWorker
 ```
 
-Two things worth calling out:
-
-- **The golden actor lives in the reserved `ate-golden` atespace.** In
-  `PhaseInitial` the reconciler first ensures that atespace exists
-  (`CreateAtespace`, tolerating `AlreadyExists`), then creates a golden actor
-  there whose name is a fresh UUID (`Status.GoldenActorID`).
-- **The warmup wait is readyz-gated.** The reconciler stamps
-  `Status.TakeGoldenSnapshotAt` and requeues (rather than blocking on a sleep)
-  before it suspends the golden actor to capture the snapshot. That delay is
-  **20s** *only as a fallback*: if every container in
-  the template declares a `readyz` probe, the delay is **0**, because
-  `ResumeActor` already blocked until the workload reported readiness. A
-  template with no containers keeps the 20s default.
-
-The reconciler never assigns a `PhaseFailed`; on error it just returns and lets
-controller-runtime requeue. The result: every ready ActorTemplate has a
-`Status.GoldenSnapshot` URI (read from the suspended golden actor's
-`latest_snapshot_info.external.snapshot_uri_prefix`) that new actors of this
-template can restore from in milliseconds.
+- Registration happens once the pod is scheduled to a node. A Worker is named
+  by the pod's UID, so a replacement pod with the same name is a different
+  Worker.
+- Readiness gates scheduling, and only a Ready pod with an IP is `ACTIVE`. The
+  worker process itself still has to register its epoch, IPs, capacity, and
+  runtimes through atelet before anything is placed on it.
+- Termination marks the Worker `DRAINING` so nothing new lands there, without
+  touching the actors on it (the pod is shutting them down itself).
+- Deletion calls `DeleteWorker` once the pod is gone, and ateapi crashes any
+  actor still running there and removes the record.
+- During cleanup, a terminal pod (Succeeded or Failed), or one whose pool no
+  longer exists, is deleted. On startup the syncer also walks every Worker
+  record in ateapi and removes the ones whose pods vanished while it was down.
 
 ## Why is this a separate process from ateapi?
 
-It uses the Kubernetes informer cache and has reconcile-loop semantics -
-the standard operator pattern. ateapi is stateless gRPC, optimized for QPS.
-Different concerns, different scaling profiles. (The manager is constructed
-without leader election, so if you scale this to multiple replicas they will
-all reconcile concurrently.)
+atecontroller is a standard Kubernetes operator (informer caches, reconcile
+loops, owner references, server-side apply, etc), while ateapi is a gRPC server
+optimized for request latency on database-backed records. Keeping the
+Kubernetes reconciliation in atecontroller keeps ateapi out of the Kubernetes
+API's hot path. The manager runs without leader election, and the install runs
+a single replica.
 
 ## Related
 
-- [WorkerPool](/concepts/workerpool/) · [ActorTemplate](/concepts/actortemplate/)
-- [Golden snapshot bootstrap](/flows/golden-snapshot/) - the ActorTemplate
-  reconciler's interesting flow.
-- [Atespace](/concepts/atespace/) - including the reserved `ate-golden` atespace.
-- [ateapi](/components/ateapi/) - atecontroller's only gRPC client.
+- [WorkerPool](/concepts/workerpool/) · [SandboxConfig](/concepts/sandboxconfig/) ·
+  [Worker](/concepts/worker/)
+- [Worker lifecycle](/flows/worker-lifecycle/) follows the syncer's states end
+  to end.
+- [ateapi](/components/ateapi/) is atecontroller's only gRPC peer, and where
+  golden snapshots are built.
+- [Golden snapshot](/flows/golden-snapshot/) covers the ActorTemplate flow,
+  which ateapi runs.

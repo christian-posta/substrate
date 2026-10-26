@@ -1,146 +1,222 @@
 ---
 title: Storage
-description: The two persistent stores Substrate uses - Redis/Valkey for actor and worker state, GCS/S3 for external snapshots - plus node-local snapshots for paused actors.
+description: Where Substrate keeps its state - PostgreSQL for control-plane records, object storage behind a plugin for external snapshots, and node-local disk for local snapshots and sandbox assets.
 ---
 
-Substrate has **two** persistent stores. They serve completely different
-needs and have completely different access patterns.
+Substrate keeps its state in three places, and as the table below shows, each
+one serves a different need and has a different owner. Every other component
+reaches these stores through ateapi or atelet.
 
-## Redis / Valkey - hot path
+| Store | Holds | Who touches it |
+|---|---|---|
+| PostgreSQL | Every API resource record, worker assignments, leases, the worker change feed, authorization tuples | ateapi only |
+| Object storage (GCS or S3) | External snapshots, tag copies, sandbox assets | The `objectstore-plugin` sidecars only |
+| Node-local disk (`/var/lib/ate`) | Local snapshots, the sandbox asset cache, per-actor working state | atelet and the worker pods on that node |
 
-The source of truth for actor and worker state. Every routing decision
-reads from here. The deployed backend is **ValKey 9.1**, run as a TLS
-cluster; the cluster reloads its own TLS certificate on an interval
-(`tls-auto-reload-interval`, 12h in the shipped config) so pod-certificate
-rotations take effect without a restart.
+## PostgreSQL for control-plane state
+
+PostgreSQL is the source of truth for the control plane, and ateapi is its only
+client, so every other component goes through ateapi's gRPC API.
 
 ```mermaid
 flowchart LR
-  API[ateapi] -- read/write --> R[(Redis / Valkey)]
-  SYNC[Worker-pool syncer] -- write --> R
-  WF[Workflow engine] -- read/write/lock --> R
-  R -- worker updates --> WC[In-memory worker cache]
+  API[ateapi replicas] -- read / write<br/>versioned records --> PG[(PostgreSQL)]
+  API -- acquire / renew --> L[leases]
+  PG -- worker change feed<br/>outbox --> WC[In-memory worker cache<br/>in each replica]
+  L -.- PG
 
   click API "/components/ateapi/" "ateapi"
 ```
 
-### Keyspace
+### What it holds
 
-| Key pattern | Value | Notes |
+| Data | Keyed by | Notes |
 |---|---|---|
-| `actor:<atespace>:<name>` | Actor proto (JSON) | Keyed by `(atespace, name)` |
-| `atespace:<name>` | Atespace proto (JSON) | Global-scoped |
-| `worker:<ns>:<pool>:<pod>` | Worker proto (JSON) | One per Ready worker pod |
-| `lock:actor:<atespace>:<name>` | Workflow-instance ID | 30s TTL, used by ateapi workflows |
+| Atespaces | `name` | Global |
+| Actors, ActorTemplates, Tags | `(atespace, name)` | Each references its atespace, which cannot be deleted while any remain |
+| Actor egress policies | `(atespace, actor_name)` | Deleted with the actor |
+| Workers | `name` (the worker pod's UID) | Global |
+| Worker assignments | actor UID | One row per hosted actor, so an actor has at most one worker |
+| Leases | lease key | e.g. `lease:actor:<atespace>:<name>`, with an expiry |
+| Worker outbox | transaction ID | Change feed for the worker cache |
+| Access policies, OpenFGA tuples and model | - | Authorization state, in the same schema |
 
-To speed up scheduling, ateapi also fronts the worker keys with an in-memory
-worker cache that streams changes over Redis pub/sub and
-relists periodically. See [ateapi](/components/ateapi/).
+Each record is stored as its protobuf alongside a `uid` and a `version`, and
+every update is a compare-and-set on `version`, so a lost race surfaces as
+`Aborted` for the caller to retry. ateapi applies the schema migrations itself
+at startup.
 
-### Why Redis (and not the K8s API)?
+### Leases
 
-The hot path needs sub-millisecond reads and atomic compare-and-set for
-locks. Etcd-backed K8s API isn't built for that. Substrate uses K8s for
-declarative state (CRDs) and Redis for high-frequency operational state.
+A lease is a row with a token and an expiry, and ateapi takes one before any
+workflow that mutates an actor, tag, template, or worker. The default TTL is 30
+seconds, and the holder renews it in the background roughly every 10 seconds.
+If renewal fails, the workflow's context is cancelled, so it stops before
+another replica can claim the expired lease. A second operation on the same
+resource gets `Aborted` instead of waiting.
 
-### Locks
+### The worker change feed
 
-`lock:actor:<atespace>:<name>` is set with a 30-second TTL whenever a workflow
-starts on an actor. The workflow itself runs under a context that times out at
-28 seconds (TTL minus 2s of padding). Two concurrent operations on the same
-actor cannot both succeed - the second returns `Aborted`.
+Every write to a worker record appends an event to an outbox table in the same
+transaction. Each ateapi replica polls the outbox to keep its in-memory worker
+cache current, which is what the scheduler reads. The outbox is unlogged and
+partitioned by time, so it's cheap to write and old events are dropped in bulk,
+and a replica that falls behind the retention window detects the gap and
+rebuilds from the workers table.
 
-## Snapshots: external vs. local
+### Deployment options
 
-A snapshot is the memory + sandbox state that lets a stopped actor come back to
-life. There are now **two storage locations**, modeled as a oneof on
-`SnapshotInfo` (`Actor.latest_snapshot_info`):
+- In the bundled setup, the installer runs a single-replica `postgres`
+  StatefulSet (PostgreSQL 18) in `ate-system`. ateapi connects over TLS with no
+  passwords, presenting Kubernetes pod certificates from a dedicated signer that
+  only issues them to the `ate-api-server` ServiceAccount.
+- If you bring your own database, ateapi takes owner and read/write connection
+  strings, roles, and a schema name (default `substrate`), and the operator
+  provisions the database, schema, and roles first.
+- On Cloud SQL, an optional Cloud SQL Auth Proxy sidecar on the API server pod
+  handles transport and IAM database authentication.
 
-| `SnapshotInfo` variant | Where it lives | Backs which state |
+ateapi uses two connection pools under separate roles, an owner role for
+migrations and partition maintenance and a read/write role for normal queries.
+Both credentials live in the same process, so the split limits mistakes rather
+than a compromised API server.
+
+### Why a database and not the Kubernetes API?
+
+Resuming an actor needs low-latency reads, atomic multi-row writes (an actor
+and its worker assignment together), and leases that many replicas can
+contend on. Those don't fit etcd's watch-and-reconcile model, and putting
+thousands of actor transitions per second through the Kubernetes API would
+load the cluster's own control plane. So Substrate keeps infrastructure
+(WorkerPools, SandboxConfigs) in Kubernetes CRDs and workload state in
+PostgreSQL.
+
+## Snapshots: local and external
+
+A snapshot is the state that lets a suspended actor come back. Each actor's
+`status.snapshots` records its snapshot generations, and a snapshot can live in
+two places at once, tracked by the two fields below.
+
+| Field | Where | Meaning |
 |---|---|---|
-| `ExternalSnapshotInfo { snapshot_uri_prefix }` | Object storage (GCS or S3) | `SUSPENDED` - actor released from its worker |
-| `LocalSnapshotInfo { snapshot_prefix, node_vms_with_local_snapshots[] }` | On the worker node's disk | `PAUSED` - snapshot kept on the node VM for a fast resume |
+| `locality` | A node's disk | The node holding the snapshot's files; set while a local copy exists |
+| `durable_snapshot` | Object storage | `PENDING` while uploading, `COMPLETED` once the upload is recorded |
 
-`SuspendActor` uploads to **external** storage; `PauseActor` keeps the
-snapshot **local** on the node and records which node VMs hold it. What each
-transition captures is governed by the template's
-`snapshotsConfig` (`onPause`, `onCommit`, each a `SnapshotScope` of `Full` or
-`Data`). See [Snapshot](/concepts/snapshot/).
+A suspend always writes the checkpoint to the node first. An asynchronous
+suspend (the default) returns at that point, and atelet uploads the snapshot in
+the background (by default about 5 minutes later) and reports it so ateapi
+marks it `COMPLETED`, while a synchronous suspend uploads before returning.
+While a local copy exists, a resume is placed back on that node and restores
+without touching object storage. After a detach delay (30 minutes by default),
+or during a resume when that node has no room, atelet uploads if needed and
+deletes the local files, and from then on the actor is free to resume anywhere.
 
-## GCS / S3 - external snapshots
+What a snapshot holds is its _fidelity_, which is one of `VOLUMES` (durable
+volumes only), `ROOTFS` (plus root filesystem changes), or `MEMORY` (plus
+process memory), and the template's `preferred_fidelity` sets the ceiling. We
+cover what each fidelity captures on the [Snapshot](/concepts/snapshot/) page.
+
+## Object storage behind a plugin
+
+Neither ateapi nor atelet talks to object storage for snapshots. As the diagram
+below shows, both run the `objectstore-plugin` as a sidecar that serves the
+`objectstore.v1` gRPC API over a Unix socket in its pod.
 
 ```mermaid
 flowchart LR
-  AT[atelet] -- zstd upload<br/>(parallel) --> G[("GCS or S3")]
-  AT -- zstd download<br/>(parallel) --> G
+  subgraph NODE["atelet pod (every node)"]
+    AT[atelet] -- Unix socket --> NP["objectstore-plugin<br/>NodeProvider + AssetProvider"]
+  end
+  subgraph CP["ate-api-server pod"]
+    API[ateapi] -- Unix socket --> CPV["objectstore-plugin<br/>ControlProvider"]
+  end
+  NP -- upload / fetch<br/>snapshot files --> OBJ[("GCS or S3")]
+  NP -- fetch sandbox assets --> OBJ
+  CPV -- copy / delete<br/>whole snapshots --> OBJ
+  NP -. on GCS, exchange actor JWT<br/>for a scoped token .-> CPV
 
   click AT "/components/atelet/" "atelet"
+  click API "/components/ateapi/" "ateapi"
 ```
+
+| Service | Runs beside | Does |
+|---|---|---|
+| `NodeProvider` | atelet | `UploadSnapshot`, `FetchSnapshot` for the files atelet names |
+| `AssetProvider` | atelet | `FetchAsset` for sandbox binaries a SandboxConfig names, verified by sha256 |
+| `ControlProvider` | ateapi | `CopySnapshot` (tags, golden snapshots), `CleanupSnapshot` (suspend, revert, delete) |
+
+The in-tree plugin backs this with GCS (the default) or S3, chosen by
+`ATE_STORAGE_BACKEND` on the sidecar, and neither main process holds object
+storage credentials. Other providers come in through the same API, where a
+platform implements the three services and ships its own plugin binary.
+
+:::note[Per-actor storage credentials on GCS]
+On GCS, each transfer carries a `worker-for-actor` JWT that ateapi minted for
+the node hosting the actor. The node plugin exchanges it with the control
+plugin for a short-lived token limited to that actor's snapshot prefix
+(read-write) and the tag it was created from (read-only). The token is
+refused once the actor leaves that node, so snapshot access is scoped per
+actor rather than per node. On S3 the plugin ignores the JWT and transfers
+with the pod's own credentials.
+:::
 
 ### Object layout
 
-The external snapshot prefix is built by ateapi from the per-template config,
-not a hardcoded bucket path:
+The base location is ateapi's `--snapshot-location` (e.g.
+`gs://my-bucket/substrate`), and every snapshot sits under it in the prefix of
+the resource that owns it, as the layout below shows.
 
 ```
-<ActorTemplate.spec.snapshotsConfig.location>/<actorName>/<RFC3339-timestamp>-<random>/
-  <snapshot-file>.zstd     (one per file runsc actually wrote)
-  manifest.json            (sandbox binaries + the snapshot file list)
+<location>/atespaces/<atespace>/actors/<actor-uid>/snapshots/<snapshot-uuid>/
+  <file>.zstd        (one per file the sandbox runtime wrote)
+  manifest.json      (the file list; uploaded last)
+<location>/atespaces/<atespace>/tags/<tag-uid>/
+  ...                (a tag's own copy of one snapshot)
 ```
 
-`spec.snapshotsConfig.location` is whatever the template provides (e.g.
-`gs://my-bucket/some/prefix`); ateapi appends `/<actorName>/<ts>-<rand>` to form
-the per-snapshot directory.
+Prefixes use the actor's UID rather than its name, so a deleted and recreated
+actor never reads the old one's snapshots. The manifest is uploaded only after
+every data file succeeds, so a reader that finds it can rely on every file it
+lists. A tag is a separate copy, so suspending or deleting the source actor
+can't collect it. With the `PerTemplateSnapshotLocation` preview gate, a
+template's `snapshot_config.storage_location` overrides the base location.
 
-atelet no longer ships a hardcoded set of image files. The sandbox runtime
-(e.g. ateom-gvisor via `runsc`) reports exactly the files it produced, and
-atelet uploads precisely that set, each compressed with a **sparse-extent zstd
-format** (magic `ATESPRSE`) that skips file holes, plus a `manifest.json` so a
-later Restore on any node is self-describing. For a gVisor checkpoint this set is
-typically `checkpoint.img` (always) plus lazy-paged RAM images such as
-`pages.img` / `pages_meta.img` when produced; the micro-VM runtime writes CH's
-`memory-ranges` set. The sparse format is applied uniformly to both.
+### Compression
 
-Both the checkpoint **upload** and the restore **download** run in parallel.
+Network bandwidth between nodes and object storage is the bottleneck on a cold
+resume. The plugin compresses each file with zstd in a sparse-extent
+format that skips file holes, which matters for memory images that are mostly
+empty. Uploads and downloads both run in parallel, and the node plugin shares
+one memory budget (`--upload-memory-budget`, default 512Mi) across concurrent
+uploads.
 
-### Why compress?
+## Node-local storage
 
-Network bandwidth between worker nodes and object storage is the bottleneck
-on cold resume. zstd buys a large reduction on these RAM-image files. The
-CPU cost is paid once on suspend, hidden behind storage I/O on restore.
+atelet and the workers keep node-local state under `/var/lib/ate`.
 
-### Why GCS *or* S3?
+- `snapshots/` holds local checkpoints. It shares the boot disk by default, and
+  an operator can mount a dedicated disk there (before any actors run) to keep
+  heavy guest writes from slowing checkpoint and restore.
+- `sandbox-asset-cache/` is a content-addressed cache of sandbox binaries
+  (gVisor releases, micro-VM kernels and images). Each actor gets hard links
+  into it, so an asset is downloaded once per node. See
+  [atelet](/components/atelet/).
+- `actors/<uid>/` is each actor's working directory on the node.
 
-Both back-ends implement the same internal object interface. The choice is
-environmental - GCS in GCP, S3 in AWS - selected at
-atelet startup, not per snapshot.
+Worker pods see only `/var/lib/ate`, and the layout beyond `snapshots/` is an
+implementation detail.
 
-## Node-local snapshots
+## External volumes
 
-For a `PAUSED` actor, atelet keeps the snapshot on the worker node's disk
-instead of uploading it, under a per-actor directory
-(rooted under `/var/lib/ateom-gvisor/...`, plus the `snapshot_prefix`), again
-beside a `manifest.json`. Because the bytes never
-leave the node, resuming a paused actor on the same node avoids the object-store
-round trip entirely; `LocalSnapshotInfo.node_vms_with_local_snapshots` records
-which nodes hold a copy.
-
-## Who reads each store
-
-| Component | Redis | GCS / S3 | Node-local snapshot |
-|---|---|---|---|
-| ateapi | read + write | never | never |
-| atecontroller | never (via ateapi) | never | never |
-| atelet | never | read + write | read + write |
-| atenet | never (via ateapi) | never | never |
-| ateom | never | never | reads files atelet stages |
-
-This is a deliberate isolation: **only ateapi touches Redis, only atelet
-touches object storage and node-local snapshot files.** Everything else goes
-through them.
+Actors can also mount per-actor external volumes from a CSI driver (a preview
+feature). ateapi provisions and attaches them through the CSI controller during
+the resume workflow, and deletes them with the actor. Their contents are never
+part of a snapshot, so a revert or resume doesn't rewind them.
 
 ## Related
 
-- [ateapi internals](/components/ateapi/) - Redis is its private database.
-- [atelet](/components/atelet/) - the GCS/S3 and node-local snapshot client.
-- [Snapshot](/concepts/snapshot/) - what the snapshot files actually are.
+- [ateapi](/components/ateapi/) is PostgreSQL's only client.
+- [atelet](/components/atelet/) handles local snapshots, uploads, and the asset
+  cache.
+- [Snapshot](/concepts/snapshot/) covers what the snapshot files are and what
+  each fidelity captures.
