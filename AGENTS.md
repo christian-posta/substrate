@@ -106,3 +106,7 @@ Keep this up to date when updating AGENTS.md.
 - **Ingress Authentication**: `atenet-router --ingress-auth-mode=static-mtls` requires clients to present a SPIFFE certificate signed by `--ingress-client-ca-file` whose ID is in `--ingress-allowed-spiffe-ids`; that list is the whole authorization policy, so any listed client may reach any Actor. The default, `deprecated-insecure`, checks a certificate only when a client presents one, and also serves plaintext listeners that accept any client. Install with it via `ate-setup --ingress-auth-mode=static-mtls` (`manifests/ate-install/components/router-static-mtls`); the allowlist lives in `manifests/ate-install/atenet-router.yaml`.
 
 For future plans for security, reference `docs/roadmap.md`.
+
+## Security architecture docs
+
+To refresh or check the root `IDENTITY.md`, `EGRESS.md`, `RBAC.md`, and `CREDENTIALS.md` against `upstream/main`, use `.agents/skills/refresh-security-docs/SKILL.md`. Each doc records the upstream commit it was last verified against.
